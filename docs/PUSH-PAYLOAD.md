@@ -46,7 +46,7 @@ shape. The source of truth is `PushIntent` in `packages/server/src/push-client.t
 | Field | Type | Description |
 |---|---|---|
 | `v` | `1` | Payload version. **Treat an unknown `v` (a future `2`, etc.) the same as a decryption failure and suppress the notification** — this lets an old app safely ignore newer payloads |
-| `type` | `permission_requested` / `turn_completed` / `turn_failed` / `auth_error` | Kind of notification |
+| `type` | `permission_requested` / `turn_completed` / `turn_failed` / `auth_error` / `session_added` | Kind of notification. `session_added` announces a session that appeared from the Mac side (a CLI hook, `tiny handoff`, `tiny new`); it is not derived from an event, so its `eventId` is `0` and tapping it simply opens the session |
 | `sessionId` | string | The session to open on tap. `tiny push test` may send the non-existent ID `"push-test"` (`packages/server/src/api.ts`), so the NSE / app must not crash on a `sessionId` it cannot resolve |
 | `eventId` | number | Fetch the rest with `GET /v1/sessions/:id/events?since=<eventId-1>` |
 | `title` | string | Session title, falling back to the basename of the cwd (max 40 chars) |
@@ -83,7 +83,7 @@ notification type**. If it were sent for some types and not others, the relay co
 "this is a pending permission request" from the mere presence of `collapseId` — a 1-bit
 side channel in plaintext. To close it:
 
-- `turn_completed` / `turn_failed` / `auth_error` use the first 32 hex chars of
+- `turn_completed` / `turn_failed` / `auth_error` / `session_added` use the first 32 hex chars of
   `HMAC-SHA256(key = e2eKey, sessionId)`, per session. The value is stable within a
   session, so APNs replaces notifications with the same value and only the latest one
   remains.

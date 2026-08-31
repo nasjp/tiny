@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import path from "node:path";
+import { getDriver } from "./agents/index.js";
 import { sealForDevice } from "./crypto.js";
 import type { TinySettings } from "./settings.js";
 import type { Stores } from "./stores.js";
@@ -16,7 +17,9 @@ export type PushEventType = (typeof PUSH_EVENT_TYPES)[number];
 /** Contents of the ciphertext. The Phase 3 Notification Service Extension reads this shape. */
 export interface PushIntent {
   v: 1;
-  type: PushEventType;
+  // session_added is not derived from an event: it announces a session that appeared from the Mac
+  // side (a CLI hook, `tiny handoff`, `tiny new`) and carries eventId 0
+  type: PushEventType | "session_added";
   sessionId: string;
   eventId: number;
   title: string;
@@ -37,6 +40,14 @@ const RELAY_TIMEOUT_MS = 10_000;
 const DEAD_TOKEN_REASONS = new Set(["BadDeviceToken", "Unregistered"]);
 /** Topic-side misconfiguration. The token is still alive, so it must not be deleted. */
 const MISCONFIG_REASONS = new Set(["DeviceTokenNotForTopic", "TopicDisallowed", "BadTopic"]);
+
+function agentLabel(agent: string): string {
+  try {
+    return getDriver(agent).label;
+  } catch {
+    return agent; // a session from an agent this build no longer knows
+  }
+}
 
 export function truncate(s: string, max: number): string {
   const t = s.replace(/\s+/g, " ").trim();
@@ -113,6 +124,24 @@ export function buildIntent(ev: EventRecord, session: SessionRecord | null): Pus
 }
 
 /**
+ * A session that showed up from the Mac. There is no event to build from — an adopted session has
+ * not necessarily said anything yet — so the record alone names it (cwd basename, like every
+ * other intent for an untitled session) and the body says which agent and where
+ */
+export function buildSessionAddedIntent(session: SessionRecord, agentLabel: string): PushIntent {
+  return {
+    v: 1,
+    type: "session_added",
+    sessionId: session.id,
+    eventId: 0,
+    title: truncate(session.title ?? path.basename(session.cwd), TITLE_LIMIT),
+    body: truncate(`New ${agentLabel} session on your Mac · ${session.cwd}`, BODY_LIMIT),
+    category: "tiny.info",
+    level: "active",
+  };
+}
+
+/**
  * Always send a value regardless of type, so the relay cannot tell "is this a pending permission?".
  * Only pending permissions get a per-event value — APNs only replaces notifications with the same
  * value, so a different value every time is behaviorally equivalent to "no collapse".
@@ -147,6 +176,7 @@ export interface PushClientDeps {
 /** Interface satisfied by SessionManager (narrowed so tests need not build a full EventEmitter). */
 export interface EventSource {
   on(event: "event", listener: (ev: EventRecord) => void): unknown;
+  on(event: "session_added", listener: (s: SessionRecord) => void): unknown;
 }
 
 export class PushClient {
@@ -156,6 +186,20 @@ export class PushClient {
     manager.on("event", (ev) => {
       void this.handleEvent(ev);
     });
+    manager.on("session_added", (s) => {
+      void this.handleSessionAdded(s);
+    });
+  }
+
+  /** Same never-throws contract as handleEvent */
+  async handleSessionAdded(s: SessionRecord): Promise<void> {
+    try {
+      const settings = this.deps.settings();
+      if (!settings.pushEnabled || settings.relayUrl === "") return;
+      await this.deliver(buildSessionAddedIntent(s, agentLabel(s.agent)));
+    } catch (err) {
+      console.error("[tinyd] push delivery error:", err);
+    }
   }
 
   /** Never lets exceptions escape, so a push failure cannot take down turn execution. */

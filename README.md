@@ -140,7 +140,8 @@ For development (pnpm, tsx, tests, smoke scripts, iOS builds) see
 
 ## Push notifications
 
-When tinyd on the Mac detects a pending permission, a finished turn, or an error, it
+When tinyd on the Mac detects a pending permission, a finished turn, an error, or a
+session that appeared from the Mac side (`tiny new`, `tiny handoff`, `tiny live on`), it
 encrypts the content with ChaCha20-Poly1305, sends it to the push relay (Cloudflare
 Workers), and the relay forwards it to APNs. The relay holds only the p8 key and cannot
 decrypt the notification contents.

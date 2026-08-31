@@ -132,6 +132,29 @@ describe("SessionManager", () => {
     expect(stores.events.listSince(first.session.id, 0)).toHaveLength(2);
   });
 
+  // A session that appears from the Mac side (hook / `tiny handoff` / `tiny new`) is announced so
+  // the phone can be told; the phone's own creations are not (it already knows)
+  it("announces a session the first time it is adopted, not on the hook's repeats", () => {
+    const { manager, home } = makeManager(okAdapter);
+    fs.mkdirSync(path.join(home, "external-claude"), { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", path.join(home, "external-claude"));
+    const announced: string[] = [];
+    manager.on("session_added", (s: { id: string }) => announced.push(s.id));
+    const first = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-9" });
+    manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-9" });
+    expect(announced).toEqual([first.session.id]);
+  });
+
+  it("announces a created session only when asked to", () => {
+    const { manager } = makeManager(okAdapter);
+    const announced: string[] = [];
+    manager.on("session_added", (s: { id: string }) => announced.push(s.id));
+    manager.createSession({ profile: "work", cwd });
+    expect(announced).toEqual([]);
+    const s = manager.createSession({ profile: "work", cwd }, { announce: true });
+    expect(announced).toEqual([s.id]);
+  });
+
   it("adopts a session with no transcript yet", () => {
     const { manager, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");

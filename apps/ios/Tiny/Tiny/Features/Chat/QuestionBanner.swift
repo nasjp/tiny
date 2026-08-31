@@ -241,7 +241,7 @@ struct QuestionAnswerCard: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(p.question).font(.callout).foregroundStyle(Color.tInkSub)
                     Text(p.answer).font(.body.weight(.medium))
-                        .textSelection(.enabled)
+                        .copyable(p.answer)
                 }
             }
         }

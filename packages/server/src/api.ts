@@ -175,7 +175,9 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
 
   app.post("/v1/sessions", async (c) => {
     const body = createSessionSchema.parse(await c.req.json());
-    return c.json(withLive(deps.manager.createSession(body)), 201);
+    // `tiny new` on the Mac is announced to the phone; the phone creating one is not
+    const announce = c.get("principal") === "cli";
+    return c.json(withLive(deps.manager.createSession(body, { announce })), 201);
   });
 
   // `tiny handoff`: register a session started in the agent's own CLI. Idempotent (SessionStart

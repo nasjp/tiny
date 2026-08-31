@@ -31,6 +31,8 @@ final class ChatRowWidthTests: XCTestCase {
             ("bubble-4img-remote", AnyView(UserBubble(text: "photos", imageCount: 4, time: "16:36",
                                                       imageFileIds: ["a", "b", "c", "d"], loadImage: { _ in nil }))),
             ("bubble-long", AnyView(UserBubble(text: "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZ", imageCount: 0, time: "16:36"))),
+            ("peer-card", AnyView(PeerMessageCard(from: "a-teammate-with-a-really-long-identifier-name", summary: "A summary line that is long enough to need wrapping on the narrowest device for sure",
+                                                  text: "| Name | Hours |\n|---|---|\n| Kanda Yabu Soba | 11:30-20:30 nonstop (L.O. 20:00) and then some more text |"))),
         ]
         for (label, v) in rows {
             let w = measuredWidth(v)

@@ -18,6 +18,10 @@ struct EventRow: View {
         case .assistantText(let text):
             MarkdownText(text)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .copyable(text)
+
+        case .peerMessage(let from, let summary, let text):
+            PeerMessageCard(from: from, summary: summary, text: text)
 
         case .toolStarted, .toolFinished:
             // Tool calls are converted to the collapsed display (ToolSummaryRow) on the ChatView side
@@ -187,12 +191,43 @@ struct UserBubble: View {
                     .background(Color.tTint)
                     .foregroundStyle(.white)
                     .clipShape(RoundedRectangle(cornerRadius: 18))
-                    .textSelection(.enabled)
+                    .copyable(text)
             }
             Text(time)
                 .font(.caption2).foregroundStyle(Color.tInkSub)
                 .fontDesign(.monospaced).kerning(1.3)
         }
+    }
+}
+
+/// A message from another Claude session, shown as a card on the assistant side: it was not
+/// typed by the person (so not a user bubble) and not said by this session's agent either.
+/// Header = who sent it, then the sender's one-line summary when it gave one, then the body
+struct PeerMessageCard: View {
+    let from: String
+    let summary: String?
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.branch")
+                Text(from).fontWeight(.semibold)
+                Text("· another session").foregroundStyle(Color.tInkSub)
+            }
+            .font(.caption)
+            .foregroundStyle(Color.tDetached)
+            .lineLimit(1)
+            if let summary, !summary.isEmpty {
+                Text(summary).font(.callout.weight(.medium))
+            }
+            MarkdownText(text)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.tCard))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(.quaternary))
+        .copyable(text)
     }
 }
 

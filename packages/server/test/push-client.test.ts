@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
+import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openSealed } from "../src/crypto.js";
 import { openDb } from "../src/db.js";
-import { buildIntent, collapseIdFor, PushClient, truncate } from "../src/push-client.js";
+import { buildIntent, buildSessionAddedIntent, collapseIdFor, PushClient, truncate } from "../src/push-client.js";
 import { createStores, type Stores } from "../src/stores.js";
 import type { DeviceRecord, EventRecord, SessionRecord } from "../src/types.js";
 
@@ -118,6 +119,25 @@ describe("buildIntent", () => {
 
   it("still builds an intent when the session is not found", () => {
     expect(buildIntent(event("turn_completed"), null)!.title).toBe("tiny");
+  });
+});
+
+// A session that shows up from the Mac (a CLI hook, `tiny handoff`, `tiny new`) has no event yet,
+// so it is announced from the session record alone
+describe("buildSessionAddedIntent", () => {
+  it("names the session after its cwd and says where it started", () => {
+    const i = buildSessionAddedIntent(session({ title: null, agent: "claude" }), "Claude");
+    expect(i).toMatchObject({
+      v: 1, type: "session_added", sessionId: "sess-1", eventId: 0, title: "my-repo",
+      category: "tiny.info", level: "active",
+    });
+    expect(i.body).toContain("Claude");
+    expect(i.body).toContain("/Users/me/src/my-repo");
+    expect(i.reqId).toBeUndefined();
+  });
+
+  it("uses the title when the session already has one", () => {
+    expect(buildSessionAddedIntent(session({ title: "Handoff design" }), "Claude").title).toBe("Handoff design");
   });
 });
 
@@ -245,6 +265,16 @@ describe("PushClient", () => {
     settings.relayUrl = "https://relay.example.com/";
     await client().handleEvent(event("turn_completed"));
     expect(calls[0]!.url).toBe("https://relay.example.com/v1/push");
+  });
+
+  it("pushes a session announced by the manager", async () => {
+    const source = new EventEmitter();
+    client().attach(source as unknown as Parameters<PushClient["attach"]>[0]);
+    source.emit("session_added", session());
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls).toHaveLength(1);
+    const opened = JSON.parse(openSealed(e2eKey, String(calls[0]!.body.payload))) as Record<string, unknown>;
+    expect(opened).toMatchObject({ v: 1, type: "session_added", sessionId: "sess-1" });
   });
 
   it("sends nothing for non-push events", async () => {

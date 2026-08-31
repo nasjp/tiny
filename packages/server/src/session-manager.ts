@@ -153,13 +153,17 @@ export class SessionManager extends EventEmitter {
     return { dir, driver, caps };
   }
 
+  /**
+   * `announce` = the session appeared from the Mac side (`tiny new`), so listeners such as the
+   * push client tell the phone about it. The phone's own creations are never announced back to it
+   */
   createSession(input: {
     profile: string;
     cwd: string;
     permissionMode?: PermissionModeValue;
     model?: string;
     effort?: string;
-  }): SessionRecord {
+  }, opts: { announce?: boolean } = {}): SessionRecord {
     const { driver, caps } = this.resolveProfile(input);
     const now = new Date().toISOString();
     const rec: SessionRecord = {
@@ -180,7 +184,17 @@ export class SessionManager extends EventEmitter {
       updatedAt: now,
     };
     this.deps.stores.sessions.create(rec);
+    if (opts.announce) this.announce(rec);
     return rec;
+  }
+
+  /** Never lets a listener's failure reach the caller that created the session */
+  private announce(s: SessionRecord): void {
+    try {
+      this.emit("session_added", s);
+    } catch (err) {
+      console.error("[tinyd] session_added listener error:", err);
+    }
   }
 
   /**
@@ -228,6 +242,9 @@ export class SessionManager extends EventEmitter {
     };
     this.deps.stores.sessions.create(rec);
     this.importOrSeed(rec.id);
+    // Always from the Mac side (a hook or `tiny handoff`), and only the first time: the hook fires
+    // again on resume / fork / clear, which is not a new session
+    this.announce(rec);
     return { session: this.getSession(rec.id), adopted: true };
   }
 
