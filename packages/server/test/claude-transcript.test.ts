@@ -122,20 +122,30 @@ describe("claude-transcript", () => {
     expect(said).toEqual(["ask 2", "ask 3"]);
   });
 
-  // Every real transcript carries 1-9 isMeta records; counting them as turns would cut the import
-  // short of what the person actually said
-  it("does not count isMeta user records as human turns", () => {
+  // Every real transcript carries 1-9 isMeta records: Claude Code's own interjections, not anything
+  // a person typed. They must not count as turns, and must not reach the client as user messages
+  it("drops isMeta records and keeps the real ones around them", () => {
     const records: Array<Record<string, unknown>> = [];
     records.push({ type: "user", uuid: "u0", message: { role: "user", content: "the real question" } });
     for (let k = 0; k < 3; k++) {
       records.push({ type: "user", uuid: `m${k}`, isMeta: true, message: { role: "user", content: `<meta ${k}>` } });
     }
+    records.push({ type: "assistant", uuid: "a0", message: { content: [{ type: "text", text: "the real answer" }] } });
     const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, records);
     const r = readTranscript(file, { turns: 2 });
-    expect(r.events.map((e) => e.payload.text)).toEqual([
-      "the real question", "<meta 0>", "<meta 1>", "<meta 2>",
+    expect(r.events.map((e) => e.payload.text)).toEqual(["the real question", "the real answer"]);
+    // and the cursor still covers them, so the next read does not offer them again
+    expect(r.cursor).toBe("a0");
+  });
+
+  it("does not take a title from an isMeta record", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      { type: "user", uuid: "m0", isMeta: true, message: { role: "user", content: "Caveat: generated while running local commands" } },
+      { type: "user", uuid: "u0", message: { role: "user", content: "what the person asked" } },
     ]);
+    expect(readTranscript(file).title).toBe("what the person asked");
   });
 
   // The Nth turn is included, not cut away: starting after it strands a tool_finished whose
