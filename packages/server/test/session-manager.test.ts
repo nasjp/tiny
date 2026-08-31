@@ -166,6 +166,28 @@ describe("SessionManager", () => {
     expect(manager.syncTranscript(session.id)).toBe(0);
   });
 
+  it("syncTranscript is a no-op for a non-claude agent", () => {
+    const { manager, stores } = makeManager(okAdapter);
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    // makeManager creates an opencode profile named "oc"
+    const s = manager.createSession({ profile: "oc", cwd });
+    stores.sessions.patch(s.id, { agentSessionId: "agent-oc" });
+    expect(manager.syncTranscript(s.id)).toBe(0);
+  });
+
+  it("syncTranscript returns 0 when the profile's config dir has gone away", () => {
+    const { manager, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "vanishing-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "gone", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "gone", cwd, agentSessionId: "agent-gone" });
+    // the user moved or deleted their CLAUDE_CONFIG_DIR after adoption
+    fs.rmSync(configDir, { recursive: true, force: true });
+    expect(() => manager.syncTranscript(session.id)).not.toThrow();
+    expect(manager.syncTranscript(session.id)).toBe(0);
+  });
+
   it("discardIfEmpty removes a session with no events and keeps one with events", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");

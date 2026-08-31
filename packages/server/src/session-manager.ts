@@ -6,7 +6,7 @@ import type { McpLaunch } from "./mcp-launch.js";
 import type { FileOutbox } from "./outbox.js";
 import { profileDir, profileDriver } from "./profiles.js";
 import { findTranscript, readTranscript } from "./claude-transcript.js";
-import type { AgentCapabilities } from "./agents/index.js";
+import type { AgentCapabilities, AgentDriver } from "./agents/index.js";
 import type { PendingPermission, PermissionBroker, PermissionDecision } from "./permission-broker.js";
 import type { SessionPatch, Stores } from "./stores.js";
 import type { FileRecord, PermissionModeValue, SessionRecord, SessionStatus } from "./types.js";
@@ -68,6 +68,26 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  /**
+   * Shared entry validation for createSession / adoptSession: the profile exists, the requested
+   * choices are among the agent's, and the cwd is a real directory.
+   */
+  private resolveProfile(input: {
+    profile: string;
+    cwd: string;
+    permissionMode?: PermissionModeValue;
+    effort?: string;
+  }): { dir: string; driver: AgentDriver; caps: AgentCapabilities } {
+    const dir = profileDir(this.deps.profilesDir, input.profile); // throws if missing
+    const driver = profileDriver(this.deps.profilesDir, input.profile);
+    const caps = driver.capabilities(dir);
+    assertChoices(caps, input);
+    if (!fs.existsSync(input.cwd) || !fs.statSync(input.cwd).isDirectory()) {
+      throw new NotFoundError(`cwd not found: ${input.cwd}`);
+    }
+    return { dir, driver, caps };
+  }
+
   createSession(input: {
     profile: string;
     cwd: string;
@@ -75,13 +95,7 @@ export class SessionManager extends EventEmitter {
     model?: string;
     effort?: string;
   }): SessionRecord {
-    const dir = profileDir(this.deps.profilesDir, input.profile); // existence check (throws if missing)
-    const driver = profileDriver(this.deps.profilesDir, input.profile);
-    const caps = driver.capabilities(dir);
-    assertChoices(caps, input);
-    if (!fs.existsSync(input.cwd) || !fs.statSync(input.cwd).isDirectory()) {
-      throw new NotFoundError(`cwd not found: ${input.cwd}`);
-    }
+    const { driver, caps } = this.resolveProfile(input);
     const now = new Date().toISOString();
     const rec: SessionRecord = {
       id: crypto.randomUUID(),
@@ -120,13 +134,7 @@ export class SessionManager extends EventEmitter {
     effort?: string;
     permissionMode?: PermissionModeValue;
   }): { session: SessionRecord; adopted: boolean } {
-    const dir = profileDir(this.deps.profilesDir, input.profile); // throws if missing
-    const driver = profileDriver(this.deps.profilesDir, input.profile);
-    const caps = driver.capabilities(dir);
-    assertChoices(caps, input);
-    if (!fs.existsSync(input.cwd) || !fs.statSync(input.cwd).isDirectory()) {
-      throw new NotFoundError(`cwd not found: ${input.cwd}`);
-    }
+    const { driver, caps } = this.resolveProfile(input);
     const existing = this.deps.stores.sessions.byAgentSessionId(input.agentSessionId);
     if (existing) {
       this.syncTranscript(existing.id);
