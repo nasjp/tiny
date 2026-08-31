@@ -88,6 +88,33 @@ tiny daemon uninstall
 tiny config --server-url http://<Tailscale IP>:7777
 ```
 
+### Running `tiny handoff` from inside Claude Code
+
+`tiny handoff` is meant to be run *from within* the Claude Code session you want to hand
+over — that is how it identifies which session you mean (Claude Code exports
+`CLAUDE_CODE_SESSION_ID` to the commands it runs).
+
+Type it with a leading `!` so it runs as a shell command:
+
+```
+!tiny handoff
+```
+
+Asking the agent in prose ("run tiny handoff") tends to misfire, because `handoff` collides
+with the name of a skill in many setups — the agent invokes the skill instead of the command.
+The `!` prefix bypasses the agent entirely.
+
+If you would rather not think about it, turn on automatic handoff once:
+
+```
+tiny live on
+```
+
+Every new Claude Code session is then handed over on its own, and you never type `handoff`
+again. Turn it off with `tiny live off`; it only adds two hooks to your agent's own
+`settings.json` and removes exactly those when you turn it off.
+
+
 For development (pnpm, tsx, tests, smoke scripts, iOS builds) see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
