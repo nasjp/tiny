@@ -9,7 +9,7 @@ import qrcode from "qrcode-terminal";
 import { tinyPaths } from "./config.js";
 import { summarizePeerInboxes } from "./claude-peer.js";
 import { installDaemon, readInstalledDaemon, uninstallDaemon } from "./daemon.js";
-import { collectDoctor, formatDoctorReport } from "./doctor.js";
+import { collectDoctor, formatDoctorReport, type AlwaysHandoffTarget } from "./doctor.js";
 import { openDb } from "./db.js";
 import { tinyEntry, tinyLaunch } from "./entry.js";
 import { buildHookCommand, readLiveMode, setLiveMode } from "./claude-hooks.js";
@@ -66,6 +66,39 @@ export function resolveHandoffInput(env: Record<string, string | undefined>): Ha
     // An empty env var means "not set" here, same as for the session id above
     configDir: typeof dir === "string" && dir !== "" ? dir : defaultClaudeConfigDir(),
   };
+}
+
+/**
+ * What `tiny doctor` reports for always-handoff: every place `tiny live` can be set, starting with
+ * the config dir the caller's own shell uses. A profile pointing at that same directory is named
+ * once (as that profile), and profiles of other agents are left out — the hooks are Claude Code's.
+ * A profile whose mode cannot be read (its external config dir is gone) is skipped rather than
+ * taking the report down with it.
+ */
+export function alwaysHandoffTargets(
+  profiles: ProfileInfo[],
+  selfDir: string,
+  readMode: (dir: string) => boolean = readLiveMode,
+): AlwaysHandoffTarget[] {
+  const claude = profiles.filter((p) => p.agent === "claude");
+  const mode = (dir: string): boolean | null => {
+    try {
+      return readMode(dir);
+    } catch {
+      return null;
+    }
+  };
+  const self = claude.find((p) => p.dir === selfDir);
+  const selfOn = mode(selfDir);
+  const targets: AlwaysHandoffTarget[] = selfOn === null
+    ? []
+    : [{ name: `${self ? self.name : selfDir} (this shell)`, on: selfOn }];
+  for (const p of claude) {
+    if (p.dir === selfDir) continue;
+    const on = mode(p.dir);
+    if (on !== null) targets.push({ name: p.name, on });
+  }
+  return targets;
 }
 
 /**
@@ -474,7 +507,10 @@ program
       profiles: listProfiles(p.profilesDir),
       fileExists: (f) => fs.existsSync(f),
       sameFile,
-      alwaysHandoff: readLiveMode(process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir()),
+      alwaysHandoff: alwaysHandoffTargets(
+        listProfiles(p.profilesDir),
+        process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir(),
+      ),
       peerInboxes: summarizePeerInboxes(process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir()),
     });
     console.log(formatDoctorReport(report));
