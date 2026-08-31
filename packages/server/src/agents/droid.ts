@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { readAcpChoices } from "../acp-choices.js";
 import type { AgentDriver } from "./index.js";
 
 // Factory Droid (droid exec --output-format acp). Measured (HANDOFF "Gemini CLI / Cursor / Droid
@@ -32,9 +33,10 @@ export const droidDriver: AgentDriver = {
   login: () => ({ bin: "droid", args: [] }),
   attach: (s) => ({ bin: "droid", args: ["--resume", s.agentSessionId] }),
   authMethodId: "device-pairing",
-  capabilities: () => ({
-    models: [],
-    efforts: [],
+  capabilities: (profileDir) => ({
+    // Mirrored from the cached ACP configOptions (see acp-choices.ts); empty until first contact
+    models: readAcpChoices(profileDir)?.models ?? [],
+    efforts: readAcpChoices(profileDir)?.efforts ?? [],
     permissionModes: [
       { id: "ask", label: "Ask first" },
       { id: "auto", label: "Auto-approve" },

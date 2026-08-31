@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { readAcpChoices } from "../acp-choices.js";
 import type { AgentDriver } from "./index.js";
 
 // Cursor CLI (cursor-agent acp). Measured (HANDOFF "Gemini CLI / Cursor / Droid ACP measurements" 2026-08-30):
@@ -40,9 +41,10 @@ export const cursorDriver: AgentDriver = {
   login: () => ({ bin: "cursor-agent", args: ["login"] }),
   attach: (s) => ({ bin: "cursor-agent", args: ["--resume", s.agentSessionId] }),
   authMethodId: "cursor_login",
-  capabilities: () => ({
-    models: [],
-    efforts: [],
+  capabilities: (profileDir) => ({
+    // Mirrored from the cached ACP configOptions (see acp-choices.ts); empty until first contact
+    models: readAcpChoices(profileDir)?.models ?? [],
+    efforts: readAcpChoices(profileDir)?.efforts ?? [],
     permissionModes: [
       { id: "ask", label: "Ask first" },
       { id: "auto", label: "Auto-approve" },

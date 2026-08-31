@@ -13,6 +13,7 @@ import { collectDoctor, formatDoctorReport, type AlwaysHandoffTarget } from "./d
 import { openDb } from "./db.js";
 import { tinyEntry, tinyLaunch } from "./entry.js";
 import { buildHookCommand, readLiveMode, setLiveMode } from "./claude-hooks.js";
+import { fetchAcpChoices } from "./acp-adapter.js";
 import { detectTailscaleIp } from "./tailscale.js";
 import { findOnPath } from "./which.js";
 import { migrateClaudeCredential, type KeychainMigration } from "./keychain.js";
@@ -601,9 +602,28 @@ function runProfileLogin(name: string): void {
   if (r.error) throw r.error;
 }
 
-profiles.command("login <name>").action((name: string) => {
+profiles.command("login <name>").action(async (name: string) => {
   runProfileLogin(name);
+  await seedAcpChoices(name);
 });
+
+/**
+ * ACP agents report their model / effort choices only over a live session, so cache them right
+ * after a login; the app's pickers then fill in without waiting for the first turn.
+ */
+async function seedAcpChoices(name: string): Promise<void> {
+  const p = tinyPaths();
+  const driver = profileDriver(p.profilesDir, name);
+  if (driver.adapter !== "acp") return;
+  const dir = profileDir(p.profilesDir, name);
+  if (!driver.isLoggedIn(dir)) return;
+  const c = await fetchAcpChoices(driver, dir);
+  console.log(
+    c
+      ? `Cached ${c.models.length} model choice(s) and ${c.efforts.length} effort level(s) for the app`
+      : "Could not read model choices yet; they fill in after the first turn",
+  );
+}
 
 /** Issue a pairing code and print the QR (used by `tiny pair` and at the end of `tiny setup`) */
 async function showPairingQr(): Promise<void> {

@@ -1,5 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import os from "node:os";
 import type { AgentAdapter, RunTurnParams, TurnResult } from "./adapter.js";
+import { harvestAcpChoices, readAcpChoices, type AcpChoices } from "./acp-choices.js";
 import { agentEnv, type AgentDriver, type AgentLaunch } from "./agents/index.js";
 import { JsonRpcConnection, JsonRpcRemoteError } from "./jsonrpc-stdio.js";
 import type { PermissionDecision } from "./permission-broker.js";
@@ -317,6 +319,9 @@ export class AcpAdapter implements AgentAdapter {
         sessionId = r.sessionId;
         if (Array.isArray(r.configOptions)) configOptions = r.configOptions as typeof configOptions;
       }
+      // The response just listed every model / effort this profile can use — mirror it so the
+      // app's pickers fill in (the driver's capabilities(profileDir) serves this cache)
+      harvestAcpChoices(p.profileDir, configOptions);
       p.emit({ type: "turn_started", payload: { agentSessionId: sessionId } });
 
       // Never throw after emitting turn_started (invariant that lets SessionManager save the
@@ -391,5 +396,60 @@ export class AcpAdapter implements AgentAdapter {
       conn.close();
       proc.kill();
     }
+  }
+}
+
+/**
+ * Seed the choices cache without running a turn: spawn the agent, initialize, open a throwaway
+ * session and harvest its configOptions (`tiny profiles login` calls this right after a login).
+ * Returns what was cached, or null when the agent would not talk (never throws).
+ */
+export async function fetchAcpChoices(
+  driver: AgentDriver,
+  profileDir: string,
+  opts: { spawn?: AcpSpawn; cwd?: string; timeoutMs?: number } = {},
+): Promise<AcpChoices | null> {
+  if (!driver.launch) return null;
+  const proc = (opts.spawn ?? spawnAcpProcess)(driver.launch, {
+    cwd: opts.cwd ?? os.tmpdir(),
+    env: agentEnv(driver, profileDir),
+  });
+  const conn = proc.conn;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("timed out")), opts.timeoutMs ?? 20_000);
+    timer.unref?.();
+  });
+  try {
+    // Same handshake as a turn (initialize -> session/new, with one authenticate retry on -32000)
+    const init = (await Promise.race([
+      conn.request("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+        clientInfo: { name: "tiny", title: "tiny", version: TINY_VERSION },
+      }),
+      deadline,
+    ])) as { authMethods?: Array<{ id: string }> };
+    const authMethods = Array.isArray(init?.authMethods) ? init.authMethods : [];
+    const newSession = () =>
+      Promise.race([conn.request("session/new", { cwd: opts.cwd ?? os.tmpdir(), mcpServers: [] }), deadline]);
+    let r: { configOptions?: unknown };
+    try {
+      r = (await newSession()) as typeof r;
+    } catch (err) {
+      const code = err instanceof JsonRpcRemoteError ? err.code : undefined;
+      const authish = code === -32000 || /auth/i.test(err instanceof Error ? err.message : String(err));
+      if (!authish || authMethods.length === 0) throw err;
+      const methodId = driver.authMethodId ?? authMethods[0]!.id;
+      await Promise.race([conn.request("authenticate", { methodId }), deadline]);
+      r = (await newSession()) as typeof r;
+    }
+    harvestAcpChoices(profileDir, r.configOptions);
+    return readAcpChoices(profileDir);
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+    proc.kill();
   }
 }
