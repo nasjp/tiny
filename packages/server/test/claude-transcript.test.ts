@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { findTranscript, readTranscript } from "../src/claude-transcript.js";
+import { findTranscript, readTranscript, readTranscriptCursor } from "../src/claude-transcript.js";
 
 const SID = "3424c289-0fc1-4ec3-a0ca-3e5f324839fa";
 
@@ -84,17 +84,74 @@ describe("claude-transcript", () => {
     expect(r.cursor).toBe("u2");
   });
 
-  it("keeps only the last `limit` message records on a first read", () => {
+  it("keeps only the last `turns` human turns on a first read", () => {
     const many: Array<Record<string, unknown>> = [];
     for (let i = 0; i < 10; i++) {
       many.push({ type: "user", uuid: `u${i}`, message: { role: "user", content: `m${i}` } });
     }
     const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, many);
-    const r = readTranscript(file, { limit: 3 });
+    const r = readTranscript(file, { turns: 3 });
     expect(r.events).toHaveLength(3);
     expect(r.events[0]!.payload.text).toBe("m7");
     expect(r.cursor).toBe("u9");
+  });
+
+  // The point of a backfill is the conversation. Slicing by record count on a real transcript
+  // yields almost nothing but tool traffic, so slice by what the person actually said
+  it("counts human turns, not records, so tool traffic cannot crowd out the conversation", () => {
+    const records: Array<Record<string, unknown>> = [];
+    for (let turn = 0; turn < 4; turn++) {
+      records.push({ type: "user", uuid: `u${turn}`, message: { role: "user", content: `ask ${turn}` } });
+      // each turn drags along a pile of tool traffic
+      for (let k = 0; k < 20; k++) {
+        records.push({
+          type: "assistant", uuid: `a${turn}-${k}`,
+          message: { content: [{ type: "tool_use", id: `t${turn}-${k}`, name: "Read", input: { file_path: "/srv/x" } }] },
+        });
+        records.push({
+          type: "user", uuid: `r${turn}-${k}`,
+          message: { role: "user", content: [{ type: "tool_result", tool_use_id: `t${turn}-${k}`, is_error: false }] },
+        });
+      }
+    }
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, records);
+    const r = readTranscript(file, { turns: 2 });
+    const said = r.events.filter((e) => e.type === "user_message").map((e) => e.payload.text);
+    expect(said).toEqual(["ask 2", "ask 3"]);
+  });
+
+  it("caps a first read at maxRecords, keeping the newest", () => {
+    const records: Array<Record<string, unknown>> = [];
+    records.push({ type: "user", uuid: "u0", message: { role: "user", content: "ask" } });
+    for (let k = 0; k < 50; k++) {
+      records.push({
+        type: "assistant", uuid: `a${k}`,
+        message: { content: [{ type: "text", text: `t${k}` }] },
+      });
+    }
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, records);
+    const r = readTranscript(file, { turns: 10, maxRecords: 5 });
+    expect(r.events.map((e) => e.payload.text)).toEqual(["t45", "t46", "t47", "t48", "t49"]);
+    expect(r.cursor).toBe("a49");
+  });
+
+  it("takes the whole conversation when it has fewer turns than asked for", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    const r = readTranscript(file, { turns: 10 });
+    expect(r.events.map((e) => e.type)).toEqual([
+      "user_message", "assistant_text", "tool_started", "tool_finished",
+    ]);
+  });
+
+  it("readTranscriptCursor returns the tail without producing events", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    expect(readTranscriptCursor(file)).toBe("u2");
+    expect(readTranscriptCursor(path.join(root, "no-such.jsonl"))).toBeNull();
   });
 
   it("survives malformed lines and unknown record types", () => {

@@ -56,21 +56,16 @@ function blocks(content: unknown): Array<Record<string, unknown>> {
   return Array.isArray(content) ? (content as Array<Record<string, unknown>>) : [];
 }
 
-/**
- * Read a Claude Code transcript into Tiny events.
- * `sinceUuid` resumes after a previous read; `limit` caps a first read (newest kept).
- */
-export function readTranscript(
-  file: string,
-  opts: { sinceUuid?: string | null; limit?: number } = {},
-): TranscriptRead {
+/** Backstop for a first read: one turn can carry hundreds of tool records */
+const DEFAULT_MAX_RECORDS = 300;
+
+function parseRecords(file: string): Array<Record<string, unknown>> | null {
   let raw: string;
   try {
     raw = fs.readFileSync(file, "utf8");
   } catch {
-    return { events: [], title: null, cursor: null };
+    return null;
   }
-
   const records: Array<Record<string, unknown>> = [];
   for (const line of raw.split("\n")) {
     if (line.trim() === "") continue;
@@ -80,14 +75,74 @@ export function readTranscript(
       // A partially written last line is normal while the CLI is running
     }
   }
+  return records;
+}
+
+/** Only user/assistant records carry conversation. Everything else is bookkeeping */
+function messagesOf(records: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return records.filter((r) => r.type === "user" || r.type === "assistant");
+}
+
+function cursorOf(messages: Array<Record<string, unknown>>): string | null {
+  const last = messages[messages.length - 1];
+  return last && typeof last.uuid === "string" ? last.uuid : null;
+}
+
+/**
+ * The transcript's current tail, without producing any events.
+ * Lets a caller move its cursor past records it already knows about.
+ */
+export function readTranscriptCursor(file: string): string | null {
+  const records = parseRecords(file);
+  return records === null ? null : cursorOf(messagesOf(records));
+}
+
+/** A user record that carries something the person actually typed (not just tool_result blocks) */
+function startsHumanTurn(r: Record<string, unknown>): boolean {
+  return r.type === "user" && textOf((r.message as Record<string, unknown> | undefined)?.content) !== null;
+}
+
+/**
+ * The newest `turns` human turns, capped at `maxRecords` (newest kept).
+ * Slicing by record count instead would fill a first import with nothing but tool traffic:
+ * a single turn routinely spans dozens of tool_use / tool_result records.
+ */
+export function sliceRecentTurns(
+  messages: Array<Record<string, unknown>>,
+  turns: number,
+  maxRecords: number = DEFAULT_MAX_RECORDS,
+): Array<Record<string, unknown>> {
+  let start = 0;
+  let seen = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (!startsHumanTurn(messages[i]!)) continue;
+    seen += 1;
+    if (seen === turns) {
+      start = i;
+      break;
+    }
+  }
+  const slice = messages.slice(start);
+  return slice.length > maxRecords ? slice.slice(slice.length - maxRecords) : slice;
+}
+
+/**
+ * Read a Claude Code transcript into Tiny events.
+ * `sinceUuid` resumes after a previous read; `turns` caps a first read to the newest human turns.
+ */
+export function readTranscript(
+  file: string,
+  opts: { sinceUuid?: string | null; turns?: number; maxRecords?: number } = {},
+): TranscriptRead {
+  const records = parseRecords(file);
+  if (records === null) return { events: [], title: null, cursor: null };
 
   let title: string | null = null;
   for (const r of records) {
     if (r.type === "ai-title" && typeof r.aiTitle === "string" && r.aiTitle !== "") title = r.aiTitle;
   }
 
-  // Only user/assistant records carry conversation. Everything else is bookkeeping
-  const messages = records.filter((r) => r.type === "user" || r.type === "assistant");
+  const messages = messagesOf(records);
 
   let slice = messages;
   if (opts.sinceUuid) {
@@ -95,8 +150,8 @@ export function readTranscript(
     // Cursor not found: the transcript was forked or rotated. Importing everything again would
     // duplicate the whole conversation for the caller, so import nothing and let the cursor advance
     slice = at >= 0 ? messages.slice(at + 1) : [];
-  } else if (opts.limit !== undefined && messages.length > opts.limit) {
-    slice = messages.slice(messages.length - opts.limit);
+  } else if (opts.turns !== undefined) {
+    slice = sliceRecentTurns(messages, opts.turns, opts.maxRecords);
   }
 
   const events: TranscriptEvent[] = [];
@@ -144,7 +199,5 @@ export function readTranscript(
     title = t ? t.slice(0, 60) : null;
   }
 
-  const last = messages[messages.length - 1];
-  const cursor = last && typeof last.uuid === "string" ? last.uuid : null;
-  return { events, title, cursor };
+  return { events, title, cursor: cursorOf(messages) };
 }

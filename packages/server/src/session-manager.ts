@@ -123,8 +123,11 @@ export class SessionManager extends EventEmitter {
     return rec;
   }
 
-  /** How many transcript messages a first backfill imports (a 12MB transcript exists in the wild) */
-  private static readonly BACKFILL_LIMIT = 50;
+  /**
+   * How many human turns a first backfill imports. Counting records instead would fill the
+   * import with tool traffic and almost none of the conversation the person came back for
+   */
+  private static readonly BACKFILL_TURNS = 10;
 
   /**
    * Register a session that was started in the agent's own CLI (`tiny handoff`).
@@ -183,7 +186,7 @@ export class SessionManager extends EventEmitter {
     if (!file) return 0;
     const read = readTranscript(file, {
       sinceUuid: s.sourceCursor,
-      ...(s.sourceCursor ? {} : { limit: SessionManager.BACKFILL_LIMIT }),
+      ...(s.sourceCursor ? {} : { turns: SessionManager.BACKFILL_TURNS }),
     });
     for (const ev of read.events) this.emitEvent(id, ev.type, ev.payload);
     const patch: SessionPatch = {};
