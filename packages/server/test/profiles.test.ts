@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { addProfile, listProfiles, profileDir, profileDriver, renameProfile } from "../src/profiles.js";
+import { addProfile, listProfiles, profileDir, profileDriver, renameProfile, readProfileLive, setProfileLive, readProfileAgent } from "../src/profiles.js";
 import { EMPTY_CAPABILITIES, registerDriver } from "../src/agents/index.js";
 
 describe("profiles", () => {
@@ -204,5 +204,20 @@ describe("profiles: agent kind (tiny-profile.json)", () => {
     });
     const p = addProfile(root, "prep", "fake-prep");
     expect(prepared).toEqual([p.dir]);
+  });
+});
+
+describe("profile live flag (hookless agents)", () => {
+  it("round-trips and keeps the rest of tiny-profile.json", () => {
+    const profilesDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-prof-"));
+    addProfile(profilesDir, "cx", "codex");
+    expect(readProfileLive(profilesDir, "cx")).toBe(false);
+    setProfileLive(profilesDir, "cx", true);
+    expect(readProfileLive(profilesDir, "cx")).toBe(true);
+    expect(readProfileAgent(path.join(profilesDir, "cx"))).toBe("codex");
+    setProfileLive(profilesDir, "cx", false);
+    expect(readProfileLive(profilesDir, "cx")).toBe(false);
+    expect(() => readProfileLive(profilesDir, "nope")).not.toThrow();
+    expect(readProfileLive(profilesDir, "..")).toBe(false);
   });
 });

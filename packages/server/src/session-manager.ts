@@ -4,8 +4,11 @@ import { EventEmitter } from "node:events";
 import type { AgentAdapter, TurnImage } from "./adapter.js";
 import type { McpLaunch } from "./mcp-launch.js";
 import type { FileOutbox } from "./outbox.js";
-import { profileDir, profileDriver } from "./profiles.js";
+import { listProfiles, profileDir, profileDriver } from "./profiles.js";
 import type { LiveSessionEntry } from "./claude-live.js";
+import type { ExternalTurn } from "./agent-storage.js";
+import { codexRolloutCursor, findCodexRollout, listCodexSessions, readCodexRollout } from "./codex-live.js";
+import { listOpencodeSessions, opencodeDbStat, opencodeSessionCursor, readOpencodeSession } from "./opencode-live.js";
 import { findTranscript, readTranscript, readTranscriptCursor, type TranscriptTurn } from "./claude-transcript.js";
 import { PEER_STOP, wrapForPeer, type CliMode, type PeerFrame, type PeerStatus, type PeerTarget } from "./claude-peer.js";
 import type { AgentCapabilities, AgentDriver } from "./agents/index.js";
@@ -82,6 +85,16 @@ export interface SessionManagerDeps {
    * tell. Feeds `activity` for turns the person typed into the terminal, which tiny never sees start
    */
   cliState?: (s: SessionRecord) => LiveSessionEntry | null;
+  /**
+   * Whether `tiny live` scanning is on for a hookless profile (codex / opencode): tinyd then
+   * adopts sessions the person starts in the agent's own CLI by watching its storage
+   */
+  liveScanEnabled?: (profileName: string) => boolean;
+  /**
+   * Process-level evidence that the agent's own CLI is working a session right now (codex thread
+   * lock holders, opencode instance pids). false = definitely nobody; null = cannot tell
+   */
+  externalBusy?: (s: SessionRecord) => boolean | null;
   /** Live join into the CLI (Step 2). Absent = a turn sent while the CLI holds the session is refused (409) */
   peer?: PeerBridge;
   /** Watcher timings. Tests shorten them; production uses the defaults */
@@ -129,8 +142,10 @@ export class SessionManager extends EventEmitter {
   private running = new Map<string, RunningTurn>();
   /** Progress of the turns in `running`: when they started and, for adapters that report it, output so far */
   private turnProgress = new Map<string, { since: string; outputTokens: number | null }>();
-  /** Newest turn seen in each session's transcript at the last import, and when that import ran */
-  private transcriptTurns = new Map<string, TranscriptTurn & { readAt: number }>();
+  /** Newest turn seen in each session's transcript / storage at the last import, and when that ran */
+  private transcriptTurns = new Map<string, TranscriptTurn & { readAt: number; open?: boolean }>();
+  /** Rollout file per codex session, found once (the date-dir scan is not free) */
+  private codexRollouts = new Map<string, string>();
   /** Turns currently running inside the user's CLI rather than tiny's own adapter, by session id */
   private liveTurns = new Map<string, LiveTurn>();
   /**
@@ -313,6 +328,21 @@ export class SessionManager extends EventEmitter {
    */
   private advanceCursor(s: SessionRecord): void {
     try {
+      if (s.agent === "codex") {
+        const file = this.codexRollout(s);
+        const cursor = file ? codexRolloutCursor(file) : null;
+        if (cursor && cursor !== s.sourceCursor) this.deps.stores.sessions.patch(s.id, { sourceCursor: cursor });
+        return;
+      }
+      if (s.agent === "opencode") {
+        if (!s.agentSessionId) return;
+        const cursor = opencodeSessionCursor(profileDir(this.deps.profilesDir, s.profile), s.agentSessionId);
+        // null = the tail is an unfinished reply; leaving the cursor lets the next sync take it whole
+        if (cursor !== null && cursor !== "" && cursor !== s.sourceCursor) {
+          this.deps.stores.sessions.patch(s.id, { sourceCursor: cursor });
+        }
+        return;
+      }
       const file = this.transcriptFile(s);
       if (!file) return;
       // Reads the same guard as syncTranscript — an unchanged file already has the cursor at its
@@ -370,6 +400,15 @@ export class SessionManager extends EventEmitter {
 
   private importTranscript(id: string): { imported: number; peerMsgIds: string[]; responded: boolean } {
     const s = this.getSession(id);
+    if (s.agent === "codex" || s.agent === "opencode") {
+      // Same running guard as claude, minus live turns (those are claude-only)
+      if (this.running.has(id)) return SessionManager.noImport();
+      try {
+        return s.agent === "codex" ? this.importCodex(s) : this.importOpencode(s);
+      } catch {
+        return SessionManager.noImport(); // a vanished profile dir etc.; never throw out of a sync
+      }
+    }
     // Mid-turn, tiny is itself appending to this transcript through the SDK and emitting every one
     // of those records natively as it goes. Importing them here would duplicate them, and the
     // cursor advance at completion cannot take back events already in the log. With this guard the
@@ -426,6 +465,116 @@ export class SessionManager extends EventEmitter {
       }
     }
     return { imported: read.events.length, peerMsgIds: read.peerMsgIds, responded };
+  }
+
+  /** The rollout file backing a codex session, found once and cached while it exists */
+  private codexRollout(s: SessionRecord): string | null {
+    const cached = this.codexRollouts.get(s.id);
+    if (cached && fs.existsSync(cached)) return cached;
+    if (!s.agentSessionId) return null;
+    const file = findCodexRollout(profileDir(this.deps.profilesDir, s.profile), s.agentSessionId);
+    if (file) this.codexRollouts.set(s.id, file);
+    return file;
+  }
+
+  /**
+   * The importOrSeed rule, applied inline on every sync: a session whose events were emitted
+   * natively (turns tiny ran) but whose cursor was never seeded must NOT import its storage from
+   * zero — that would replay the whole conversation. Seed at the tail instead.
+   */
+  private seedInsteadOfImport(s: SessionRecord, tailCursor: () => string | null): boolean {
+    if (s.sourceCursor !== null || this.deps.stores.events.count(s.id) === 0) return false;
+    const cursor = tailCursor();
+    if (cursor !== null && cursor !== "") this.deps.stores.sessions.patch(s.id, { sourceCursor: cursor });
+    return true;
+  }
+
+  /** What the newest read said about the turn in progress. startedAt null inherits the previous read's */
+  private recordExternalTurn(id: string, turn: ExternalTurn | null): void {
+    if (!turn) return;
+    const prev = this.transcriptTurns.get(id);
+    this.transcriptTurns.set(id, {
+      startedAt: turn.startedAt ?? prev?.startedAt ?? null,
+      outputTokens: turn.outputTokens ?? (turn.open ? prev?.outputTokens ?? 0 : 0),
+      open: turn.open,
+      readAt: Date.now(),
+    });
+  }
+
+  private importCodex(s: SessionRecord): { imported: number; peerMsgIds: string[]; responded: boolean } {
+    const file = this.codexRollout(s);
+    if (!file) return SessionManager.noImport();
+    if (this.seedInsteadOfImport(s, () => codexRolloutCursor(file))) return SessionManager.noImport();
+    const stat = this.transcriptChange(s.id, file);
+    if (!stat) return SessionManager.noImport();
+    const read = readCodexRollout(file, s.sourceCursor);
+    if (!read) return SessionManager.noImport();
+    for (const ev of read.events) this.emitEvent(s.id, ev.type, ev.payload);
+    this.recordExternalTurn(s.id, read.turn);
+    const patch: SessionPatch = {};
+    if (read.cursor !== s.sourceCursor) patch.sourceCursor = read.cursor;
+    if (read.title && !s.title) patch.title = read.title;
+    if (Object.keys(patch).length > 0) this.deps.stores.sessions.patch(s.id, patch);
+    this.transcriptStats.set(s.id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
+    return { imported: read.events.length, peerMsgIds: [], responded: false };
+  }
+
+  private importOpencode(s: SessionRecord): { imported: number; peerMsgIds: string[]; responded: boolean } {
+    if (!s.agentSessionId) return SessionManager.noImport();
+    const dir = profileDir(this.deps.profilesDir, s.profile);
+    if (this.seedInsteadOfImport(s, () => opencodeSessionCursor(dir, s.agentSessionId!))) return SessionManager.noImport();
+    const st = opencodeDbStat(dir);
+    if (!st) return SessionManager.noImport();
+    const seen = this.transcriptStats.get(s.id);
+    if (seen && seen.size === st.size && seen.mtimeMs === st.mtimeMs) return SessionManager.noImport();
+    const read = readOpencodeSession(dir, s.agentSessionId, s.sourceCursor);
+    if (!read) return SessionManager.noImport();
+    for (const ev of read.events) this.emitEvent(s.id, ev.type, ev.payload);
+    this.recordExternalTurn(s.id, read.turn);
+    const patch: SessionPatch = {};
+    if (read.cursor !== "" && read.cursor !== s.sourceCursor) patch.sourceCursor = read.cursor;
+    if (read.title && !s.title) patch.title = read.title;
+    if (Object.keys(patch).length > 0) this.deps.stores.sessions.patch(s.id, patch);
+    this.transcriptStats.set(s.id, { path: "opencode.db", size: st.size, mtimeMs: st.mtimeMs });
+    return { imported: read.events.length, peerMsgIds: [], responded: false };
+  }
+
+  /**
+   * Adopt sessions the person started in an agent's own CLI (codex / opencode), by reading the
+   * agent's storage. Claude needs none of this — its SessionStart hook announces sessions itself.
+   * Only profiles the user switched on (`tiny live on --profile <name>`) are scanned, and only
+   * sessions that carry something a person actually said are worth the phone's list.
+   */
+  scanExternalSessions(): number {
+    let adopted = 0;
+    let profiles;
+    try {
+      profiles = listProfiles(this.deps.profilesDir);
+    } catch {
+      return 0;
+    }
+    for (const p of profiles) {
+      if (p.agent !== "codex" && p.agent !== "opencode") continue;
+      if (this.deps.liveScanEnabled?.(p.name) !== true) continue;
+      let sessions;
+      try {
+        sessions = p.agent === "codex" ? listCodexSessions(p.dir) : listOpencodeSessions(p.dir);
+      } catch {
+        continue;
+      }
+      for (const es of sessions) {
+        if (!es.title) continue; // nothing said yet (includes tiny's own choice-fetch probes)
+        if (this.deps.stores.sessions.byAgentSessionId(es.agentSessionId)) continue;
+        if (!fs.existsSync(es.cwd)) continue; // a session whose cwd is gone cannot run turns anyway
+        try {
+          this.adoptSession({ profile: p.name, cwd: es.cwd, agentSessionId: es.agentSessionId });
+          adopted++;
+        } catch (err) {
+          console.error(`[tinyd] could not adopt ${p.agent} session ${es.agentSessionId}:`, err);
+        }
+      }
+    }
+    return adopted;
   }
 
   /**
@@ -552,6 +701,12 @@ export class SessionManager extends EventEmitter {
     saved: { paths: string[] } | null,
   ): void {
     const id = s.id;
+    // A turn the agent's own CLI is running (seen through its storage): a second writer on the
+    // same session is the one thing every agent forbids. codex / opencode have no live join (yet)
+    const ext = this.transcriptTurns.get(id);
+    if ((s.agent === "codex" || s.agent === "opencode") && ext?.open === true && this.deps.externalBusy?.(s) !== false) {
+      throw new ConflictError("a turn is running in the agent's own CLI");
+    }
     // The CLI holds the session. Running the turn in a second process would race it on the
     // transcript, so either hand the message to that very process (live join) or refuse
     const isLive = this.deps.isCliLive?.(s) === true;
@@ -616,6 +771,15 @@ export class SessionManager extends EventEmitter {
       // A live turn's output is written by the CLI, so the transcript is the only place it shows up
       const fromTranscript = this.liveTurns.has(s.id) ? this.transcriptTurns.get(s.id)?.outputTokens ?? null : null;
       return { since: own.since, outputTokens: own.outputTokens ?? fromTranscript };
+    }
+    if (s.agent === "codex" || s.agent === "opencode") {
+      // A turn the person runs in the agent's own CLI: the storage says open, and process-level
+      // evidence (when available) has not said "nobody is there"
+      const ext = this.transcriptTurns.get(s.id);
+      if (ext?.open === true && this.deps.externalBusy?.(s) !== false) {
+        return { since: ext.startedAt, outputTokens: ext.outputTokens > 0 ? ext.outputTokens : null };
+      }
+      return null;
     }
     const st = this.deps.cliState?.(s);
     if (!st || !CLI_BUSY.has(st.status)) return null;

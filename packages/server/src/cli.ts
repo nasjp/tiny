@@ -17,7 +17,7 @@ import { fetchAcpChoices } from "./acp-adapter.js";
 import { detectTailscaleIp } from "./tailscale.js";
 import { findOnPath } from "./which.js";
 import { migrateClaudeCredential, type KeychainMigration } from "./keychain.js";
-import { addProfile, listProfiles, profileDir, profileDriver, renameProfile, type ProfileInfo } from "./profiles.js";
+import { addProfile, listProfiles, profileDir, profileDriver, readProfileLive, renameProfile, setProfileLive, type ProfileInfo } from "./profiles.js";
 import { agentEnv, getDriver, listDrivers } from "./agents/index.js";
 import { defaultClaudeConfigDir } from "./agents/claude.js";
 import { runSetup } from "./setup.js";
@@ -80,6 +80,7 @@ export function alwaysHandoffTargets(
   profiles: ProfileInfo[],
   selfDir: string,
   readMode: (dir: string) => boolean = readLiveMode,
+  readScanFlag?: (name: string) => boolean,
 ): AlwaysHandoffTarget[] {
   const claude = profiles.filter((p) => p.agent === "claude");
   const mode = (dir: string): boolean | null => {
@@ -98,6 +99,16 @@ export function alwaysHandoffTargets(
     if (p.dir === selfDir) continue;
     const on = mode(p.dir);
     if (on !== null) targets.push({ name: p.name, on });
+  }
+  // Hookless agents (codex / opencode): the flag lives in tiny-profile.json and means "tinyd scans
+  // the agent's own storage" rather than "a hook fires"
+  for (const p of profiles) {
+    if (p.agent !== "codex" && p.agent !== "opencode") continue;
+    try {
+      targets.push({ name: `${p.name} (scan)`, on: readScanFlag?.(p.name) ?? false });
+    } catch {
+      // an unreadable profile must not take the report down
+    }
   }
   return targets;
 }
@@ -466,7 +477,19 @@ program
   .option("--profile <name>", "tiny profile to configure (default: the caller's own config dir)")
   .option("--config-dir <dir>", "CLAUDE_CONFIG_DIR to configure (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
   .action((state: string | undefined, opts: { profile?: string; configDir?: string }) => {
-    const configDir = resolveLiveConfigDir(opts, tinyPaths().profilesDir);
+    const paths = tinyPaths();
+    // Claude gets hooks; codex / opencode get tinyd's storage scan — one command, per-agent means
+    if (opts.profile !== undefined && profileDriver(paths.profilesDir, opts.profile).id !== "claude") {
+      if (state === undefined) {
+        console.log(`${readProfileLive(paths.profilesDir, opts.profile) ? "on" : "off"}  (${opts.profile}: storage scan)`);
+        return;
+      }
+      if (state !== "on" && state !== "off") throw new Error(`state must be on or off (got ${state})`);
+      setProfileLive(paths.profilesDir, opts.profile, state === "on");
+      console.log(`Always-handoff is now ${state} (${opts.profile}: tinyd scans the agent's own sessions)`);
+      return;
+    }
+    const configDir = resolveLiveConfigDir(opts, paths.profilesDir);
     const l = tinyLaunch();
     const command = buildHookCommand(l.command, l.args);
     if (state === undefined) {
@@ -511,6 +534,8 @@ program
       alwaysHandoff: alwaysHandoffTargets(
         listProfiles(p.profilesDir),
         process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir(),
+        undefined,
+        (name) => readProfileLive(p.profilesDir, name),
       ),
       peerInboxes: summarizePeerInboxes(process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir()),
     });
