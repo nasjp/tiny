@@ -1,6 +1,7 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { CanUseTool, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentAdapter, RunTurnParams, TurnResult } from "./adapter.js";
+import { claudeConfigDirEnv } from "./agents/claude.js";
 import { describeClaudeTool } from "./tool-kinds.js";
 
 type QueryFn = typeof sdkQuery;
@@ -25,6 +26,17 @@ const SDK_PERMISSION_MODES: readonly SdkPermissionMode[] = ["default", "acceptEd
 /** Map tiny's permission mode (string) to the SDK type. Assumed pre-validated by the driver's capabilities, but fall back to default on mismatch */
 function toSdkPermissionMode(mode: string): SdkPermissionMode {
   return (SDK_PERMISSION_MODES as readonly string[]).includes(mode) ? (mode as SdkPermissionMode) : "default";
+}
+
+/**
+ * Drops keys whose value is undefined, so "remove this variable" really is removal.
+ * The SDK replaces the child env wholesale with options.env (`env = options.env ? {...options.env}
+ * : {...process.env}`), so a key that is absent here is absent from the agent process
+ */
+function definedEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
+  return out;
 }
 
 function contentBlocks(msg: Record<string, any>): Array<Record<string, any>> {
@@ -85,12 +97,15 @@ export class ClaudeAdapter implements AgentAdapter {
           // TINY_SESSION_ID: hooks in the user's own settings.json run inside this agent and inherit its
           // env, and `tiny handoff` reads it to recognize that it is inside an agent tiny started and do
           // nothing — otherwise an always-on SessionStart hook adopts tiny's own session as a new one
-          env: {
+          // claudeConfigDirEnv removes CLAUDE_CONFIG_DIR when the profile is Claude Code's own
+          // default directory: setting it there would point the config lookup at a file that
+          // does not exist (see agents/claude.ts)
+          env: definedEnv({
             ...process.env,
             ANTHROPIC_API_KEY: undefined,
-            CLAUDE_CONFIG_DIR: p.profileDir,
+            ...claudeConfigDirEnv(p.profileDir),
             TINY_SESSION_ID: p.tinySessionId,
-          },
+          }),
           ...(p.agentSessionId ? { resume: p.agentSessionId } : {}),
           permissionMode: toSdkPermissionMode(p.permissionMode),
           ...(p.model ? { model: p.model } : {}),

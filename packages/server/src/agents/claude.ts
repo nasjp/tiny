@@ -1,6 +1,39 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { AgentDriver } from "./index.js";
+
+/** Claude Code's default data directory (the one it uses when CLAUDE_CONFIG_DIR is unset) */
+export function defaultClaudeConfigDir(): string {
+  return path.join(os.homedir(), ".claude");
+}
+
+/** realpath when the path exists (symlinked homes); plain resolve otherwise (trailing slash, "..") */
+function canonicalDir(dir: string): string {
+  const abs = path.resolve(dir);
+  try {
+    return fs.realpathSync(abs);
+  } catch {
+    return abs; // not created yet — the textual form is the best we have
+  }
+}
+
+/** Whether `dir` is the directory Claude Code uses on its own */
+export function isDefaultClaudeConfigDir(dir: string): boolean {
+  return canonicalDir(dir) === canonicalDir(defaultClaudeConfigDir());
+}
+
+/**
+ * Env that points Claude Code at `dir`. `undefined` means the variable MUST be removed, not set
+ * to an empty string: Claude Code locates its config file asymmetrically — unset it reads
+ * ~/.claude.json (home root), set to $X it reads $X/.claude.json. So naming the default data
+ * directory explicitly is not the no-op it looks like; it moves the lookup to
+ * ~/.claude/.claude.json, which a normal installation does not have, and every turn dies with
+ * "Claude configuration file not found". A `tiny handoff` profile points at exactly that directory.
+ */
+export function claudeConfigDirEnv(dir: string): { CLAUDE_CONFIG_DIR: string | undefined } {
+  return { CLAUDE_CONFIG_DIR: isDefaultClaudeConfigDir(dir) ? undefined : dir };
+}
 
 // Login detection:
 // - Linux etc.: the token is written to $CLAUDE_CONFIG_DIR/.credentials.json
@@ -34,7 +67,7 @@ export const claudeDriver: AgentDriver = {
   label: "Claude",
   bin: "claude",
   adapter: "claude",
-  homeEnv: (profileDir) => ({ CLAUDE_CONFIG_DIR: profileDir }),
+  homeEnv: (profileDir) => claudeConfigDirEnv(profileDir),
   // Leaving it bills API pay-as-you-go instead of the subscription
   stripEnv: ["ANTHROPIC_API_KEY"],
   isLoggedIn: claudeLoggedIn,

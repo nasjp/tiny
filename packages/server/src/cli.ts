@@ -17,6 +17,7 @@ import { findOnPath } from "./which.js";
 import { migrateClaudeCredential, type KeychainMigration } from "./keychain.js";
 import { addProfile, listProfiles, profileDir, profileDriver, renameProfile, type ProfileInfo } from "./profiles.js";
 import { agentEnv, getDriver, listDrivers } from "./agents/index.js";
+import { defaultClaudeConfigDir } from "./agents/claude.js";
 import { runSetup } from "./setup.js";
 import { TINY_VERSION } from "./version.js";
 import { createStores } from "./stores.js";
@@ -62,7 +63,7 @@ export function resolveHandoffInput(env: Record<string, string | undefined>): Ha
   return {
     agentSessionId: typeof sid === "string" && sid !== "" ? sid : null,
     // An empty env var means "not set" here, same as for the session id above
-    configDir: typeof dir === "string" && dir !== "" ? dir : path.join(os.homedir(), ".claude"),
+    configDir: typeof dir === "string" && dir !== "" ? dir : defaultClaudeConfigDir(),
   };
 }
 
@@ -409,7 +410,7 @@ program
   .description("always hand new Claude Code sessions to tiny (state: on|off; omit to show)")
   .option("--config-dir <dir>", "CLAUDE_CONFIG_DIR to configure (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
   .action((state: string | undefined, opts: { configDir?: string }) => {
-    const configDir = opts.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+    const configDir = opts.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir();
     const l = tinyLaunch();
     const command = buildHookCommand(l.command, l.args);
     if (state === undefined) {
@@ -451,7 +452,7 @@ program
       profiles: listProfiles(p.profilesDir),
       fileExists: (f) => fs.existsSync(f),
       sameFile,
-      alwaysHandoff: readLiveMode(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")),
+      alwaysHandoff: readLiveMode(process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir()),
     });
     console.log(formatDoctorReport(report));
     if (!report.ok) process.exitCode = 1;
