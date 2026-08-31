@@ -69,6 +69,26 @@ export function resolveHandoffInput(env: Record<string, string | undefined>): Ha
 }
 
 /**
+ * Which CLAUDE_CONFIG_DIR `tiny live` reads or writes the hooks in. The mode lives in exactly one
+ * settings.json, so this must never be a guess: `--profile` names a tiny profile (following it to
+ * an external config dir when the profile points at one), `--config-dir` is taken as given, and
+ * with neither it is the shell's own — the same directory the caller's `claude` would use.
+ */
+export function resolveLiveConfigDir(
+  opts: { profile?: string; configDir?: string },
+  profilesDir: string,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  if (opts.profile !== undefined && opts.configDir !== undefined) {
+    throw new Error("pass either --profile or --config-dir, not both");
+  }
+  if (opts.profile !== undefined) return profileDir(profilesDir, opts.profile);
+  if (opts.configDir !== undefined) return opts.configDir;
+  const dir = env.CLAUDE_CONFIG_DIR;
+  return typeof dir === "string" && dir !== "" ? dir : defaultClaudeConfigDir();
+}
+
+/**
  * Whether we are running inside an agent tiny itself spawned. TINY_SESSION_ID is only ever set in
  * the environment tiny gives those agents, and there is nothing there to hand off: the session is
  * already tiny's. The Agent SDK reads every settings source, so with `tiny live on` the
@@ -409,9 +429,10 @@ program
 program
   .command("live [state]")
   .description("always hand new Claude Code sessions to tiny (state: on|off; omit to show)")
+  .option("--profile <name>", "tiny profile to configure (default: the caller's own config dir)")
   .option("--config-dir <dir>", "CLAUDE_CONFIG_DIR to configure (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
-  .action((state: string | undefined, opts: { configDir?: string }) => {
-    const configDir = opts.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir();
+  .action((state: string | undefined, opts: { profile?: string; configDir?: string }) => {
+    const configDir = resolveLiveConfigDir(opts, tinyPaths().profilesDir);
     const l = tinyLaunch();
     const command = buildHookCommand(l.command, l.args);
     if (state === undefined) {

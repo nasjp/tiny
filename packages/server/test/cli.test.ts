@@ -14,10 +14,11 @@ import {
   isInsideTinyAgent,
   parseHookSessionId,
   resolveHandoffInput,
+  resolveLiveConfigDir,
   resolveSessionId,
   runProfileRename,
 } from "../src/cli.js";
-import { listProfiles, readProfileConfigDir } from "../src/profiles.js";
+import { addProfile, listProfiles, readProfileConfigDir } from "../src/profiles.js";
 import type { SessionRecord } from "../src/types.js";
 
 function sess(over: Partial<SessionRecord>): SessionRecord {
@@ -272,6 +273,55 @@ describe("handoff", () => {
     expect(readProfileConfigDir(path.join(root, "local"))).toBe(configDir);
     expect(ensureHandoffProfile(root, configDir)).toBe("local");
     expect(listProfiles(root)).toHaveLength(1);
+  });
+
+  // `tiny live` writes hooks into ONE settings.json, so which directory that is has to be
+  // unambiguous — the whole always-on mode lives there
+  describe("resolveLiveConfigDir", () => {
+    function profilesRoot(): string {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-live-"));
+      addProfile(root, "profile-1", "claude");
+      return root;
+    }
+
+    it("resolves a profile name to that profile's config dir", () => {
+      const root = profilesRoot();
+      expect(resolveLiveConfigDir({ profile: "profile-1" }, root, {}))
+        .toBe(path.join(root, "profile-1"));
+    });
+
+    // A profile can point at an external CLAUDE_CONFIG_DIR (`tiny handoff` makes those)
+    it("follows a profile that points at an external config dir", () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-live-"));
+      const external = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+      addProfile(root, "local", "claude", external);
+      expect(resolveLiveConfigDir({ profile: "local" }, root, {})).toBe(external);
+    });
+
+    it("takes --config-dir as-is", () => {
+      expect(resolveLiveConfigDir({ configDir: "/srv/cfg" }, profilesRoot(), {})).toBe("/srv/cfg");
+    });
+
+    it("falls back to the caller's own CLAUDE_CONFIG_DIR", () => {
+      expect(resolveLiveConfigDir({}, profilesRoot(), { CLAUDE_CONFIG_DIR: "/srv/mine" }))
+        .toBe("/srv/mine");
+    });
+
+    it("falls back to Claude Code's default directory when nothing says otherwise", () => {
+      expect(resolveLiveConfigDir({}, profilesRoot(), {}))
+        .toBe(path.join(os.homedir(), ".claude"));
+    });
+
+    // Silently letting one win would turn the mode on somewhere the user did not name
+    it("refuses --profile together with --config-dir", () => {
+      expect(() => resolveLiveConfigDir({ profile: "profile-1", configDir: "/srv/cfg" }, profilesRoot(), {}))
+        .toThrow(/either --profile or --config-dir/);
+    });
+
+    it("names an unknown profile instead of writing hooks somewhere random", () => {
+      expect(() => resolveLiveConfigDir({ profile: "nope" }, profilesRoot(), {}))
+        .toThrow(/profile not found: nope/);
+    });
   });
 
   it("makes a second profile for a different config dir", () => {
