@@ -197,6 +197,29 @@ final class ModelsTests: XCTestCase {
         XCTAssertNil(b.archivedAt)
     }
 
+    func testDecodesCliLiveWhenPresent() throws {
+        let json = """
+        {"id":"s1","agentSessionId":"a1","agent":"claude","profile":"local","cwd":"/tmp",
+         "permissionMode":"default","model":null,"effort":null,"title":"t","status":"idle",
+         "createdAt":"2026-08-31T00:00:00Z","updatedAt":"2026-08-31T00:00:00Z","cliLive":true}
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(SessionRecord.self, from: json)
+        XCTAssertEqual(s.cliLive, true)
+        XCTAssertTrue(s.isHeldByCLI)
+    }
+
+    func testCliLiveDefaultsToNilOnOlderServers() throws {
+        let json = """
+        {"id":"s1","agentSessionId":"a1","agent":"claude","profile":"work","cwd":"/tmp",
+         "permissionMode":"default","model":null,"effort":null,"title":"t","status":"idle",
+         "createdAt":"2026-08-31T00:00:00Z","updatedAt":"2026-08-31T00:00:00Z"}
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(SessionRecord.self, from: json)
+        XCTAssertNil(s.cliLive)
+        // Undetermined must never lock the composer
+        XCTAssertFalse(s.isHeldByCLI)
+    }
+
     func testPushIntentDecodesWithAndWithoutReqId() throws {
         let a = try JSONDecoder().decode(PushIntent.self, from: Data("""
         {"v":1,"type":"permission_requested","sessionId":"s","eventId":42,

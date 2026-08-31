@@ -176,6 +176,13 @@ struct SessionListView: View {
                 HStack {
                     Text(s.displayTitle).font(.tinyHeadline).lineLimit(1)
                     Spacer()
+                    if s.isHeldByCLI {
+                        Text("CLI")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.15), in: Capsule())
+                    }
                     statusBadge(s.status)
                 }
                 HStack(spacing: 4) {

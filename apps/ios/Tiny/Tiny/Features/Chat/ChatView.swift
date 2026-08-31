@@ -340,6 +340,12 @@ struct ChatView: View {
     /// ChatGPT-style composer: rounded container with attachment thumbnails + multi-line input + attach button + send button
     private var composer: some View {
         VStack(spacing: 0) {
+            if session.isHeldByCLI {
+                Text("Open in the CLI — close it there to send from here")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 14).padding(.top, 12)
+            }
             if !attachments.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -391,6 +397,7 @@ struct ChatView: View {
                     .padding(.trailing, 4)
                     .padding(.vertical, 12)
                     .focused($inputFocused)
+                    .disabled(session.isHeldByCLI)
                     .accessibilityIdentifier("chatInput")
                 Button {
                     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -555,9 +562,10 @@ struct ChatView: View {
         model.inner?.isSyncing == true && model.inner?.events.isEmpty == false
     }
 
-    /// Can send if there is either text or an image
+    /// Can send if there is either text or an image, and the CLI does not currently hold this session
     private var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+        (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+            && !session.isHeldByCLI
     }
 
     /// Whether an AskUserQuestion answer is pending (the standard composer is hidden while shown)
