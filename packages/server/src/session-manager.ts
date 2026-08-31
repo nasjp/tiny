@@ -45,7 +45,7 @@ export interface PeerBridge {
   /** What that process is doing. null = it is gone */
   status: (s: SessionRecord, target: PeerTarget) => PeerStatus | null;
   /** The CLI's current permission mode, asserted on the wrapper so a bypass session delivers instead of holding */
-  mode: (s: SessionRecord) => CliMode | null;
+  mode: (s: SessionRecord, target: PeerTarget) => CliMode | null;
   send: (s: SessionRecord, target: PeerTarget, frame: PeerFrame) => Promise<void>;
 }
 
@@ -586,7 +586,7 @@ export class SessionManager extends EventEmitter {
     try {
       // The CLI's inbox takes text only; images go on disk where the CLI can Read them
       const body = prompt + imagePaths.map((p) => `\n[attached image: ${p}]`).join("");
-      const content = wrapForPeer(body, { name: "tiny", mode: this.deps.peer!.mode(s) });
+      const content = wrapForPeer(body, { name: "tiny", mode: this.deps.peer!.mode(s, target) });
       try {
         await this.deps.peer!.send(s, target, { agentSessionId: s.agentSessionId!, msgId: live.msgId, content, priority: "next" });
       } catch (err) {
@@ -660,14 +660,17 @@ export class SessionManager extends EventEmitter {
     if (live.deliveredAt !== null && live.sawResponse && st.status === "idle") {
       return { type: "turn_completed", payload: { costUsd: null, resultText: null } };
     }
-    // Only idle time counts against delivery: while the CLI is busy with its own turn our message
-    // sits in its queue, and that can legitimately take minutes
-    if (live.deliveredAt === null && st.status === "idle") {
+    // Idle or waiting time counts against delivery: while the CLI is busy with its own turn our
+    // message sits in its queue, and that can legitimately take minutes. "waiting" must count too —
+    // a fresh bypass session with no transcript yet holds an unattested message and reports
+    // status: "waiting" indistinguishably from a real permission prompt, so it would otherwise hang
+    // for the full turn instead of surfacing as a failure
+    if (live.deliveredAt === null && (st.status === "idle" || st.status === "waiting")) {
       live.idleUndeliveredSince ??= now;
       if (now - live.idleUndeliveredSince > timing.deliveryTimeoutMs) {
         return {
           type: "turn_failed",
-          payload: { error: "the CLI dropped the message (it drops a repeat of the previous message within 30s, rate-limits bursts, and holds messages it was told to review)" },
+          payload: { error: "the CLI did not take the message (it may be held for review in the terminal, dropped as a repeat of the previous message, or rate-limited)" },
         };
       }
     } else {
@@ -703,7 +706,7 @@ export class SessionManager extends EventEmitter {
     // the watcher closes the turn as "interrupted" once the CLI has taken it
     if (live.stopMsgId !== null) return; // already stopping
     live.stopMsgId = crypto.randomUUID();
-    const content = wrapForPeer(PEER_STOP, { name: "tiny", mode: this.deps.peer!.mode(s) });
+    const content = wrapForPeer(PEER_STOP, { name: "tiny", mode: this.deps.peer!.mode(s, live.target) });
     this.deps.peer!
       .send(s, live.target, { agentSessionId: s.agentSessionId!, msgId: live.stopMsgId, content, priority: "now" })
       .catch((err) => {

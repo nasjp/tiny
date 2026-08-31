@@ -9,7 +9,7 @@ import { PermissionBroker } from "../src/permission-broker.js";
 import { FileOutbox } from "../src/outbox.js";
 import { ConflictError, NotFoundError, SessionManager, type PeerBridge, type SessionManagerDeps } from "../src/session-manager.js";
 import type { AgentAdapter, RunTurnParams } from "../src/adapter.js";
-import type { PeerFrame, PeerStatus } from "../src/claude-peer.js";
+import type { PeerFrame, PeerStatus, PeerTarget } from "../src/claude-peer.js";
 import type { EventRecord } from "../src/types.js";
 
 /** Fake session-token issuer for tests (stands in for AuthService.issueSessionToken / revokeSessionTokens) */
@@ -967,7 +967,7 @@ describe("SessionManager", () => {
 
   describe("SessionManager live turns (CLI holds the session)", () => {
     it("sends the turn to the CLI instead of 409, then completes from what the CLI writes", async () => {
-      const { peer, sent, setStatus } = fakePeer();
+      const { peer, sent, modeCalls, setStatus } = fakePeer();
       const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
       const { session, file } = liveSession(manager, home, "agent-live");
       const seen: EventRecord[] = [];
@@ -978,6 +978,9 @@ describe("SessionManager", () => {
       await until(() => sent.length === 1);
       expect(sent[0]!.agentSessionId).toBe("agent-live");
       expect(sent[0]!.content).toMatch(/^<cross-session-message from-name="tiny" from-mode="prompting">\nhello from the phone\n/);
+      // mode() must be called with the resolved target, not just the session — this is how the
+      // server picks up readProcessMode(target.pid) when the transcript does not exist yet
+      expect(modeCalls).toContainEqual({ pid: 4242, sockPath: "/srv/cc-socks/4242.sock" });
 
       // the CLI runs it: registry goes busy, the transcript gets our record and the reply, then idle
       setStatus({ status: "busy", waitingFor: null });
@@ -1129,6 +1132,25 @@ describe("SessionManager", () => {
       expect(seen.at(-1)!.type).toBe("turn_completed");
     });
 
+    it("times out a message held for review (status stays 'waiting', not idle) instead of hanging for the full turn", async () => {
+      // A fresh bypass session with no transcript yet holds an unattested message and reports
+      // status: "waiting" the same as a real permission prompt — this must not be mistaken for
+      // "the CLI is busy with its own turn" (which does not count toward the delivery timeout)
+      const { peer, sent, setStatus } = fakePeer();
+      setStatus({ status: "waiting", waitingFor: "permission prompt" });
+      const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session } = liveSession(manager, home, "agent-held");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      await manager.waitForIdle(session.id);
+      const failed = seen.find((e) => e.type === "turn_failed");
+      expect(failed?.payload.error).toMatch(/dropped|held/);
+      expect(seen.filter((e) => e.type === "cli_attention")).toHaveLength(1);
+      expect(stores.sessions.get(session.id)!.status).toBe("idle");
+    });
+
     it("fails the turn when the CLI goes away mid-turn", async () => {
       const { peer, sent, setStatus } = fakePeer();
       const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
@@ -1254,17 +1276,21 @@ const FAST_LIVE = { pollMs: 10, deliveryTimeoutMs: 200, maxTurnMs: 2000 };
 
 function fakePeer(over: Partial<PeerBridge> = {}) {
   const sent: PeerFrame[] = [];
+  const modeCalls: PeerTarget[] = [];
   let status: PeerStatus | null = { status: "idle", waitingFor: null };
   const peer: PeerBridge = {
     resolve: () => ({ pid: 4242, sockPath: "/srv/cc-socks/4242.sock" }),
     status: () => status,
-    mode: () => "prompting",
+    mode: (_s, target) => {
+      modeCalls.push(target);
+      return "prompting";
+    },
     send: async (_s, _t, frame) => {
       sent.push(frame);
     },
     ...over,
   };
-  return { peer, sent, setStatus: (st: PeerStatus | null) => { status = st; } };
+  return { peer, sent, modeCalls, setStatus: (st: PeerStatus | null) => { status = st; } };
 }
 
 async function until(cond: () => boolean, ms = 1000): Promise<void> {

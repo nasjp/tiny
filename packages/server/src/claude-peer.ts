@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
@@ -158,6 +159,35 @@ export function readCliMode(transcriptFile: string): CliMode | null {
   }
   if (mode === null) return null;
   return mode === "bypassPermissions" ? "bypass" : "prompting";
+}
+
+/**
+ * The mode the CLI process was started with, read from its argv (`ps`). Used when the transcript
+ * cannot tell (a session that has not run a turn yet has no transcript file). `--dangerously-skip-
+ * permissions` / `--permission-mode bypassPermissions` mean bypass; any other start is prompting
+ * (default / auto / acceptEdits / plan). null when the process cannot be inspected.
+ */
+export function readProcessMode(
+  pid: number,
+  ps: (pid: number) => string | null = psArgs,
+): CliMode | null {
+  const args = ps(pid);
+  if (args === null) return null;
+  if (/(^|\s)--dangerously-skip-permissions(\s|$)/.test(args)) return "bypass";
+  if (/(^|\s)--permission-mode(=|\s+)bypassPermissions(\s|$)/.test(args)) return "bypass";
+  return "prompting";
+}
+
+function psArgs(pid: number): string | null {
+  try {
+    // Spawned processes must never inherit ANTHROPIC_API_KEY (repo rule), even a `ps`
+    const { ANTHROPIC_API_KEY: _omit, ...env } = process.env;
+    const out = execFileSync("ps", ["-o", "args=", "-p", String(pid)], { env, encoding: "utf8", timeout: 2000 });
+    const line = out.trim();
+    return line === "" ? null : line;
+  } catch {
+    return null;
+  }
 }
 
 export const PEER_TAG = "cross-session-message";

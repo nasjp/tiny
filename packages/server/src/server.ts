@@ -5,7 +5,7 @@ import { ensureDirs, tinyPaths } from "./config.js";
 import { createApp } from "./api.js";
 import { AuthService } from "./auth.js";
 import { readLiveSessionIds } from "./claude-live.js";
-import { readCliMode, readPeerStatus, readPeerToken, resolvePeerTarget, sendPeerMessage } from "./claude-peer.js";
+import { readCliMode, readPeerStatus, readPeerToken, readProcessMode, resolvePeerTarget, sendPeerMessage } from "./claude-peer.js";
 import { findTranscript } from "./claude-transcript.js";
 import { FileOutbox } from "./outbox.js";
 import { openDb } from "./db.js";
@@ -90,10 +90,11 @@ export async function startServer(env: Record<string, string | undefined> = proc
       const dir = configDirOf(s);
       return dir ? readPeerStatus(dir, target) : null;
     },
-    mode: (s) => {
+    mode: (s, target) => {
       const dir = configDirOf(s);
       const file = dir && s.agentSessionId ? findTranscript(dir, s.cwd, s.agentSessionId) : null;
-      return file ? readCliMode(file) : null;
+      // A session that has not run a turn yet has no transcript; its argv still says how it was started
+      return (file ? readCliMode(file) : null) ?? readProcessMode(target.pid);
     },
     send: (s, target, frame) => {
       const dir = configDirOf(s);

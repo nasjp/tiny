@@ -10,6 +10,7 @@ import {
   readCliMode,
   readPeerStatus,
   readPeerToken,
+  readProcessMode,
   resolvePeerTarget,
   sendPeerMessage,
   summarizePeerInboxes,
@@ -249,5 +250,27 @@ describe("claude-peer: summarizePeerInboxes", () => {
   it("is zeros when neither directory exists", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-peer-"));
     expect(summarizePeerInboxes(root, path.join(root, "none"), () => true)).toEqual({ open: 0, sockets: 0, stale: 0 });
+  });
+});
+
+describe("claude-peer: readProcessMode", () => {
+  it("reads bypass from --dangerously-skip-permissions or --permission-mode bypassPermissions", () => {
+    expect(readProcessMode(1, () => "claude --dangerously-skip-permissions")).toBe("bypass");
+    expect(readProcessMode(1, () => "claude --permission-mode bypassPermissions")).toBe("bypass");
+    expect(readProcessMode(1, () => "claude --permission-mode=bypassPermissions")).toBe("bypass");
+  });
+
+  it("reads prompting from any other start, including default/no-flag/resume", () => {
+    expect(readProcessMode(1, () => "claude --permission-mode default")).toBe("prompting");
+    expect(readProcessMode(1, () => "claude")).toBe("prompting");
+    expect(readProcessMode(1, () => "claude --resume abc")).toBe("prompting");
+  });
+
+  it("is null when the process cannot be inspected", () => {
+    expect(readProcessMode(1, () => null)).toBeNull();
+  });
+
+  it("does not match the flag as a substring of another token", () => {
+    expect(readProcessMode(1, () => "claude --dangerously-skip-permissions-not")).toBe("prompting");
   });
 });
