@@ -356,6 +356,70 @@ describe("SessionManager", () => {
     expect(stores.events.count(session.id)).toBe(count);
   });
 
+  // Only the path that actually imports events may record a stat. If advanceCursor recorded one it
+  // would mark the file "consumed" after reading nothing but the tail uuid, and the next real sync
+  // would skip it — silently dropping genuine appended conversation
+  it("advanceCursor does not mark the transcript as read", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    addProfile(profilesDir, "local", "claude", configDir);
+    const stores = createStores(openDb(":memory:"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-c.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+
+    // a record the CLI adds later, and a bookkeeping line padded to its exact byte length, so the
+    // two file states are indistinguishable by size — only the recorded stat decides
+    const later = JSON.stringify({ type: "user", uuid: "c1", message: { role: "user", content: "from the CLI, later" } });
+    let filler = "";
+    for (let pad = 0; filler.length !== later.length; pad++) {
+      filler = JSON.stringify({ type: "mode", pad: "x".repeat(pad) });
+      if (filler.length > later.length) throw new Error("cannot pad to the same length");
+    }
+    const t = new Date(1_700_000_000_000);
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }) + "\n");
+
+    const writesThenStamps: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        p.emit({ type: "assistant_text", payload: { text: "done" } });
+        fs.appendFileSync(file, [
+          JSON.stringify({ type: "user", uuid: "t-u", message: { role: "user", content: "from the phone" } }),
+          JSON.stringify({ type: "assistant", uuid: "t-a", message: { content: [{ type: "text", text: "done" }] } }),
+          filler,
+        ].join("\n") + "\n");
+        // fixed timestamp, so the stat advanceCursor sees and the one after the swap agree exactly
+        fs.utimesSync(file, t, t);
+        return { agentSessionId: "agent-c", costUsd: null, resultText: "ok" };
+      },
+    };
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: writesThenStamps },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+    });
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-c" });
+    manager.startTurn(session.id, "from the phone");
+    await manager.waitForIdle(session.id);
+    expect(manager.getSession(session.id).sourceCursor).toBe("t-a");
+
+    // the CLI's next line lands in a file of identical size and mtime
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }),
+      JSON.stringify({ type: "user", uuid: "t-u", message: { role: "user", content: "from the phone" } }),
+      JSON.stringify({ type: "assistant", uuid: "t-a", message: { content: [{ type: "text", text: "done" }] } }),
+      later,
+    ].join("\n") + "\n");
+    fs.utimesSync(file, t, t);
+
+    // only the import path may have recorded a stat, so this must still be read
+    expect(manager.syncTranscript(session.id)).toBe(1);
+    expect(stores.events.listSince(session.id, 0).at(-1)!.payload).toEqual({ text: "from the CLI, later" });
+  });
+
   it("syncTranscript does not re-read a transcript whose path, size and mtime are unchanged", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");

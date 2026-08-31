@@ -214,11 +214,12 @@ export class SessionManager extends EventEmitter {
     try {
       const file = this.transcriptFile(s);
       if (!file) return;
-      // Behind the same guard as syncTranscript: an unchanged file already has the cursor at its
-      // tail, so there is nothing to do and no reason to parse it again
-      const stat = this.transcriptChange(s.id, file);
-      if (!stat) return;
-      this.transcriptStats.set(s.id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
+      // Reads the same guard as syncTranscript — an unchanged file already has the cursor at its
+      // tail, so there is nothing to do and no reason to parse it again — but NEVER records a stat.
+      // Recording one here would mark the file consumed after reading nothing but its tail uuid,
+      // and the next real sync would skip it, silently dropping genuine appended conversation.
+      // Only the path that actually imports events may record a stat
+      if (!this.transcriptChange(s.id, file)) return;
       const cursor = readTranscriptCursor(file);
       if (cursor && cursor !== s.sourceCursor) this.deps.stores.sessions.patch(s.id, { sourceCursor: cursor });
     } catch {
@@ -229,7 +230,7 @@ export class SessionManager extends EventEmitter {
   /**
    * The transcript's stat when it is worth reading, or null when there is nothing new (path, size
    * and mtime all match the last read) or it cannot be stat'ed — both mean "do nothing".
-   * A caller that goes on to read must record the returned stat.
+   * Only a caller that goes on to IMPORT records the returned stat; see advanceCursor.
    */
   private transcriptChange(id: string, file: string): fs.Stats | null {
     let stat: fs.Stats;
