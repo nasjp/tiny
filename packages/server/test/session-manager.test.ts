@@ -7,8 +7,9 @@ import { createStores } from "../src/stores.js";
 import { addProfile } from "../src/profiles.js";
 import { PermissionBroker } from "../src/permission-broker.js";
 import { FileOutbox } from "../src/outbox.js";
-import { ConflictError, NotFoundError, SessionManager } from "../src/session-manager.js";
+import { ConflictError, NotFoundError, SessionManager, type PeerBridge, type SessionManagerDeps } from "../src/session-manager.js";
 import type { AgentAdapter, RunTurnParams } from "../src/adapter.js";
+import type { PeerFrame, PeerStatus } from "../src/claude-peer.js";
 import type { EventRecord } from "../src/types.js";
 
 /** Fake session-token issuer for tests (stands in for AuthService.issueSessionToken / revokeSessionTokens) */
@@ -30,7 +31,10 @@ function fakeTokens() {
   };
 }
 
-function makeManager(adapter: AgentAdapter, { withTokens = true }: { withTokens?: boolean } = {}) {
+function makeManager(
+  adapter: AgentAdapter,
+  { withTokens = true, deps = {} }: { withTokens?: boolean; deps?: Partial<SessionManagerDeps> } = {},
+) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
   const profilesDir = path.join(home, "profiles");
   const outboxDir = path.join(home, "outbox");
@@ -49,6 +53,7 @@ function makeManager(adapter: AgentAdapter, { withTokens = true }: { withTokens?
       env: { TINY_SESSION_ID: sessionId, TINY_TOKEN: token },
     }),
     ...(withTokens ? { sessionTokens: tokens } : {}),
+    ...deps,
   });
   return { manager, stores, home, tokens };
 }
@@ -959,4 +964,245 @@ describe("SessionManager", () => {
     expect(types).toEqual(["user_message", "turn_failed"]);
     expect(manager.getSession(s.id).status).toBe("idle");
   });
+
+  describe("SessionManager live turns (CLI holds the session)", () => {
+    it("sends the turn to the CLI instead of 409, then completes from what the CLI writes", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-live");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+
+      manager.startTurn(session.id, "hello from the phone");
+      expect(stores.sessions.get(session.id)!.status).toBe("running");
+      await until(() => sent.length === 1);
+      expect(sent[0]!.agentSessionId).toBe("agent-live");
+      expect(sent[0]!.content).toMatch(/^<cross-session-message from-name="tiny" from-mode="prompting">\nhello from the phone\n/);
+
+      // the CLI runs it: registry goes busy, the transcript gets our record and the reply, then idle
+      setStatus({ status: "busy", waitingFor: null });
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId), assistantRecord("hi phone")]));
+      setStatus({ status: "idle", waitingFor: null });
+      await manager.waitForIdle(session.id);
+
+      expect(seen.map((e) => e.type)).toEqual(["user_message", "turn_started", "assistant_text", "turn_completed"]);
+      expect(seen[0]!.payload.text).toBe("hello from the phone");
+      expect(stores.sessions.get(session.id)!.status).toBe("idle");
+      // the CLI's own record of our message must not come back as a second user bubble
+      expect(seen.filter((e) => e.type === "user_message")).toHaveLength(1);
+    });
+
+    it("puts attached images on disk and tells the CLI where they are", async () => {
+      const { peer, sent } = fakePeer();
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session } = liveSession(manager, home, "agent-img");
+      const png = Buffer.from("89504e470d0a1a0a", "hex").toString("base64");
+      manager.startTurn(session.id, "what is this", [{ data: png, mediaType: "image/png" }]);
+      await until(() => sent.length === 1);
+      const m = /\[attached image: (\S+)\]/.exec(sent[0]!.content);
+      expect(m).not.toBeNull();
+      expect(fs.existsSync(m![1]!)).toBe(true);
+      await manager.waitForIdle(session.id); // ends as turn_failed (nothing ever delivered) — that is fine here
+    });
+
+    it("fails the turn when the CLI never records the message while idle (dropped as duplicate / rate-limited)", async () => {
+      const { peer } = fakePeer();
+      const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session } = liveSession(manager, home, "agent-drop");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await manager.waitForIdle(session.id);
+      const failed = seen.find((e) => e.type === "turn_failed");
+      expect(failed?.payload.error).toMatch(/dropped/);
+      expect(stores.sessions.get(session.id)!.status).toBe("idle");
+    });
+
+    it("keeps waiting while the CLI is busy with its own turn — the message is queued, not dropped", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      setStatus({ status: "busy", waitingFor: null });
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-queued");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      await new Promise((r) => setTimeout(r, FAST_LIVE.deliveryTimeoutMs * 2)); // well past the idle-only timeout
+      expect(seen.some((e) => e.type === "turn_failed")).toBe(false);
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId), assistantRecord("late reply")]));
+      setStatus({ status: "idle", waitingFor: null });
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)!.type).toBe("turn_completed");
+    });
+
+    it("fails the turn when the CLI goes away mid-turn", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session } = liveSession(manager, home, "agent-gone");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      setStatus(null);
+      await manager.waitForIdle(session.id);
+      expect(seen.find((e) => e.type === "turn_failed")?.payload.error).toMatch(/CLI closed/);
+    });
+
+    it("fails immediately, without turn_started, when the socket cannot be written", async () => {
+      const { peer } = fakePeer({ send: async () => { throw new Error("connect ENOENT /srv/cc-socks/4242.sock"); } });
+      const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session } = liveSession(manager, home, "agent-nosock");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await manager.waitForIdle(session.id);
+      expect(seen.map((e) => e.type)).toEqual(["user_message", "turn_failed"]);
+      expect(seen[1]!.payload.error).toMatch(/could not reach the CLI/);
+      expect(stores.sessions.get(session.id)!.status).toBe("idle");
+    });
+
+    it("reports the CLI waiting for its user once per wait, as cli_attention", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-wait");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "run the tests");
+      await until(() => sent.length === 1);
+      setStatus({ status: "busy", waitingFor: null });
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId)]));
+      await until(() => seen.some((e) => e.type === "turn_started"));
+      setStatus({ status: "waiting", waitingFor: "permission prompt" });
+      await until(() => seen.some((e) => e.type === "cli_attention"));
+      await new Promise((r) => setTimeout(r, FAST_LIVE.pollMs * 5)); // still waiting: must not repeat
+      setStatus({ status: "busy", waitingFor: null });
+      fs.appendFileSync(file, jsonl([assistantRecord("tests pass")]));
+      setStatus({ status: "idle", waitingFor: null });
+      await manager.waitForIdle(session.id);
+      const attention = seen.filter((e) => e.type === "cli_attention");
+      expect(attention).toHaveLength(1);
+      expect(attention[0]!.payload.reason).toBe("permission prompt");
+      expect(seen.at(-1)!.type).toBe("turn_completed");
+    });
+
+    it("Stop sends a 'now' message that makes the CLI abandon the turn, and the turn ends as interrupted", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-stop");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "count to a million");
+      await until(() => sent.length === 1);
+      setStatus({ status: "busy", waitingFor: null });
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId), assistantRecord("1\n2\n3")]));
+      await until(() => seen.some((e) => e.type === "assistant_text"));
+
+      manager.interrupt(session.id);
+      await until(() => sent.length === 2);
+      expect(sent[1]!.priority).toBe("now");
+      expect(sent[1]!.content).toContain("pressed Stop");
+      manager.interrupt(session.id); // a second tap while stopping does not send twice
+      expect(sent).toHaveLength(2);
+
+      // the CLI takes the stop message, answers in one line, goes idle
+      fs.appendFileSync(file, jsonl([peerRecord(sent[1]!.msgId), assistantRecord("Stopped.")]));
+      setStatus({ status: "idle", waitingFor: null });
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "interrupted" } });
+    });
+
+    it("Stop on a turn the CLI has not taken yet still ends the turn once the stop message lands", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      setStatus({ status: "busy", waitingFor: null }); // the CLI is busy with its own work; ours is queued
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-stop-queued");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      manager.interrupt(session.id);
+      await until(() => sent.length === 2);
+      fs.writeFileSync(file, jsonl([peerRecord(sent[1]!.msgId), assistantRecord("Stopped.")]));
+      setStatus({ status: "idle", waitingFor: null });
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "interrupted" } });
+    });
+
+    it("still refuses with 409 when the CLI is live but cannot be joined", () => {
+      const { peer } = fakePeer({ resolve: () => null });
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer } });
+      const { session } = liveSession(manager, home, "agent-nojoin");
+      expect(() => manager.startTurn(session.id, "hello")).toThrow(/open in the CLI/);
+    });
+
+    it("canJoin is false without a peer bridge, for other agents, without an agent session id, or when the CLI is not live", () => {
+      const { peer } = fakePeer();
+      const none = makeManager(okAdapter, { deps: { isCliLive: () => true } });
+      const a = liveSession(none.manager, none.home, "agent-a").session;
+      expect(none.manager.canJoin(a)).toBe(false);
+
+      const notLive = makeManager(okAdapter, { deps: { isCliLive: () => false, peer } });
+      const b = liveSession(notLive.manager, notLive.home, "agent-b").session;
+      expect(notLive.manager.canJoin(b)).toBe(false);
+
+      const live = makeManager(okAdapter, { deps: { isCliLive: () => true, peer } });
+      const c = liveSession(live.manager, live.home, "agent-c").session;
+      expect(live.manager.canJoin(c)).toBe(true);
+      const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+      expect(live.manager.canJoin(live.manager.createSession({ profile: "oc", cwd }))).toBe(false); // opencode
+      expect(live.manager.canJoin(live.manager.createSession({ profile: "work", cwd }))).toBe(false); // no agentSessionId yet
+    });
+  });
 });
+
+/** Watcher timings short enough for tests: poll 10ms, give up on delivery after 200ms idle, 2s max */
+const FAST_LIVE = { pollMs: 10, deliveryTimeoutMs: 200, maxTurnMs: 2000 };
+
+function fakePeer(over: Partial<PeerBridge> = {}) {
+  const sent: PeerFrame[] = [];
+  let status: PeerStatus | null = { status: "idle", waitingFor: null };
+  const peer: PeerBridge = {
+    resolve: () => ({ pid: 4242, sockPath: "/srv/cc-socks/4242.sock" }),
+    status: () => status,
+    mode: () => "prompting",
+    send: async (_s, _t, frame) => {
+      sent.push(frame);
+    },
+    ...over,
+  };
+  return { peer, sent, setStatus: (st: PeerStatus | null) => { status = st; } };
+}
+
+async function until(cond: () => boolean, ms = 1000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("condition not met in time");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+/** A handoff session whose CLI is live, plus the transcript path the CLI would write */
+function liveSession(manager: SessionManager, home: string, agentSessionId: string) {
+  const configDir = path.join(home, "external-claude");
+  fs.mkdirSync(configDir, { recursive: true });
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+  addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+  const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId });
+  const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), `${agentSessionId}.jsonl`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  return { session, file };
+}
+
+function peerRecord(msgId: string): Record<string, unknown> {
+  return {
+    type: "user", uuid: `p-${msgId}`, isMeta: true, promptSource: "system",
+    origin: { kind: "peer", from: "unknown", msg_id: msgId, name: "tiny" },
+    message: { role: "user", content: "Another Claude session sent a message: ..." },
+  };
+}
+
+function assistantRecord(text: string): Record<string, unknown> {
+  return { type: "assistant", uuid: `a-${text}`, message: { content: [{ type: "text", text }] } };
+}
+
+const jsonl = (records: Array<Record<string, unknown>>) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";

@@ -6,6 +6,7 @@ import type { McpLaunch } from "./mcp-launch.js";
 import type { FileOutbox } from "./outbox.js";
 import { profileDir, profileDriver } from "./profiles.js";
 import { findTranscript, readTranscript, readTranscriptCursor } from "./claude-transcript.js";
+import { PEER_STOP, wrapForPeer, type CliMode, type PeerFrame, type PeerStatus, type PeerTarget } from "./claude-peer.js";
 import type { AgentCapabilities, AgentDriver } from "./agents/index.js";
 import type { PendingPermission, PermissionBroker, PermissionDecision } from "./permission-broker.js";
 import type { SessionPatch, Stores } from "./stores.js";
@@ -34,6 +35,31 @@ export interface SessionTokenIssuer {
   revokeSessionTokens(sessionId: string): void;
 }
 
+/**
+ * How the manager talks to the agent's own CLI process while it holds a session (Step 2 live join).
+ * Implemented by claude-peer.ts in server.ts; tests inject fakes. Absent = Step 1 behaviour (409)
+ */
+export interface PeerBridge {
+  /** The live CLI process holding this session, or null (= cannot join) */
+  resolve: (s: SessionRecord) => PeerTarget | null;
+  /** What that process is doing. null = it is gone */
+  status: (s: SessionRecord, target: PeerTarget) => PeerStatus | null;
+  /** The CLI's current permission mode, asserted on the wrapper so a bypass session delivers instead of holding */
+  mode: (s: SessionRecord) => CliMode | null;
+  send: (s: SessionRecord, target: PeerTarget, frame: PeerFrame) => Promise<void>;
+}
+
+export interface LiveTiming {
+  /** How often the watcher looks at the transcript and the registry */
+  pollMs: number;
+  /** How long the CLI may sit idle without recording our message before we call it dropped */
+  deliveryTimeoutMs: number;
+  /** Hard stop for one live turn */
+  maxTurnMs: number;
+}
+
+const DEFAULT_LIVE_TIMING: LiveTiming = { pollMs: 1000, deliveryTimeoutMs: 60_000, maxTurnMs: 30 * 60_000 };
+
 export interface SessionManagerDeps {
   stores: Stores;
   profilesDir: string;
@@ -50,6 +76,10 @@ export interface SessionManagerDeps {
    * Injected so tests do not depend on a real registry. Absent = never blocks.
    */
   isCliLive?: (s: SessionRecord) => boolean | null;
+  /** Live join into the CLI (Step 2). Absent = a turn sent while the CLI holds the session is refused (409) */
+  peer?: PeerBridge;
+  /** Watcher timings. Tests shorten them; production uses the defaults */
+  liveTiming?: LiveTiming;
 }
 
 interface RunningTurn {
@@ -57,8 +87,25 @@ interface RunningTurn {
   done: Promise<void>;
 }
 
+interface LiveTurn {
+  msgId: string;
+  target: PeerTarget;
+  startedAt: number;
+  /** When the CLI's transcript first showed our msg_id */
+  deliveredAt: number | null;
+  /** The transcript produced assistant output after we started */
+  sawResponse: boolean;
+  /** Since when the CLI has been idle without having recorded our message (null while busy / delivered) */
+  idleUndeliveredSince: number | null;
+  lastStatus: PeerStatus["status"] | null;
+  /** msg_id of the Stop message sent on interrupt(); the turn ends as "interrupted" once the CLI took it */
+  stopMsgId: string | null;
+}
+
 export class SessionManager extends EventEmitter {
   private running = new Map<string, RunningTurn>();
+  /** Turns currently running inside the user's CLI rather than tiny's own adapter, by session id */
+  private liveTurns = new Map<string, LiveTurn>();
   /**
    * Last transcript stat per session. Parsing a transcript is expensive (a 139MB one costs ~250ms
    * and ~800MB of RSS) and the events endpoint asks on every poll, so an unchanged file must cost
@@ -260,17 +307,24 @@ export class SessionManager extends EventEmitter {
    * Returns how many events were appended. Never throws — a missing transcript is normal.
    */
   syncTranscript(id: string): number {
+    return this.importTranscript(id).imported;
+  }
+
+  private static readonly NO_IMPORT = { imported: 0, peerMsgIds: [] as string[], responded: false };
+
+  private importTranscript(id: string): { imported: number; peerMsgIds: string[]; responded: boolean } {
     const s = this.getSession(id);
     // Mid-turn, tiny is itself appending to this transcript through the SDK and emitting every one
     // of those records natively as it goes. Importing them here would duplicate them, and the
     // cursor advance at completion cannot take back events already in the log. With this guard the
     // writers of the jsonl (the user's CLI, tiny's SDK child) and the writers of the cursor
-    // (syncTranscript, turn completion) can no longer interleave
-    if (s.status === "running") return 0;
+    // (syncTranscript, turn completion) can no longer interleave.
+    // A LIVE turn is the exception: the only writer is the user's CLI, so importing is the point
+    if (s.status === "running" && !this.liveTurns.has(id)) return SessionManager.NO_IMPORT;
     const file = this.transcriptFile(s);
-    if (!file) return 0;
+    if (!file) return SessionManager.NO_IMPORT;
     const stat = this.transcriptChange(id, file);
-    if (!stat) return 0;
+    if (!stat) return SessionManager.NO_IMPORT;
     const read = readTranscript(file, {
       sinceUuid: s.sourceCursor,
       ...(s.sourceCursor ? {} : { turns: SessionManager.BACKFILL_TURNS }),
@@ -285,7 +339,11 @@ export class SessionManager extends EventEmitter {
     // yielded none (a rotate caught mid-flight) would otherwise advance the stat while the cursor
     // stood still, and those records would never be imported. Leave the old entry: the next call retries
     if (read.cursor) this.transcriptStats.set(id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
-    return read.events.length;
+    return {
+      imported: read.events.length,
+      peerMsgIds: read.peerMsgIds,
+      responded: read.events.some((ev) => ev.type === "assistant_text" || ev.type === "tool_started"),
+    };
   }
 
   /**
@@ -355,35 +413,62 @@ export class SessionManager extends EventEmitter {
     return s;
   }
 
+  /**
+   * Whether a turn sent now would run inside the user's CLI (live join) rather than be refused.
+   * Claude only in Step 2; other agents keep the Step 1 rule
+   */
+  canJoin(s: SessionRecord): boolean {
+    if (!this.deps.peer || s.agent !== "claude" || !s.agentSessionId) return false;
+    if (this.deps.isCliLive?.(s) !== true) return false;
+    return this.deps.peer.resolve(s) !== null;
+  }
+
   startTurn(id: string, prompt: string, images?: TurnImage[]): void {
     const s = this.getSession(id);
     if (s.status === "running") throw new ConflictError("turn already running");
     if (s.status === "detached") throw new ConflictError("session is attached from CLI");
-    // Step 1 has no live-join yet: a turn sent while the CLI holds the session would run in a
-    // separate process and the CLI can overwrite the transcript leaf on exit, stranding it
-    if (this.deps.isCliLive?.(s) === true) throw new ConflictError("session is open in the CLI");
+    if (this.deps.isCliLive?.(s) === true) {
+      // The CLI holds the session. Running the turn in a second process would race it on the
+      // transcript, so either hand the message to that very process (live join) or refuse
+      const target = this.canJoin(s) ? this.deps.peer!.resolve(s) : null;
+      if (!target) throw new ConflictError("session is open in the CLI");
+      this.deps.stores.sessions.patch(id, { status: "running", title: s.title ?? prompt.slice(0, 60) });
+      const saved = this.persistUserMessage(id, prompt, images);
+      const done = this.runLiveTurn(s, prompt, saved.paths, target).finally(() => this.running.delete(id));
+      this.running.set(id, { abort: new AbortController(), done });
+      return;
+    }
     const abort = new AbortController();
     this.deps.stores.sessions.patch(id, { status: "running", title: s.title ?? prompt.slice(0, 60) });
-    // Persist the user's message as an event too. Without this, the client's history view
-    // shows no user-side bubbles at all (the SDK stream does not include the prompt).
-    // Images are saved to the outbox and given a fileId (so history can show thumbnails).
-    // A save failure must not block the send itself (only the image count remains in that case)
-    let imageFileIds: string[] = [];
+    this.persistUserMessage(id, prompt, images);
+    const done = this.runTurn(s, prompt, images, abort.signal).finally(() => this.running.delete(id));
+    this.running.set(id, { abort, done });
+  }
+
+  /**
+   * Persist the user's message as an event. Without this, the client's history view shows no
+   * user-side bubbles at all (the SDK stream does not include the prompt). Images are saved to the
+   * outbox and given a fileId (so history can show thumbnails); a save failure must not block the
+   * send itself (only the image count remains in that case)
+   */
+  private persistUserMessage(id: string, prompt: string, images?: TurnImage[]): { fileIds: string[]; paths: string[] } {
+    let fileIds: string[] = [];
+    let paths: string[] = [];
     try {
-      imageFileIds = (images ?? []).map(
-        (img) => this.deps.outbox.saveData(id, Buffer.from(img.data, "base64"), img.mediaType).id,
-      );
+      const saved = (images ?? []).map((img) => this.deps.outbox.saveData(id, Buffer.from(img.data, "base64"), img.mediaType));
+      fileIds = saved.map((f) => f.id);
+      paths = saved.map((f) => f.storedPath);
     } catch (err) {
       console.error("[tinyd] failed to persist turn images:", err);
-      imageFileIds = [];
+      fileIds = [];
+      paths = [];
     }
     this.emitEvent(id, "user_message", {
       text: prompt,
       ...(images && images.length > 0 ? { imageCount: images.length } : {}),
-      ...(imageFileIds.length > 0 ? { imageFileIds } : {}),
+      ...(fileIds.length > 0 ? { imageFileIds: fileIds } : {}),
     });
-    const done = this.runTurn(s, prompt, images, abort.signal).finally(() => this.running.delete(id));
-    this.running.set(id, { abort, done });
+    return { fileIds, paths };
   }
 
   private async runTurn(
@@ -457,6 +542,92 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  /**
+   * A turn that runs inside the user's CLI. We hand the message to the CLI process over its
+   * messaging socket, then watch two things it maintains anyway: the transcript (for our msg_id
+   * coming back as a peer record, and for the reply) and the registry status (busy / idle /
+   * waiting). Nothing in this loop touches the socket again — the CLI never answers on it
+   */
+  private async runLiveTurn(s: SessionRecord, prompt: string, imagePaths: string[], target: PeerTarget): Promise<void> {
+    const timing = this.deps.liveTiming ?? DEFAULT_LIVE_TIMING;
+    const live: LiveTurn = {
+      msgId: crypto.randomUUID(), target, startedAt: Date.now(), deliveredAt: null,
+      sawResponse: false, idleUndeliveredSince: null, lastStatus: null, stopMsgId: null,
+    };
+    this.liveTurns.set(s.id, live);
+    try {
+      // The CLI's inbox takes text only; images go on disk where the CLI can Read them
+      const body = prompt + imagePaths.map((p) => `\n[attached image: ${p}]`).join("");
+      const content = wrapForPeer(body, { name: "tiny", mode: this.deps.peer!.mode(s) });
+      try {
+        await this.deps.peer!.send(s, target, { agentSessionId: s.agentSessionId!, msgId: live.msgId, content, priority: "next" });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        this.emitEvent(s.id, "turn_failed", { error: `could not reach the CLI: ${reason}` });
+        return;
+      }
+      this.emitEvent(s.id, "turn_started", { agentSessionId: s.agentSessionId });
+      for (;;) {
+        await new Promise((r) => setTimeout(r, timing.pollMs));
+        const outcome = this.pollLiveTurn(s, live, timing);
+        if (outcome) {
+          this.emitEvent(s.id, outcome.type, outcome.payload);
+          return;
+        }
+      }
+    } finally {
+      this.liveTurns.delete(s.id);
+      this.deps.stores.sessions.patch(s.id, { status: "idle" });
+      // No advanceCursorAfterTurn here: everything the CLI wrote is ours to import
+    }
+  }
+
+  /** One watcher tick. Returns the terminal event when the turn is over, null to keep watching */
+  private pollLiveTurn(
+    s: SessionRecord,
+    live: LiveTurn,
+    timing: LiveTiming,
+  ): { type: "turn_completed" | "turn_failed"; payload: Record<string, unknown> } | null {
+    const now = Date.now();
+    const read = this.importTranscript(s.id);
+    if (live.deliveredAt === null && read.peerMsgIds.includes(live.msgId)) live.deliveredAt = now;
+    if (read.responded) live.sawResponse = true;
+
+    const st = this.deps.peer!.status(s, live.target);
+    if (st === null) return { type: "turn_failed", payload: { error: "the CLI closed" } };
+    if (st.status === "waiting" && live.lastStatus !== "waiting") {
+      this.emitEvent(s.id, "cli_attention", { reason: st.waitingFor ?? "input" });
+    }
+    live.lastStatus = st.status;
+
+    // Stop was tapped: the CLI abandoned our turn for the stop message; once it took that and went
+    // quiet, the turn is over. "interrupted" is what the SDK path reports too, so the app shows Stopped
+    if (live.stopMsgId !== null && read.peerMsgIds.includes(live.stopMsgId)) live.deliveredAt ??= now;
+    if (live.stopMsgId !== null && live.deliveredAt !== null && st.status === "idle") {
+      return { type: "turn_failed", payload: { error: "interrupted" } };
+    }
+    if (live.deliveredAt !== null && live.sawResponse && st.status === "idle") {
+      return { type: "turn_completed", payload: { costUsd: null, resultText: null } };
+    }
+    // Only idle time counts against delivery: while the CLI is busy with its own turn our message
+    // sits in its queue, and that can legitimately take minutes
+    if (live.deliveredAt === null && st.status === "idle") {
+      live.idleUndeliveredSince ??= now;
+      if (now - live.idleUndeliveredSince > timing.deliveryTimeoutMs) {
+        return {
+          type: "turn_failed",
+          payload: { error: "the CLI dropped the message (it drops a repeat of the previous message within 30s, rate-limits bursts, and holds messages it was told to review)" },
+        };
+      }
+    } else {
+      live.idleUndeliveredSince = null;
+    }
+    if (now - live.startedAt > timing.maxTurnMs) {
+      return { type: "turn_failed", payload: { error: `no response from the CLI in ${Math.round(timing.maxTurnMs / 60_000)} minutes` } };
+    }
+    return null;
+  }
+
   /** Save an agent-sent file to the outbox and record file_sent (the `tiny mcp-server` -> POST /files path) */
   saveUserFile(sessionId: string, filePath: string, caption?: string): FileRecord {
     this.getSession(sessionId); // NotFoundError if missing
@@ -470,8 +641,25 @@ export class SessionManager extends EventEmitter {
   }
 
   interrupt(id: string): void {
-    this.getSession(id);
-    this.running.get(id)?.abort.abort();
+    const s = this.getSession(id);
+    const live = this.liveTurns.get(id);
+    if (!live) {
+      this.running.get(id)?.abort.abort();
+      return;
+    }
+    // The CLI owns this turn and its socket has no cancel — but a "now" message makes it abandon
+    // what it is doing and take that message instead (measured). Send the stop note that way;
+    // the watcher closes the turn as "interrupted" once the CLI has taken it
+    if (live.stopMsgId !== null) return; // already stopping
+    live.stopMsgId = crypto.randomUUID();
+    const content = wrapForPeer(PEER_STOP, { name: "tiny", mode: this.deps.peer!.mode(s) });
+    this.deps.peer!
+      .send(s, live.target, { agentSessionId: s.agentSessionId!, msgId: live.stopMsgId, content, priority: "now" })
+      .catch((err) => {
+        live.stopMsgId = null; // let a later tap try again
+        const reason = err instanceof Error ? err.message : String(err);
+        console.error(`[tinyd] could not send stop to the CLI: ${reason}`);
+      });
   }
 
   setDetached(id: string, detached: boolean): SessionRecord {
