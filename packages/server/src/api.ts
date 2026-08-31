@@ -217,7 +217,7 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
 
   app.post("/v1/sessions/:id/interrupt", (c) => {
     deps.manager.interrupt(c.req.param("id"));
-    return c.json({ ok: true }, 202);
+    return c.json({ ok: true });
   });
 
   app.post("/v1/sessions/:id/detach", async (c) => {

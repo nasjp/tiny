@@ -634,7 +634,7 @@ describe("REST API", () => {
     expect(peerSent[0]!.agentSessionId).toBe("agent-join");
 
     const stop = await app.request(`/v1/sessions/${id}/interrupt`, { method: "POST", headers: H() });
-    expect(stop.status).toBe(202);
+    expect(stop.status).toBe(200);
     expect(peerSent).toHaveLength(2);
     expect(peerSent[1]!.priority).toBe("now");
     await manager.waitForIdle(id); // the fake CLI never records anything: ends as turn_failed (dropped)
