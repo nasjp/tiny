@@ -65,7 +65,8 @@ struct MarkdownText: View {
                             // Line height ~1.6em (on par with the official Claude app).
                             // Inter/Noto's natural line height (~20.6pt at 17pt) + 8pt
                             .lineSpacing(8)
-                            .textSelection(.enabled)
+                            // No .textSelection here: its Copy takes one line as RTFD. The whole
+                            // message copies as plain text via .copyable on the row (EventRow)
                             .padding(.top, block.paragraphBreak ? 8 : 0)
                         }
                     }

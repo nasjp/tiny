@@ -562,6 +562,22 @@ describe("REST API", () => {
     expect(((await second.json()) as { id: string }).id).toBe(s1.id);
   });
 
+  it("announces sessions created with the CLI token but not the phone's own", async () => {
+    const announced: string[] = [];
+    manager.on("session_added", (s: { id: string }) => announced.push(s.id));
+    const fromMac = await app.request("/v1/sessions", { method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }) });
+    expect(fromMac.status).toBe(201);
+    expect(announced).toEqual([((await fromMac.json()) as { id: string }).id]);
+
+    const started = await (await app.request("/v1/pair/start", { method: "POST", headers: H() })).json();
+    const dev = await app.request("/v1/devices", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: started.code, name: "ph" }) });
+    const D = { Authorization: `Bearer ${(await dev.json()).bearerToken}`, "Content-Type": "application/json" };
+    const fromPhone = await app.request("/v1/sessions", { method: "POST", headers: D, body: JSON.stringify({ profile: "work", cwd }) });
+    expect(fromPhone.status).toBe(201);
+    expect(announced).toHaveLength(1);
+  });
+
   it("rejects adopt without agentSessionId", async () => {
     const res = await app.request("/v1/sessions/adopt", {
       method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }),

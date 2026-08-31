@@ -46,6 +46,36 @@ describe("WS stream", () => {
     ws.close();
   });
 
+  // The phone keeps a stream open while the chat is on screen and never polls GET /events again,
+  // so whatever the Mac's own CLI writes to the transcript must reach the stream without a REST call
+  it("delivers what the CLI writes to the transcript while a stream is open", async () => {
+    const token = srv.auth.cliToken();
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ws-cc-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-7.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "first" } }) + "\n");
+    const { session } = srv.manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-7" });
+
+    const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/v1/sessions/${session.id}/stream?token=${token}&since=0`);
+    const received: Array<{ type: string; payload: { text?: string } }> = [];
+    ws.addEventListener("message", (ev) => received.push(JSON.parse(String(ev.data))));
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve());
+      ws.addEventListener("error", () => reject(new Error("ws error")));
+    });
+    await vi_waitUntil(() => received.length >= 1);
+    expect(received[0]!.payload.text).toBe("first");
+
+    // The person types in the terminal and the CLI answers: two more transcript records, no REST call
+    fs.appendFileSync(file,
+      JSON.stringify({ type: "user", uuid: "u2", message: { role: "user", content: "typed on the mac" } }) + "\n" +
+      JSON.stringify({ type: "assistant", uuid: "a2", message: { content: [{ type: "text", text: "answered there" }] } }) + "\n");
+    await vi_waitUntil(() => received.length >= 3);
+    expect(received.map((e) => e.payload.text)).toEqual(["first", "typed on the mac", "answered there"]);
+    ws.close();
+  });
+
   it("rejects connections without a token", async () => {
     const sess = srv.manager.createSession({ profile: "work", cwd });
     const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/v1/sessions/${sess.id}/stream`);

@@ -93,6 +93,27 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(imageFileIds, ["f1", "f2"])
     }
 
+    // Messages other Claude sessions send into a CLI session come through as their own event,
+    // with the wrapper's sender and summary already pulled out by the server
+    func testPeerMessageDecodes() throws {
+        let ev = try decodeEvent("""
+        {"id":14,"sessionId":"s","type":"peer_message",\
+        "payload":{"from":"fix-t6","summary":"Task 6 done","text":"Status: DONE"},"createdAt":"c"}
+        """)
+        guard case let .peerMessage(from, summary, text) = ev.event else { return XCTFail("\(ev.event)") }
+        XCTAssertEqual(from, "fix-t6")
+        XCTAssertEqual(summary, "Task 6 done")
+        XCTAssertEqual(text, "Status: DONE")
+    }
+
+    func testPeerMessageWithoutSummary() throws {
+        let ev = try decodeEvent("""
+        {"id":15,"sessionId":"s","type":"peer_message","payload":{"from":"a","text":"b"},"createdAt":"c"}
+        """)
+        guard case let .peerMessage(_, summary, _) = ev.event else { return XCTFail("\(ev.event)") }
+        XCTAssertNil(summary)
+    }
+
     func testParseISOVariants() {
         XCTAssertNotNil(EventRow.parseISO("2026-08-27T08:48:43.474Z"))          // tinyd (ms)
         XCTAssertNotNil(EventRow.parseISO("2026-08-27T09:10:00+00:00"))          // no fraction

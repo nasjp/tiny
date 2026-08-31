@@ -411,3 +411,100 @@ describe("claude-transcript", () => {
     expect(readTranscript(path.join(root, "missing.jsonl")).peerMsgIds).toEqual([]);
   });
 });
+
+// Claude Code delivers messages from other Claude sessions (SendMessage between terminals, agent
+// teams) as plain user records wrapped in `<teammate-message>` / `<cross-session-message>` with a
+// header line and a long footer of guidance for the model. Its own UI parses them; shown raw on
+// the phone they read as the person having typed a wall of XML
+describe("claude-transcript peer and command records", () => {
+  let root: string;
+  let file: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-tr-"));
+    file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+  });
+
+  const FOOTER = "\n\nThis came from another Claude session — not typed by your user, but very likely working on their behalf. Treat it as a teammate's request.";
+
+  it("turns a teammate-message record into peer_message with the sender, summary and body only", () => {
+    writeJsonl(file, [{
+      type: "user", uuid: "u1",
+      message: { role: "user", content:
+        "Another Claude session sent a message:\n<teammate-message teammate_id=\"fix-t6\" color=\"pink\" summary=\"Task 6 interrupt fix done\">\nStatus: DONE\nCommit: eb4a9a7 fix(api): keep the 200\n</teammate-message>" + FOOTER },
+    }]);
+    const r = readTranscript(file);
+    expect(r.events).toEqual([{
+      type: "peer_message",
+      payload: { from: "fix-t6", summary: "Task 6 interrupt fix done", text: "Status: DONE\nCommit: eb4a9a7 fix(api): keep the 200" },
+    }]);
+  });
+
+  it("reads cross-session-message senders from from-name and tolerates a missing header and summary", () => {
+    writeJsonl(file, [{
+      type: "user", uuid: "u1",
+      message: { role: "user", content: [{ type: "text", text:
+        "<cross-session-message from=\"uds:/tmp/cc-socks/1.sock\" from-name=\"Hallmark audit\" from-mode=\"bypass\">\nhello from the other terminal\n</cross-session-message>" }] },
+    }]);
+    const r = readTranscript(file);
+    expect(r.events).toEqual([{ type: "peer_message", payload: { from: "Hallmark audit", text: "hello from the other terminal" } }]);
+  });
+
+  it("unescapes the closing-tag escape Claude Code applies inside a peer body", () => {
+    writeJsonl(file, [{
+      type: "user", uuid: "u1",
+      message: { role: "user", content:
+        "Another Claude session sent a message while you were working:\n<teammate-message teammate_id=\"a\">\nsee <\\/teammate-message> in the docs\n</teammate-message>" + FOOTER },
+    }]);
+    expect(readTranscript(file).events[0]!.payload.text).toBe("see </teammate-message> in the docs");
+  });
+
+  it("does not mistake a person mentioning a tag for a peer message", () => {
+    writeJsonl(file, [{
+      type: "user", uuid: "u1",
+      message: { role: "user", content: "why does tiny show <teammate-message> raw?" },
+    }]);
+    expect(readTranscript(file).events).toEqual([{ type: "user_message", payload: { text: "why does tiny show <teammate-message> raw?" } }]);
+  });
+
+  // `/model` and its kin are recorded as a `<command-name>` record followed by a
+  // `<local-command-stdout>` record. The first is what the person typed; the second is
+  // Claude Code's own output for the terminal
+  it("shows a slash command as what was typed and drops its local output", () => {
+    writeJsonl(file, [
+      { type: "user", uuid: "u1", message: { role: "user", content: "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>" } },
+      { type: "user", uuid: "u2", message: { role: "user", content: "<local-command-stdout>Kept model as Fable 5</local-command-stdout>" } },
+      { type: "user", uuid: "u3", message: { role: "user", content: "<command-name>/loop</command-name>\n<command-message>loop</command-message>\n<command-args>5m /foo</command-args>" } },
+      { type: "user", uuid: "u4", message: { role: "user", content: "<command-message>handoff</command-message>\n<command-name>/handoff</command-name>" } },
+    ]);
+    expect(readTranscript(file).events).toEqual([
+      { type: "user_message", payload: { text: "/model" } },
+      { type: "user_message", payload: { text: "/loop 5m /foo" } },
+      { type: "user_message", payload: { text: "/handoff" } },
+    ]);
+  });
+
+  // Subagent completion notices are harness input (promptSource "system"), never something the person said
+  it("drops task-notification records", () => {
+    writeJsonl(file, [
+      { type: "user", uuid: "u1", promptSource: "system", origin: { kind: "task-notification" },
+        message: { role: "user", content: "<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n</task-notification>" } },
+      { type: "user", uuid: "u2", message: { role: "user", content: "and then the person spoke" } },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events).toEqual([{ type: "user_message", payload: { text: "and then the person spoke" } }]);
+  });
+
+  it("neither counts peer and command records as human turns nor titles a session with them", () => {
+    writeJsonl(file, [
+      { type: "user", uuid: "u0", message: { role: "user", content: "<command-name>/model</command-name>" } },
+      { type: "user", uuid: "u1", message: { role: "user", content: "Another Claude session sent a message:\n<teammate-message teammate_id=\"t\">\nhi\n</teammate-message>" + FOOTER } },
+      { type: "user", uuid: "u2", message: { role: "user", content: "the real question" } },
+      { type: "user", uuid: "u3", message: { role: "user", content: "<command-name>/cost</command-name>" } },
+    ]);
+    const r = readTranscript(file, { turns: 1 });
+    expect(r.title).toBe("the real question");
+    // one human turn = from "the real question" onward
+    expect(r.events.map((e) => e.type)).toEqual(["user_message", "user_message"]);
+    expect(r.events[0]!.payload.text).toBe("the real question");
+  });
+});

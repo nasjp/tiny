@@ -83,6 +83,80 @@ function parseBashOutput(text: string): { isError: boolean } | null {
   return m ? { isError: m[1]!.length > 0 } : null;
 }
 
+/**
+ * Messages from other Claude sessions (SendMessage between terminals, agent teams) arrive as plain
+ * user records — no isMeta, no promptSource — shaped as an optional header line, one XML wrapper
+ * whose attributes name the sender, and a footer of guidance for the model. Only the wrapper's
+ * body is conversation. The header wording and the wrapper tags are Claude Code's (2.1.251).
+ */
+const PEER_HEADER_RE = /^(?:Another Claude session sent a message|A peer session sent a message)[^\n]*:\n/;
+const PEER_TAGS = new Set(["teammate-message", "cross-session-message", "agent-message", "coordinator-relay"]);
+const TAG_BLOCK_RE = /^<([a-z][\w-]*)((?:\s[^>]*)?)>\n?([\s\S]*?)\n?<\/\1>/;
+
+export interface PeerMessage {
+  from: string;
+  summary?: string;
+  text: string;
+}
+
+function parsePeerMessage(text: string): PeerMessage | null {
+  let t = text.trimStart();
+  const header = t.match(PEER_HEADER_RE);
+  if (header) t = t.slice(header[0].length).trimStart();
+  if (!t.startsWith("<")) return null;
+  const m = t.match(TAG_BLOCK_RE);
+  // Without the header, only the known wrapper tags count — a person may well start a message with a tag
+  if (!m || (!header && !PEER_TAGS.has(m[1]!))) return null;
+  const attrs: Record<string, string> = {};
+  for (const a of m[2]!.matchAll(/([\w-]+)="([^"]*)"/g)) attrs[a[1]!] = a[2]!;
+  const from = attrs.teammate_id ?? attrs["from-name"] ?? attrs.from ?? "another session";
+  // Claude Code escapes a closing tag inside the body as `<\/tag` so the wrapper stays unambiguous
+  const body = m[3]!.replace(/<\\\//g, "</").trim();
+  return { from, ...(attrs.summary ? { summary: attrs.summary } : {}), text: body };
+}
+
+/**
+ * A slash command is recorded as a `<command-name>` record (what the person typed) followed by a
+ * `<local-command-stdout>` record (Claude Code's terminal output). Skill invocations put
+ * `<command-message>` first. The typed line is conversation; the output is not.
+ */
+function parseSlashCommand(text: string): string | null {
+  if (!text.startsWith("<command-name>") && !text.startsWith("<command-message>")) return null;
+  const name = text.match(/<command-name>([^<]*)<\/command-name>/)?.[1]?.trim();
+  const message = text.match(/<command-message>([^<]*)<\/command-message>/)?.[1]?.trim();
+  const args = text.match(/<command-args>([^<]*)<\/command-args>/)?.[1]?.trim();
+  const head = name || (message ? `/${message}` : null);
+  if (!head) return null;
+  return args ? `${head} ${args}` : head;
+}
+
+/** Records Claude Code writes as user records that carry nothing a person said or should see */
+function isHarnessNoise(text: string): boolean {
+  return text.startsWith("<local-command-stdout>") || text.startsWith("<local-command-stderr>") ||
+    text.startsWith("<task-notification>");
+}
+
+type UserText =
+  | { kind: "human"; text: string }
+  | { kind: "bash-input"; command: string }
+  | { kind: "bash-output"; isError: boolean }
+  | { kind: "peer"; message: PeerMessage }
+  | { kind: "command"; text: string }
+  | { kind: "noise" };
+
+function classifyUserText(text: string): UserText {
+  const command = parseBashInput(text);
+  if (command !== null) return { kind: "bash-input", command };
+  const output = parseBashOutput(text);
+  if (output !== null) return { kind: "bash-output", isError: output.isError };
+  if (isHarnessNoise(text)) return { kind: "noise" };
+  const slash = parseSlashCommand(text);
+  if (slash !== null) return { kind: "command", text: slash };
+  const peer = parsePeerMessage(text);
+  if (peer !== null) return { kind: "peer", message: peer };
+  return { kind: "human", text };
+}
+
 /** Backstop for a first read: one turn can carry hundreds of tool records */
 const DEFAULT_MAX_RECORDS = 300;
 
@@ -132,8 +206,9 @@ function startsHumanTurn(r: Record<string, unknown>): boolean {
   if (r.type !== "user" || r.isMeta === true) return false;
   const text = textOf((r.message as Record<string, unknown> | undefined)?.content);
   if (text === null) return false;
-  // A `!cmd` block is operation log, not a person talking — must not count toward the backfill window
-  return parseBashInput(text) === null && parseBashOutput(text) === null;
+  // Bash blocks, slash commands, peer messages and harness notices are not a person talking —
+  // none of them count toward the backfill window or may title a session
+  return classifyUserText(text).kind === "human";
 }
 
 /**
@@ -209,31 +284,41 @@ export function readTranscript(
     if (r.type === "user") {
       const text = textOf(message.content);
       if (text !== null) {
-        const command = parseBashInput(text);
-        if (command !== null) {
-          const hint = describeClaudeTool("Bash", { command });
-          pendingBashUuid = typeof r.uuid === "string" ? r.uuid : null;
-          events.push({
-            type: "tool_started",
-            payload: {
-              toolName: "Bash",
-              toolUseId: pendingBashUuid,
-              input: { command },
-              kind: hint.kind,
-              summary: hint.summary,
-            },
-          });
-          continue;
-        }
-        const output = parseBashOutput(text);
-        if (output !== null) {
-          if (pendingBashUuid !== null) {
-            events.push({ type: "tool_finished", payload: { toolUseId: pendingBashUuid, isError: output.isError } });
-            pendingBashUuid = null;
+        const u = classifyUserText(text);
+        switch (u.kind) {
+          case "bash-input": {
+            const hint = describeClaudeTool("Bash", { command: u.command });
+            pendingBashUuid = typeof r.uuid === "string" ? r.uuid : null;
+            events.push({
+              type: "tool_started",
+              payload: {
+                toolName: "Bash",
+                toolUseId: pendingBashUuid,
+                input: { command: u.command },
+                kind: hint.kind,
+                summary: hint.summary,
+              },
+            });
+            break;
           }
-          continue;
+          case "bash-output":
+            if (pendingBashUuid !== null) {
+              events.push({ type: "tool_finished", payload: { toolUseId: pendingBashUuid, isError: u.isError } });
+              pendingBashUuid = null;
+            }
+            break;
+          case "peer":
+            events.push({ type: "peer_message", payload: { ...u.message } });
+            break;
+          case "command":
+            events.push({ type: "user_message", payload: { text: u.text } });
+            break;
+          case "noise":
+            break;
+          case "human":
+            events.push({ type: "user_message", payload: { text: u.text } });
+            break;
         }
-        events.push({ type: "user_message", payload: { text } });
         continue;
       }
       for (const b of blocks(message.content)) {

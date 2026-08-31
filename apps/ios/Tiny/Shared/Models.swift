@@ -248,6 +248,9 @@ enum TinyEvent: Equatable {
     case sessionStateChanged(status: String)
     /// The CLI that owns a live turn is waiting for its user (a permission prompt in the terminal)
     case cliAttention(reason: String)
+    /// A message another Claude session sent into this one (agent teams, SendMessage between
+    /// terminals). The server already unwrapped Claude Code's XML: `from` names the sender
+    case peerMessage(from: String, summary: String?, text: String)
     case unknown(type: String)
 
     init(type: String, payload: JSONValue) {
@@ -300,6 +303,9 @@ enum TinyEvent: Equatable {
             self = .sessionStateChanged(status: str("status") ?? "")
         case "cli_attention":
             self = .cliAttention(reason: str("reason") ?? "input")
+        case "peer_message":
+            self = .peerMessage(from: str("from") ?? "another session", summary: str("summary"),
+                                text: str("text") ?? "")
         default:
             self = .unknown(type: type)
         }
@@ -418,7 +424,7 @@ struct PairQR: Codable, Equatable {
 
 struct PushIntent: Codable {
     let v: Int
-    let type: String          // permission_requested / turn_completed / turn_failed / auth_error
+    let type: String          // permission_requested / turn_completed / turn_failed / auth_error / session_added
     let sessionId: String
     let eventId: Int
     let title: String
