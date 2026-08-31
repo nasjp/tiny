@@ -288,10 +288,21 @@ export class SessionManager extends EventEmitter {
     return read.events.length;
   }
 
-  /** SessionEnd path: drop a handoff session that never got a single event */
+  /**
+   * SessionEnd path: drop a handoff session that never got a single event.
+   *
+   * Import the transcript before judging. The SessionStart hook adopts a session before the user
+   * has typed anything, so the backfill at adoption time imports nothing; if nothing syncs in
+   * between, a session that ran a whole conversation still looks empty here and would be deleted.
+   * After the import, "empty" means again what it was meant to mean: nothing ever happened.
+   */
   discardIfEmpty(agentSessionId: string): boolean {
     const s = this.deps.stores.sessions.byAgentSessionId(agentSessionId);
     if (!s) return false;
+    // syncTranscript declines to import while a turn is running. Deleting on the strength of a
+    // look we did not take would be the same bug in a new place, so keep the session instead
+    if (s.status === "running") return false;
+    this.syncTranscript(s.id);
     if (this.deps.stores.events.count(s.id) > 0) return false;
     return this.deps.stores.sessions.delete(s.id);
   }

@@ -513,6 +513,53 @@ describe("SessionManager", () => {
     expect(manager.syncTranscript(session.id)).toBe(0);
   });
 
+  it("discardIfEmpty imports the transcript before judging the session empty", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-late.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+
+    // SessionStart fires before the user has typed anything: the transcript is still empty
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-late" });
+    expect(stores.events.count(session.id)).toBe(0);
+    expect(manager.getSession(session.id).title).toBeNull();
+
+    // the turn runs and the CLI writes it out; nothing has asked tiny to sync
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "what does this repo do" } }),
+      JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "it drives agents" }] } }),
+    ].join("\n") + "\n");
+
+    // SessionEnd must not throw away a session that held a real exchange
+    expect(manager.discardIfEmpty("agent-late")).toBe(false);
+    expect(stores.sessions.get(session.id)).not.toBeNull();
+    expect(stores.events.listSince(session.id, 0).map((e) => e.type))
+      .toEqual(["user_message", "assistant_text"]);
+    // the title fallback rides along with the import
+    expect(manager.getSession(session.id).title).toBe("what does this repo do");
+  });
+
+  it("discardIfEmpty keeps a session whose import was skipped because it is running", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-busy.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-busy" });
+    fs.writeFileSync(file, JSON.stringify({
+      type: "user", uuid: "u1", message: { role: "user", content: "mid-turn" },
+    }) + "\n");
+    stores.sessions.patch(session.id, { status: "running" });
+
+    // syncTranscript declines to import mid-turn; deleting on the strength of a look we did not
+    // take would be the same bug in a new place
+    expect(manager.discardIfEmpty("agent-busy")).toBe(false);
+    expect(stores.sessions.get(session.id)).not.toBeNull();
+  });
+
   it("discardIfEmpty removes a session with no events and keeps one with events", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");
