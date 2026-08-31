@@ -238,6 +238,11 @@ describe("handoff", () => {
     expect(resolveHandoffInput({}, "/work").agentSessionId).toBeNull();
   });
 
+  it("treats an empty CLAUDE_CONFIG_DIR as unset", () => {
+    const r = resolveHandoffInput({ CLAUDE_CODE_SESSION_ID: "sid-1", CLAUDE_CONFIG_DIR: "" }, "/work");
+    expect(r.configDir).toBe(path.join(os.homedir(), ".claude"));
+  });
+
   it("creates the handoff profile once and reuses it", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-hp-"));
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cd-"));

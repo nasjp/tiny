@@ -60,9 +60,11 @@ export function resolveHandoffInput(
   _cwd: string,
 ): HandoffInput {
   const sid = env.CLAUDE_CODE_SESSION_ID;
+  const dir = env.CLAUDE_CONFIG_DIR;
   return {
     agentSessionId: typeof sid === "string" && sid !== "" ? sid : null,
-    configDir: env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
+    // An empty env var means "not set" here, same as for the session id above
+    configDir: typeof dir === "string" && dir !== "" ? dir : path.join(os.homedir(), ".claude"),
   };
 }
 
@@ -312,11 +314,11 @@ program
   .action(async (opts: {
     auto?: boolean; ended?: boolean; profile?: string; session?: string; configDir?: string;
   }) => {
-    const p = tinyPaths();
-    const env = resolveHandoffInput(process.env, process.cwd());
-    const agentSessionId = opts.session ?? env.agentSessionId;
-    const configDir = opts.configDir ?? env.configDir;
     try {
+      const p = tinyPaths();
+      const env = resolveHandoffInput(process.env, process.cwd());
+      const agentSessionId = opts.session ?? env.agentSessionId;
+      const configDir = opts.configDir ?? env.configDir;
       if (!agentSessionId) {
         throw new Error("no session id (run this inside Claude Code, or pass --session <id>)");
       }
