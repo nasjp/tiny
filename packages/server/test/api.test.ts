@@ -617,6 +617,17 @@ describe("REST API", () => {
     cliLive = null;
   });
 
+  // list / get / adopt all carry cliLive; create used to be the one shape that did not
+  it("returns cliLive on a freshly created session too", async () => {
+    cliLive = false;
+    const res = await app.request("/v1/sessions", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }),
+    });
+    expect(res.status).toBe(201);
+    expect((await res.json()) as { cliLive: boolean | null }).toHaveProperty("cliLive", false);
+    cliLive = null;
+  });
+
   it("reports cliLive on the list and on a single session", async () => {
     await app.request("/v1/sessions", { method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }) });
     const res0 = await app.request("/v1/sessions", { headers: H() });
