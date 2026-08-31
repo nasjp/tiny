@@ -95,6 +95,7 @@ export class SessionManager extends EventEmitter {
       title: null,
       status: "idle",
       archivedAt: null,
+      sourceCursor: null,
       createdAt: now,
       updatedAt: now,
     };

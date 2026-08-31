@@ -32,4 +32,17 @@ describe("openDb", () => {
     expect(cols.some((c) => c.name === "archived_at")).toBe(true);
     db.close();
   });
+
+  it("adds source_cursor to an existing sessions table", () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tiny-db-")), "old.db");
+    const raw = new Database(file);
+    raw.exec(`CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, agent_session_id TEXT, agent TEXT NOT NULL, profile TEXT NOT NULL,
+      cwd TEXT NOT NULL, permission_mode TEXT NOT NULL, title TEXT, status TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+    raw.close();
+    const db = openDb(file);
+    const cols = (db.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).toContain("source_cursor");
+  });
 });

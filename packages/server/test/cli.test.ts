@@ -17,6 +17,7 @@ function sess(over: Partial<SessionRecord>): SessionRecord {
     title: null,
     status: "idle",
     archivedAt: null,
+    sourceCursor: null,
     createdAt: "",
     updatedAt: "",
     ...over,
