@@ -184,6 +184,12 @@ export class AcpAdapter implements AgentAdapter {
         case "usage_update":
           if (typeof u.used === "number") contextTokens = u.used;
           if (typeof u.cost?.amount === "number") costUsd = u.cost.amount;
+          // The stable UsageUpdate carries no token breakdown (measured: opencode HEAD sends only
+          // used / size / cost, and cursor's bundled SDK schema is the same) — but ACP's unstable
+          // `Usage` shape names outputTokens, so pick it up the day an agent starts sending it
+          if (typeof u.outputTokens === "number" && Number.isFinite(u.outputTokens)) {
+            p.progress?.({ outputTokens: u.outputTokens });
+          }
           break;
         default:
           break; // plan / available_commands / mode / config are dropped in v1
@@ -363,6 +369,11 @@ export class AcpAdapter implements AgentAdapter {
 
         flushThought();
         flushText();
+        // The turn's own token usage rides the prompt RESPONSE (ACP unstable `Usage`; measured on
+        // opencode and in cursor's bundle). It arrives only at the end, but report it so the final
+        // count is true — and so nothing changes here when agents move it into usage_update
+        const out = (res as { usage?: { outputTokens?: unknown } }).usage?.outputTokens;
+        if (typeof out === "number" && Number.isFinite(out)) p.progress?.({ outputTokens: out });
         const resultText = texts.length > 0 ? texts.join("\n") : null;
         const stop = res?.stopReason ?? "end_turn";
         if (stop === "cancelled") {
