@@ -43,8 +43,8 @@ describe("claude-transcript", () => {
   });
 
   it("finds the transcript by encoded cwd", () => {
-    const cwd = "/Users/a/ghq/github.com/x";
-    const file = path.join(root, "projects", "-Users-a-ghq-github-com-x", `${SID}.jsonl`);
+    const cwd = "/srv/a/ghq/github.com/x";
+    const file = path.join(root, "projects", "-srv-a-ghq-github-com-x", `${SID}.jsonl`);
     writeJsonl(file, sample());
     expect(findTranscript(root, cwd, SID)).toBe(file);
   });
@@ -52,15 +52,15 @@ describe("claude-transcript", () => {
   it("falls back to scanning projects/ when the encoding does not match", () => {
     const file = path.join(root, "projects", "some-other-name", `${SID}.jsonl`);
     writeJsonl(file, sample());
-    expect(findTranscript(root, "/Users/a/whatever", SID)).toBe(file);
+    expect(findTranscript(root, "/srv/a/whatever", SID)).toBe(file);
   });
 
   it("returns null when there is no transcript", () => {
-    expect(findTranscript(root, "/Users/a/x", SID)).toBeNull();
+    expect(findTranscript(root, "/srv/a/x", SID)).toBeNull();
   });
 
   it("converts user, assistant text and tool records into events", () => {
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, sample());
     const r = readTranscript(file);
     expect(r.title).toBe("Handoff design");
@@ -77,7 +77,7 @@ describe("claude-transcript", () => {
   });
 
   it("reads only records after sinceUuid", () => {
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, sample());
     const r = readTranscript(file, { sinceUuid: "a1" });
     expect(r.events.map((e) => e.type)).toEqual(["tool_finished"]);
@@ -89,7 +89,7 @@ describe("claude-transcript", () => {
     for (let i = 0; i < 10; i++) {
       many.push({ type: "user", uuid: `u${i}`, message: { role: "user", content: `m${i}` } });
     }
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, many);
     const r = readTranscript(file, { limit: 3 });
     expect(r.events).toHaveLength(3);
@@ -98,7 +98,7 @@ describe("claude-transcript", () => {
   });
 
   it("survives malformed lines and unknown record types", () => {
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, [
       "{not json",
@@ -111,7 +111,7 @@ describe("claude-transcript", () => {
   });
 
   it("falls back to the first user message when there is no ai-title", () => {
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, [
       { type: "user", uuid: "u1", message: { role: "user", content: "a".repeat(100) } },
     ]);
@@ -119,7 +119,7 @@ describe("claude-transcript", () => {
   });
 
   it("classifies tool calls the same way the live adapter does", () => {
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, [
       {
         type: "assistant", uuid: "a1",
@@ -133,7 +133,7 @@ describe("claude-transcript", () => {
   });
 
   it("imports nothing when sinceUuid is no longer in the transcript", () => {
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, sample());
     // a cursor from a transcript that was forked or rotated away
     const r = readTranscript(file, { sinceUuid: "gone-forever" });
@@ -143,7 +143,7 @@ describe("claude-transcript", () => {
   });
 
   it("emits one tool_finished per tool_result in a user record", () => {
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, [
       {
         type: "user", uuid: "u1",
@@ -165,7 +165,7 @@ describe("claude-transcript", () => {
   });
 
   it("skips empty assistant text blocks", () => {
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, [
       {
         type: "assistant", uuid: "a1",
@@ -178,7 +178,7 @@ describe("claude-transcript", () => {
   });
 
   it("returns nothing for a transcript of only bookkeeping records", () => {
-    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
     writeJsonl(file, [
       { type: "mode", mode: "normal", sessionId: SID },
       { type: "permission-mode", permissionMode: "default", sessionId: SID },
