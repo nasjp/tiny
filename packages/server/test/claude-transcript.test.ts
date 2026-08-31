@@ -71,6 +71,8 @@ describe("claude-transcript", () => {
     expect(r.events[0]!.payload.text).toBe("hello there");
     expect(r.events[1]!.payload.text).toBe("hi back");
     expect(r.events[2]!.payload.toolName).toBe("Read");
+    expect(r.events[2]!.payload.kind).toBe("read");
+    expect(r.events[2]!.payload.summary).toBe("x");
     expect(r.events[3]!.payload.toolUseId).toBe("t1");
   });
 
@@ -114,5 +116,29 @@ describe("claude-transcript", () => {
       { type: "user", uuid: "u1", message: { role: "user", content: "a".repeat(100) } },
     ]);
     expect(readTranscript(file).title).toHaveLength(60);
+  });
+
+  it("classifies tool calls the same way the live adapter does", () => {
+    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      {
+        type: "assistant", uuid: "a1",
+        message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { description: "run the tests" } }] },
+      },
+    ]);
+    const ev = readTranscript(file).events[0]!;
+    expect(ev.type).toBe("tool_started");
+    expect(ev.payload.kind).toBe("execute");
+    expect(ev.payload.summary).toBe("run the tests");
+  });
+
+  it("imports nothing when sinceUuid is no longer in the transcript", () => {
+    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    // a cursor from a transcript that was forked or rotated away
+    const r = readTranscript(file, { sinceUuid: "gone-forever" });
+    expect(r.events).toEqual([]);
+    // the cursor still advances so the next sync resumes correctly
+    expect(r.cursor).toBe("u2");
   });
 });

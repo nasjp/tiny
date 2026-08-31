@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { describeClaudeTool } from "./tool-kinds.js";
 
 export interface TranscriptEvent {
   type: string;
@@ -91,7 +92,9 @@ export function readTranscript(
   let slice = messages;
   if (opts.sinceUuid) {
     const at = messages.findIndex((r) => r.uuid === opts.sinceUuid);
-    slice = at >= 0 ? messages.slice(at + 1) : messages;
+    // Cursor not found: the transcript was forked or rotated. Importing everything again would
+    // duplicate the whole conversation for the caller, so import nothing and let the cursor advance
+    slice = at >= 0 ? messages.slice(at + 1) : [];
   } else if (opts.limit !== undefined && messages.length > opts.limit) {
     slice = messages.slice(messages.length - opts.limit);
   }
@@ -120,9 +123,16 @@ export function readTranscript(
         events.push({ type: "assistant_text", payload: { text: b.text } });
       }
       if (b.type === "tool_use") {
+        const hint = describeClaudeTool(String(b.name ?? ""), b.input);
         events.push({
           type: "tool_started",
-          payload: { toolName: b.name, toolUseId: b.id, input: b.input ?? {} },
+          payload: {
+            toolName: b.name,
+            toolUseId: b.id,
+            input: b.input ?? {},
+            kind: hint.kind,
+            summary: hint.summary,
+          },
         });
       }
     }
