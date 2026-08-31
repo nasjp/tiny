@@ -229,3 +229,43 @@ describe("ClaudeAdapter", () => {
     ]);
   });
 });
+
+describe("ClaudeAdapter progress and narration", () => {
+  it("emits a thinking block with a body as assistant_thinking and skips an empty one", async () => {
+    const adapter = new ClaudeAdapter(fakeQuery([
+      INIT,
+      { type: "assistant", message: { id: "msg_1", content: [
+        { type: "thinking", thinking: "", signature: "s1" },
+        { type: "tool_use", id: "tu1", name: "Read", input: { file_path: "/a" } },
+      ] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", is_error: false }] } },
+      { type: "assistant", message: { id: "msg_2", content: [
+        { type: "thinking", thinking: "Found it; fixing now.", signature: "s2" },
+        { type: "text", text: "Fixed." },
+      ] } },
+      RESULT,
+    ], {}) as any);
+    const { p, events } = baseParams();
+    await adapter.runTurn(p);
+    expect(events.map((e) => e.type)).toEqual([
+      "turn_started", "tool_started", "tool_finished", "assistant_thinking", "assistant_text", "turn_completed",
+    ]);
+    expect(events[3]!.payload).toEqual({ text: "Found it; fixing now." });
+  });
+
+  it("reports output tokens as they accumulate, counting each API response once", async () => {
+    const adapter = new ClaudeAdapter(fakeQuery([
+      INIT,
+      { type: "assistant", message: { id: "msg_1", usage: { output_tokens: 363 }, content: [{ type: "text", text: "a" }] } },
+      // the same response surfaced again (a second content block) must not double count
+      { type: "assistant", message: { id: "msg_1", usage: { output_tokens: 363 }, content: [{ type: "tool_use", id: "tu1", name: "Read", input: {} }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1" }] } },
+      { type: "assistant", message: { id: "msg_2", usage: { output_tokens: 234 }, content: [{ type: "text", text: "b" }] } },
+      RESULT,
+    ], {}) as any);
+    const seen: number[] = [];
+    const { p } = baseParams({ progress: (pr) => seen.push(pr.outputTokens) });
+    await adapter.runTurn(p);
+    expect(seen).toEqual([363, 363, 597]);
+  });
+});

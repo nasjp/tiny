@@ -14,6 +14,12 @@ export interface TurnImage {
   mediaType: "image/jpeg" | "image/png" | "image/gif" | "image/webp";
 }
 
+/** Mid-turn progress an adapter can report; shown live on the phone, never persisted */
+export interface TurnProgress {
+  /** Output tokens produced so far in this turn */
+  outputTokens: number;
+}
+
 export interface RunTurnParams {
   agentSessionId: string | null;
   profileDir: string;
@@ -28,6 +34,8 @@ export interface RunTurnParams {
   prompt: string;
   images?: TurnImage[];
   emit: (ev: TurnEventInput) => void;
+  /** Optional: how far the turn has come. Adapters that know call it whenever the count changes */
+  progress?: (p: TurnProgress) => void;
   /** hint (kind / summary) feeds the permission banner and push wording. Adapters that can provide it should */
   requestPermission: (toolName: string, input: unknown, hint?: ToolHint) => Promise<PermissionDecision>;
   /** Launch spec of the `tiny mcp-server` that provides send_user_file. null attaches no MCP */

@@ -72,13 +72,9 @@ struct ChatView: View {
                                        localImages: send.thumbnails)
                         }
                         if model.inner?.isBusy == true {
-                            HStack(spacing: 8) {
-                                ProgressView()
-                                Text("Running…").font(.caption).foregroundStyle(Color.tInkSub)
-                                Spacer()
-                                Button("Stop") { Task { await model.inner?.interrupt() } }
-                                    .font(.caption)
-                                    .foregroundStyle(Color.tRuby)
+                            ActivityRow(since: model.inner?.busySince,
+                                        outputTokens: model.inner?.busyOutputTokens) {
+                                Task { await model.inner?.interrupt() }
                             }
                             .transition(appearTransition(isNew: true))
                         }

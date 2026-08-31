@@ -9,7 +9,7 @@ import { PermissionBroker } from "../src/permission-broker.js";
 import { FileOutbox } from "../src/outbox.js";
 import { ConflictError, NotFoundError, SessionManager, type PeerBridge, type SessionManagerDeps } from "../src/session-manager.js";
 import type { AgentAdapter, RunTurnParams } from "../src/adapter.js";
-import type { PeerFrame, PeerStatus, PeerTarget } from "../src/claude-peer.js";
+import { PEER_STOP, type PeerFrame, type PeerStatus, type PeerTarget } from "../src/claude-peer.js";
 import type { EventRecord } from "../src/types.js";
 
 /** Fake session-token issuer for tests (stands in for AuthService.issueSessionToken / revokeSessionTokens) */
@@ -1464,3 +1464,154 @@ function toolRecord(): Record<string, unknown> {
 }
 
 const jsonl = (records: Array<Record<string, unknown>>) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+
+/** An assistant record carrying the API response's usage, the way Claude Code writes it */
+function usageRecord(uuid: string, messageId: string, outputTokens: number): Record<string, unknown> {
+  return {
+    type: "assistant", uuid,
+    message: { id: messageId, content: [{ type: "text", text: `reply ${uuid}` }], usage: { input_tokens: 1, output_tokens: outputTokens } },
+  };
+}
+
+describe("SessionManager activity (the turn in progress, from either side)", () => {
+  let cwd: string;
+  beforeEach(() => {
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+  });
+
+  it("is null for an idle session", () => {
+    const { manager } = makeManager(okAdapter);
+    const s = manager.createSession({ profile: "work", cwd });
+    expect(manager.activity(s)).toBeNull();
+  });
+
+  it("reports a turn tiny runs with its start time and the adapter's output so far", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const slow: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        p.emit({ type: "turn_started", payload: {} });
+        p.progress?.({ outputTokens: 42 });
+        await gate;
+        p.emit({ type: "turn_completed", payload: {} });
+        return { agentSessionId: "agent-1", costUsd: null, resultText: null };
+      },
+    };
+    const { manager } = makeManager(slow);
+    const s = manager.createSession({ profile: "work", cwd });
+    const before = Date.now();
+    manager.startTurn(s.id, "hi");
+    await until(() => manager.activity(manager.getSession(s.id))?.outputTokens === 42);
+    const a = manager.activity(manager.getSession(s.id))!;
+    expect(Date.parse(a.since!)).toBeGreaterThanOrEqual(before - 1000);
+    release();
+    await manager.waitForIdle(s.id);
+    expect(manager.activity(manager.getSession(s.id))).toBeNull();
+  });
+
+  it("reports a turn typed into the CLI from the registry, and its tokens once the transcript is synced", () => {
+    const { manager, home } = makeManager(okAdapter, {
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.000Z" }) },
+    });
+    const { session, file } = liveSession(manager, home, "agent-cli-turn");
+    // Nothing synced yet: the registry alone says when it started, and nothing says how far it is
+    expect(manager.activity(manager.getSession(session.id))).toEqual({ since: "2026-08-31T12:06:55.000Z", outputTokens: null });
+    fs.writeFileSync(file, jsonl([
+      { type: "user", uuid: "h1", timestamp: "2026-08-31T12:06:56.000Z", message: { role: "user", content: "typed in the terminal" } },
+      usageRecord("a1", "msg_1", 363),
+      usageRecord("a2", "msg_1", 363),
+      usageRecord("a3", "msg_2", 234),
+    ]));
+    manager.syncTranscript(session.id);
+    expect(manager.activity(manager.getSession(session.id))).toEqual({ since: "2026-08-31T12:06:56.000Z", outputTokens: 597 });
+  });
+
+  it("never shows a previous turn's tokens against a turn the transcript has not been read for", () => {
+    let statusUpdatedAt = "2026-08-31T12:06:55.000Z";
+    const { manager, home } = makeManager(okAdapter, {
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt }) },
+    });
+    const { session, file } = liveSession(manager, home, "agent-cli-stale");
+    fs.writeFileSync(file, jsonl([
+      { type: "user", uuid: "h1", timestamp: "2026-08-31T12:06:56.000Z", message: { role: "user", content: "first" } },
+      usageRecord("a1", "msg_1", 999),
+    ]));
+    manager.syncTranscript(session.id);
+    // A new turn began after that sync (the phone sat on the list, nobody synced): the old count must not show
+    statusUpdatedAt = new Date(Date.now() + 60_000).toISOString();
+    expect(manager.activity(manager.getSession(session.id))).toEqual({ since: statusUpdatedAt, outputTokens: null });
+  });
+
+  it("counts a permission prompt as still running, and an idle or unknown CLI as nothing", () => {
+    let status: "busy" | "idle" | "waiting" | "shell" | "unknown" = "idle";
+    const { manager, home } = makeManager(okAdapter, {
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status, statusUpdatedAt: null }) },
+    });
+    const { session } = liveSession(manager, home, "agent-cli-states");
+    const s = manager.getSession(session.id);
+    expect(manager.activity(s)).toBeNull();
+    status = "unknown";
+    expect(manager.activity(s)).toBeNull();
+    status = "shell";
+    expect(manager.activity(s)).toBeNull();
+    status = "waiting";
+    expect(manager.activity(s)).toEqual({ since: null, outputTokens: null });
+  });
+
+  it("takes a live turn's tokens from the transcript the CLI writes", async () => {
+    const { peer, sent, setStatus } = fakePeer();
+    const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+    const { session, file } = liveSession(manager, home, "agent-live-tokens");
+    manager.startTurn(session.id, "hello");
+    await until(() => sent.length === 1);
+    setStatus({ status: "busy", waitingFor: null });
+    fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId), usageRecord("a1", "msg_1", 120)]));
+    await until(() => manager.activity(manager.getSession(session.id))?.outputTokens === 120);
+    setStatus({ status: "idle", waitingFor: null });
+    await manager.waitForIdle(session.id);
+    expect(manager.activity(manager.getSession(session.id))).toBeNull();
+  });
+});
+
+describe("SessionManager Stop on a turn the CLI started", () => {
+  it("sends the CLI the same stop message a live turn gets, at 'now' priority", async () => {
+    const { peer, sent } = fakePeer();
+    const { manager, home } = makeManager(okAdapter, {
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null }) },
+    });
+    const { session } = liveSession(manager, home, "agent-cli-stop");
+    await manager.interrupt(session.id);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.priority).toBe("now");
+    expect(sent[0]!.agentSessionId).toBe("agent-cli-stop");
+    expect(sent[0]!.content).toContain(PEER_STOP);
+  });
+
+  it("sends nothing when the CLI is idle", async () => {
+    const { peer, sent } = fakePeer();
+    const { manager, home } = makeManager(okAdapter, {
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "idle", statusUpdatedAt: null }) },
+    });
+    const { session } = liveSession(manager, home, "agent-cli-idle");
+    await manager.interrupt(session.id);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("fails visibly when the CLI is busy but cannot be reached", async () => {
+    const { peer } = fakePeer({ resolve: () => null });
+    const { manager, home } = makeManager(okAdapter, {
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null }) },
+    });
+    const { session } = liveSession(manager, home, "agent-cli-unreachable");
+    await expect(manager.interrupt(session.id)).rejects.toThrow(ConflictError);
+  });
+
+  it("surfaces a socket failure instead of swallowing it", async () => {
+    const { peer } = fakePeer({ send: async () => { throw new Error("connect ENOENT /srv/cc-socks/4242.sock"); } });
+    const { manager, home } = makeManager(okAdapter, {
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null }) },
+    });
+    const { session } = liveSession(manager, home, "agent-cli-socket");
+    await expect(manager.interrupt(session.id)).rejects.toThrow(/ENOENT/);
+  });
+});

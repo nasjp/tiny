@@ -118,6 +118,9 @@ export class ClaudeAdapter implements AgentAdapter {
         },
       });
 
+      // Output tokens per API response, so a response the SDK surfaces more than once is counted once
+      const outputByResponse = new Map<string, number>();
+      let anonymousResponses = 0;
       for await (const raw of q as AsyncIterable<Record<string, any>>) {
         switch (raw.type) {
           case "system":
@@ -126,8 +129,21 @@ export class ClaudeAdapter implements AgentAdapter {
               p.emit({ type: "turn_started", payload: { agentSessionId } });
             }
             break;
-          case "assistant":
+          case "assistant": {
+            const out = raw.message?.usage?.output_tokens;
+            if (typeof out === "number" && Number.isFinite(out) && p.progress) {
+              const key = typeof raw.message?.id === "string" ? raw.message.id : `#${anonymousResponses++}`;
+              outputByResponse.set(key, Math.max(outputByResponse.get(key) ?? 0, out));
+              let outputTokens = 0;
+              for (const n of outputByResponse.values()) outputTokens += n;
+              p.progress({ outputTokens });
+            }
             for (const b of contentBlocks(raw)) {
+              // Same rule as the transcript import: a thinking block with a body is the model's progress
+              // narration (Fable 5 leaves ordinary thinking empty) and is shown like the terminal shows it
+              if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim() !== "") {
+                p.emit({ type: "assistant_thinking", payload: { text: b.thinking } });
+              }
               if (b.type === "text") p.emit({ type: "assistant_text", payload: { text: b.text } });
               if (b.type === "tool_use") {
                 const hint = describeClaudeTool(b.name, b.input);
@@ -138,6 +154,7 @@ export class ClaudeAdapter implements AgentAdapter {
               }
             }
             break;
+          }
           case "user":
             for (const b of contentBlocks(raw)) {
               if (b.type === "tool_result") {

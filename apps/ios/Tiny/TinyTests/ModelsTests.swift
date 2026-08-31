@@ -262,6 +262,41 @@ final class ModelsTests: XCTestCase {
         XCTAssertTrue(s.isHeldByCLI)
     }
 
+    func testDecodesAssistantThinking() {
+        let ev = TinyEvent(type: "assistant_thinking", payload: .object(["text": .string("Checked the hedge; timeouts next.")]))
+        XCTAssertEqual(ev, .assistantThinking("Checked the hedge; timeouts next."))
+    }
+
+    func testActivityMarksASessionBusyWhateverStartedTheTurn() throws {
+        let json = """
+        {"id":"s1","agentSessionId":"a1","agent":"claude","profile":"local","cwd":"/tmp",
+         "permissionMode":"default","model":null,"effort":null,"title":"t","status":"idle",
+         "createdAt":"2026-08-31T00:00:00Z","updatedAt":"2026-08-31T00:00:00Z","cliLive":true,"cliJoin":true,
+         "activity":{"since":"2026-08-31T12:06:55.000Z","outputTokens":16400}}
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(SessionRecord.self, from: json)
+        XCTAssertEqual(s.activity, SessionActivity(since: "2026-08-31T12:06:55.000Z", outputTokens: 16400))
+        XCTAssertTrue(s.isBusy, "a turn the CLI runs on its own shows as running like any other")
+        XCTAssertFalse(s.isHeldByCLI)
+    }
+
+    func testActivityNullOrMissingLeavesTheSessionIdle() throws {
+        let json = """
+        {"id":"s1","agentSessionId":"a1","agent":"claude","profile":"local","cwd":"/tmp",
+         "permissionMode":"default","model":null,"effort":null,"title":"t","status":"idle",
+         "createdAt":"2026-08-31T00:00:00Z","updatedAt":"2026-08-31T00:00:00Z","activity":null}
+        """.data(using: .utf8)!
+        XCTAssertFalse(try JSONDecoder().decode(SessionRecord.self, from: json).isBusy)
+        let older = """
+        {"id":"s1","agentSessionId":"a1","agent":"claude","profile":"local","cwd":"/tmp",
+         "permissionMode":"default","model":null,"effort":null,"title":"t","status":"running",
+         "createdAt":"2026-08-31T00:00:00Z","updatedAt":"2026-08-31T00:00:00Z"}
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(SessionRecord.self, from: older)
+        XCTAssertNil(s.activity)
+        XCTAssertTrue(s.isBusy, "status alone still counts on an older server")
+    }
+
     func testDecodesCliAttention() {
         let ev = TinyEvent(type: "cli_attention", payload: .object(["reason": .string("permission prompt")]))
         XCTAssertEqual(ev, .cliAttention(reason: "permission prompt"))

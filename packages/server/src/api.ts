@@ -100,6 +100,7 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
     ...s,
     cliLive: deps.isCliLive(s),
     cliJoin: deps.manager.canJoin(s),
+    activity: deps.manager.activity(s),
   });
 
   app.onError((err, c) => {
@@ -217,8 +218,8 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
     return c.json({ ok: true }, 202);
   });
 
-  app.post("/v1/sessions/:id/interrupt", (c) => {
-    deps.manager.interrupt(c.req.param("id"));
+  app.post("/v1/sessions/:id/interrupt", async (c) => {
+    await deps.manager.interrupt(c.req.param("id"));
     return c.json({ ok: true });
   });
 

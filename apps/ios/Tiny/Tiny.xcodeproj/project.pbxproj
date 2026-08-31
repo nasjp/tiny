@@ -24,9 +24,11 @@
 		3BC98408DF232BDA9A041983 /* SmokeUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 193D6C70421A66AA2E001819 /* SmokeUITests.swift */; };
 		4A2E8516598B7F9A01102532 /* AppModelCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78B6867B39EF17D636C8F5BB /* AppModelCacheTests.swift */; };
 		4B07205D0B2A0B4E1049CD1A /* PushCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80681FE26187071771FA4EAE /* PushCrypto.swift */; };
+		4F95FCA5AEAFFAE8AE77DA10 /* ActivityFormatTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54034E11E3A77FA8FEBBF02B /* ActivityFormatTests.swift */; };
 		53C1CC68EE17DBCE8FC76226 /* SharedKeychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = C99B8BFD3581663C2E62B098 /* SharedKeychain.swift */; };
 		5766720FD287084AD7B52EB1 /* ChatModelCliLiveTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CBC5CBDDD8DA60222DF484B /* ChatModelCliLiveTests.swift */; };
 		58E2E93F08826814AE681140 /* MessageCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B99BB40B42A005338884113 /* MessageCopyTests.swift */; };
+		60162B03E4A6F4C64DE24390 /* ActivityRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 175C87DAB9D89FBCAED1C5E2 /* ActivityRow.swift */; };
 		6645B8DC0ED1826521E9E90C /* TinyApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D4970D875E1B6C8649AA9AA /* TinyApp.swift */; };
 		66771653B3044625AA42E0A4 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 134AD98023026BAC41E60302 /* Models.swift */; };
 		6D6AFDE9A9D09AD637A66EC3 /* WebViewHardeningTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C54C5EF9C17B0A119A28FBDF /* WebViewHardeningTests.swift */; };
@@ -119,6 +121,7 @@
 		134AD98023026BAC41E60302 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		1565353DCDA7470EB0241FB9 /* MessageCopy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageCopy.swift; sourceTree = "<group>"; };
 		17506FCF543DB529A0491FF3 /* ChatRowWidthTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatRowWidthTests.swift; sourceTree = "<group>"; };
+		175C87DAB9D89FBCAED1C5E2 /* ActivityRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityRow.swift; sourceTree = "<group>"; };
 		193D6C70421A66AA2E001819 /* SmokeUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmokeUITests.swift; sourceTree = "<group>"; };
 		1D3E8DAF906DF38DCE3A604B /* TinyUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = TinyUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		20BE7F528B9239B1A7867592 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -138,6 +141,7 @@
 		47DE8DD782FD884CF0633C42 /* EventStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventStream.swift; sourceTree = "<group>"; };
 		4D4970D875E1B6C8649AA9AA /* TinyApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TinyApp.swift; sourceTree = "<group>"; };
 		5243699118A40748D5FB99F6 /* MarkdownTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTextTests.swift; sourceTree = "<group>"; };
+		54034E11E3A77FA8FEBBF02B /* ActivityFormatTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityFormatTests.swift; sourceTree = "<group>"; };
 		5CB885AAC0F2503AAEDB1DC2 /* ArchivedSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArchivedSessionsView.swift; sourceTree = "<group>"; };
 		5F465C94EB1C8784D463A1DE /* EventStreamTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventStreamTests.swift; sourceTree = "<group>"; };
 		641D55E60406FDC3E8EC79B5 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -271,6 +275,7 @@
 			isa = PBXGroup;
 			children = (
 				3BEF3187682B03BF68431F6F /* AboutTests.swift */,
+				54034E11E3A77FA8FEBBF02B /* ActivityFormatTests.swift */,
 				9909D3BB2122A05699F122A1 /* APIClientTests.swift */,
 				78B6867B39EF17D636C8F5BB /* AppModelCacheTests.swift */,
 				2CBC5CBDDD8DA60222DF484B /* ChatModelCliLiveTests.swift */,
@@ -389,6 +394,7 @@
 		F8A4FE26350EF99010C9C4BC /* Chat */ = {
 			isa = PBXGroup;
 			children = (
+				175C87DAB9D89FBCAED1C5E2 /* ActivityRow.swift */,
 				7A86A587F0AD1EF6C310BCDE /* ChatModel.swift */,
 				0456A9DF2175BBEDAC8D1772 /* ChatView.swift */,
 				7DFE20CF39DA8FFB49FE5F5A /* EventRow.swift */,
@@ -568,6 +574,7 @@
 			files = (
 				0DE11FD5FC88E6F54818E75E /* APIClientTests.swift in Sources */,
 				033F6BDEBDF833EE3E15526D /* AboutTests.swift in Sources */,
+				4F95FCA5AEAFFAE8AE77DA10 /* ActivityFormatTests.swift in Sources */,
 				4A2E8516598B7F9A01102532 /* AppModelCacheTests.swift in Sources */,
 				5766720FD287084AD7B52EB1 /* ChatModelCliLiveTests.swift in Sources */,
 				EAC537A3AE697F065CC641F7 /* ChatModelOptimisticSendTests.swift in Sources */,
@@ -596,6 +603,7 @@
 			files = (
 				7F89FB30BF31CC271DCAF050 /* APIClient.swift in Sources */,
 				D9259830870900E4E074A143 /* AboutView.swift in Sources */,
+				60162B03E4A6F4C64DE24390 /* ActivityRow.swift in Sources */,
 				C2A23FF5ED3BCF35EB4A6E1F /* AppModel.swift in Sources */,
 				F30594D14F6D2242BC91F9CE /* ArchivedSessionsView.swift in Sources */,
 				AD985718914842B81DC175BA /* Backend.swift in Sources */,
@@ -681,7 +689,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 31;
+				CURRENT_PROJECT_VERSION = 32;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = TS295VKGNA;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -775,7 +783,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 31;
+				CURRENT_PROJECT_VERSION = 32;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = TS295VKGNA;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

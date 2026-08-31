@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isSessionLive, readLiveSessionIds } from "../src/claude-live.js";
+import { isSessionLive, readLiveSessionIds, readLiveSessions } from "../src/claude-live.js";
 
 const SID = "3424c289-0fc1-4ec3-a0ca-3e5f324839fa";
 
@@ -87,5 +87,42 @@ describe("claude-live", () => {
     };
     expect(() => isSessionLive(root, SID, throwing)).not.toThrow();
     expect(isSessionLive(root, SID, throwing)).toBeNull();
+  });
+});
+
+describe("claude-live registry status", () => {
+  let root: string;
+  const alwaysAlive = () => true;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-live-"));
+  });
+
+  it("reads each open session's status and when it changed", () => {
+    writeEntry(root, 111, { pid: 111, sessionId: SID, peerProtocol: 1, status: "busy", statusUpdatedAt: 1788178015525 });
+    writeEntry(root, 222, { pid: 222, sessionId: "other", peerProtocol: 1, status: "idle", statusUpdatedAt: 1788178000000 });
+    const entries = readLiveSessions(root, alwaysAlive);
+    expect(entries?.get(SID)).toEqual({ pid: 111, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.525Z" });
+    expect(entries?.get("other")).toEqual({ pid: 222, status: "idle", statusUpdatedAt: "2026-08-31T12:06:40.000Z" });
+  });
+
+  it("reports an unreadable or unexpected status as unknown, never as idle", () => {
+    writeEntry(root, 111, { pid: 111, sessionId: SID, peerProtocol: 1 });
+    writeEntry(root, 222, { pid: 222, sessionId: "other", peerProtocol: 1, status: "dancing", statusUpdatedAt: "soon" });
+    const entries = readLiveSessions(root, alwaysAlive);
+    expect(entries?.get(SID)).toEqual({ pid: 111, status: "unknown", statusUpdatedAt: null });
+    expect(entries?.get("other")).toEqual({ pid: 222, status: "unknown", statusUpdatedAt: null });
+  });
+
+  it("leaves out sessions whose process is gone and agrees with readLiveSessionIds", () => {
+    writeEntry(root, 111, { pid: 111, sessionId: SID, peerProtocol: 1, status: "busy" });
+    writeEntry(root, 333, { pid: 333, sessionId: "dead", peerProtocol: 1, status: "busy" });
+    const alive = (pid: number) => pid !== 333;
+    const entries = readLiveSessions(root, alive);
+    expect([...entries!.keys()]).toEqual([SID]);
+    expect(readLiveSessionIds(root, alive)).toEqual(new Set([SID]));
+  });
+
+  it("is null when the registry cannot be read", () => {
+    expect(readLiveSessions(root, alwaysAlive)).toBeNull();
   });
 });

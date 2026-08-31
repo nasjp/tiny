@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { findTranscript, readTranscript, readTranscriptCursor } from "../src/claude-transcript.js";
+import { findTranscript, newestTurn, readTranscript, readTranscriptCursor } from "../src/claude-transcript.js";
 
 const SID = "3424c289-0fc1-4ec3-a0ca-3e5f324839fa";
 
@@ -506,5 +506,77 @@ describe("claude-transcript peer and command records", () => {
     // one human turn = from "the real question" onward
     expect(r.events.map((e) => e.type)).toEqual(["user_message", "user_message"]);
     expect(r.events[0]!.payload.text).toBe("the real question");
+  });
+});
+
+describe("claude-transcript thinking and turn progress", () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-tr-"));
+  });
+
+  const human = (uuid: string, text: string, timestamp: string): Record<string, unknown> => ({
+    type: "user", uuid, timestamp, message: { role: "user", content: text },
+  });
+  const assistant = (
+    uuid: string,
+    id: string,
+    content: Array<Record<string, unknown>>,
+    outputTokens: number,
+  ): Record<string, unknown> => ({
+    type: "assistant", uuid, message: { id, content, usage: { input_tokens: 2, output_tokens: outputTokens } },
+  });
+
+  it("imports a thinking block with a body as assistant_thinking and drops an empty one", () => {
+    const file = path.join(root, "projects", "p", `${SID}.jsonl`);
+    writeJsonl(file, [
+      human("u1", "go", "2026-08-31T12:06:55.000Z"),
+      assistant("a1", "msg_1", [{ type: "thinking", thinking: "", signature: "x" }], 10),
+      assistant("a2", "msg_1", [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "/a" } }], 10),
+      assistant("a3", "msg_2", [{ type: "thinking", thinking: "Checked the hedge; now the timeouts.", signature: "y" }], 5),
+      assistant("a4", "msg_2", [{ type: "text", text: "Done." }], 5),
+    ]);
+    const read = readTranscript(file);
+    expect(read.events.map((e) => e.type)).toEqual(["user_message", "tool_started", "assistant_thinking", "assistant_text"]);
+    expect(read.events[2]!.payload).toEqual({ text: "Checked the hedge; now the timeouts." });
+  });
+
+  it("sums the newest turn's output tokens once per API response, from the record that started it", () => {
+    const messages = [
+      human("u1", "first question", "2026-08-31T12:00:00.000Z"),
+      assistant("a1", "msg_old", [{ type: "text", text: "old answer" }], 999),
+      human("u2", "second question", "2026-08-31T12:06:55.000Z"),
+      // Claude Code repeats one response's usage on each of its records: thinking / text / tool_use
+      assistant("a2", "msg_1", [{ type: "thinking", thinking: "" }], 363),
+      assistant("a3", "msg_1", [{ type: "text", text: "Looking" }], 363),
+      assistant("a4", "msg_1", [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } }], 363),
+      { type: "user", uuid: "u3", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] } },
+      // A subagent notice lands mid-turn as a user record; it must not restart the count
+      { type: "user", uuid: "u4", timestamp: "2026-08-31T12:07:00.000Z", message: { role: "user", content: "<task-notification>done</task-notification>" } },
+      assistant("a5", "msg_2", [{ type: "tool_use", id: "t2", name: "Bash", input: { command: "pwd" } }], 234),
+    ];
+    expect(newestTurn(messages)).toEqual({ startedAt: "2026-08-31T12:06:55.000Z", outputTokens: 597 });
+  });
+
+  it("treats a message injected through the messaging socket as the start of a turn", () => {
+    const messages = [
+      human("u1", "typed in the terminal", "2026-08-31T12:00:00.000Z"),
+      assistant("a1", "msg_old", [{ type: "text", text: "terminal answer" }], 100),
+      {
+        type: "user", uuid: "p1", isMeta: true, timestamp: "2026-08-31T12:10:00.000Z",
+        origin: { kind: "peer", msg_id: "m-1", name: "tiny" },
+        message: { role: "user", content: "Another Claude session sent a message: hi" },
+      },
+      assistant("a2", "msg_new", [{ type: "text", text: "phone answer" }], 40),
+    ];
+    expect(newestTurn(messages)).toEqual({ startedAt: "2026-08-31T12:10:00.000Z", outputTokens: 40 });
+  });
+
+  it("is null before the first turn, and reports zero tokens right after a prompt", () => {
+    expect(newestTurn([])).toBeNull();
+    expect(newestTurn([{ type: "user", uuid: "m", isMeta: true, message: { role: "user", content: "<local-command-caveat>x</local-command-caveat>" } }])).toBeNull();
+    const file = path.join(root, "projects", "p", `${SID}.jsonl`);
+    writeJsonl(file, [human("u1", "go", "2026-08-31T12:06:55.000Z")]);
+    expect(readTranscript(file).turn).toEqual({ startedAt: "2026-08-31T12:06:55.000Z", outputTokens: 0 });
   });
 });

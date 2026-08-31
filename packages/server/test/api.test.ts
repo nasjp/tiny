@@ -15,6 +15,7 @@ import { PushClient } from "../src/push-client.js";
 import { UsageService } from "../src/usage.js";
 import type { PeerBridge } from "../src/session-manager.js";
 import type { PeerFrame, PeerTarget } from "../src/claude-peer.js";
+import type { LiveSessionEntry } from "../src/claude-live.js";
 
 // Condensed rate_limits from the SDK's usage response (the limits array is what /usage actually shows)
 const usageFixture = {
@@ -44,11 +45,13 @@ describe("REST API", () => {
   let auth: AuthService;
   let profilesDir: string;
   let cliLive: boolean | null = null;
+  let cliState: LiveSessionEntry | null = null;
   let peerTarget: PeerTarget | null = null;
   let peerSent: PeerFrame[] = [];
 
   beforeEach(() => {
     cliLive = null;
+    cliState = null;
     peerTarget = null;
     peerSent = [];
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-api-"));
@@ -67,7 +70,7 @@ describe("REST API", () => {
     };
     manager = new SessionManager({
       stores, profilesDir, adapters: { claude: okAdapter }, broker: new PermissionBroker(1000), outbox,
-      isCliLive, peer, liveTiming: { pollMs: 10, deliveryTimeoutMs: 50, maxTurnMs: 500 },
+      isCliLive, cliState: () => cliState, peer, liveTiming: { pollMs: 10, deliveryTimeoutMs: 50, maxTurnMs: 500 },
     });
     auth = new AuthService(stores, path.join(home, "secret"));
     token = auth.cliToken();
@@ -702,5 +705,42 @@ describe("REST API", () => {
     const res1 = await app.request(`/v1/sessions/${sessions[0]!.id}`, { headers: H() });
     expect(((await res1.json()) as { cliLive: boolean | null }).cliLive).toBe(true);
     cliLive = null;
+  });
+  it("reports the turn in progress on every session, from tiny's side or the CLI's", async () => {
+    const created = await app.request("/v1/sessions", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }),
+    });
+    const { id } = (await created.json()) as { id: string };
+    let list = (await (await app.request("/v1/sessions", { headers: H() })).json()) as { sessions: Array<Record<string, unknown>> };
+    expect(list.sessions.find((s) => s.id === id)!.activity).toBeNull();
+
+    // The person typed a prompt into the terminal: only the registry knows
+    cliLive = true;
+    cliState = { pid: 4242, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.000Z" };
+    list = (await (await app.request("/v1/sessions", { headers: H() })).json()) as typeof list;
+    expect(list.sessions.find((s) => s.id === id)!.activity).toEqual({ since: "2026-08-31T12:06:55.000Z", outputTokens: null });
+    const one = (await (await app.request(`/v1/sessions/${id}`, { headers: H() })).json()) as Record<string, unknown>;
+    expect(one.activity).toEqual({ since: "2026-08-31T12:06:55.000Z", outputTokens: null });
+  });
+
+  it("Stop on a turn the CLI started reaches the CLI, and says so when it cannot", async () => {
+    const created = await app.request("/v1/sessions", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }),
+    });
+    const { id } = (await created.json()) as { id: string };
+    // adoptSession is what gives a CLI session its agent id; a session created here has none until a turn runs
+    stores.sessions.patch(id, { agentSessionId: "agent-cli" });
+    cliLive = true;
+    cliState = { pid: 4242, status: "busy", statusUpdatedAt: null };
+
+    const unreachable = await app.request(`/v1/sessions/${id}/interrupt`, { method: "POST", headers: H() });
+    expect(unreachable.status).toBe(409);
+    expect(peerSent).toHaveLength(0);
+
+    peerTarget = { pid: 4242, sockPath: "/srv/cc-socks/4242.sock" };
+    const stopped = await app.request(`/v1/sessions/${id}/interrupt`, { method: "POST", headers: H() });
+    expect(stopped.status).toBe(200);
+    expect(peerSent).toHaveLength(1);
+    expect(peerSent[0]!.priority).toBe("now");
   });
 });

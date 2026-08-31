@@ -20,6 +20,9 @@ struct EventRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .copyable(text)
 
+        case .assistantThinking(let text):
+            ThinkingRow(text: text)
+
         case .peerMessage(let from, let summary, let text):
             PeerMessageCard(from: from, summary: summary, text: text)
 
@@ -130,6 +133,31 @@ struct EventRow: View {
         // which ISO8601DateFormatter cannot read — drop the fraction and retry
         let stripped = iso.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
         return plain.date(from: stripped)
+    }
+}
+
+/// The model's progress narration, shown the way the terminal shows a summarized thinking line:
+/// quiet, secondary, a couple of lines. Tap to read the whole thing when it runs longer
+struct ThinkingRow: View {
+    let text: String
+    @State private var expanded = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "sparkle")
+                .font(.caption2)
+                .foregroundStyle(Color.tInkSub)
+                .padding(.top, 3)
+            Text(text)
+                .font(.subheadline)
+                .italic()
+                .foregroundStyle(Color.tInkSub)
+                .lineLimit(expanded ? nil : 3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() } }
+        .copyable(text)
     }
 }
 

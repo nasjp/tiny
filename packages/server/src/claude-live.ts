@@ -19,14 +19,25 @@ function processAlive(pid: number): boolean {
   }
 }
 
+/** What the registry says a CLI process is doing. "unknown" = the entry carried no readable status */
+export type CliStatus = "busy" | "idle" | "waiting" | "shell" | "unknown";
+const CLI_STATUSES: ReadonlySet<string> = new Set(["busy", "idle", "waiting", "shell"]);
+
+export interface LiveSessionEntry {
+  pid: number;
+  status: CliStatus;
+  /** When `status` last changed (ISO 8601), null when the entry does not say */
+  statusUpdatedAt: string | null;
+}
+
 /**
- * Session ids the registry currently reports as open, or null when it cannot be read.
- * Read this ONCE when checking many sessions — the list endpoint asks for every row.
+ * Every session the registry currently reports as open, keyed by session id, or null when it
+ * cannot be read. Read this ONCE when checking many sessions — the list endpoint asks for every row.
  */
-export function readLiveSessionIds(
+export function readLiveSessions(
   configDir: string,
   alive: (pid: number) => boolean = processAlive,
-): Set<string> | null {
+): Map<string, LiveSessionEntry> | null {
   const dir = path.join(configDir, "sessions");
   let names: string[];
   try {
@@ -35,10 +46,10 @@ export function readLiveSessionIds(
     return null; // no registry at all
   }
 
-  const ids = new Set<string>();
+  const entries = new Map<string, LiveSessionEntry>();
   let understood = 0;
   for (const name of names) {
-    let entry: { pid?: unknown; sessionId?: unknown; peerProtocol?: unknown };
+    let entry: { pid?: unknown; sessionId?: unknown; peerProtocol?: unknown; status?: unknown; statusUpdatedAt?: unknown };
     try {
       entry = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as typeof entry;
     } catch {
@@ -56,10 +67,29 @@ export function readLiveSessionIds(
       continue; // cannot tell for this entry, so it must not count as understood either
     }
     understood++;
-    if (running) ids.add(entry.sessionId);
+    if (!running) continue;
+    const status: CliStatus =
+      typeof entry.status === "string" && CLI_STATUSES.has(entry.status) ? (entry.status as CliStatus) : "unknown";
+    const statusUpdatedAt =
+      typeof entry.statusUpdatedAt === "number" && Number.isFinite(entry.statusUpdatedAt)
+        ? new Date(entry.statusUpdatedAt).toISOString()
+        : null;
+    entries.set(entry.sessionId, { pid: entry.pid, status, statusUpdatedAt });
   }
   // Understood nothing = we cannot tell. Understood something = absence means "not open"
-  return understood > 0 ? ids : null;
+  return understood > 0 ? entries : null;
+}
+
+/**
+ * Session ids the registry currently reports as open, or null when it cannot be read.
+ * Read this ONCE when checking many sessions — the list endpoint asks for every row.
+ */
+export function readLiveSessionIds(
+  configDir: string,
+  alive: (pid: number) => boolean = processAlive,
+): Set<string> | null {
+  const entries = readLiveSessions(configDir, alive);
+  return entries === null ? null : new Set(entries.keys());
 }
 
 /**

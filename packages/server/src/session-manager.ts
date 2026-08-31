@@ -5,12 +5,13 @@ import type { AgentAdapter, TurnImage } from "./adapter.js";
 import type { McpLaunch } from "./mcp-launch.js";
 import type { FileOutbox } from "./outbox.js";
 import { profileDir, profileDriver } from "./profiles.js";
-import { findTranscript, readTranscript, readTranscriptCursor } from "./claude-transcript.js";
+import type { LiveSessionEntry } from "./claude-live.js";
+import { findTranscript, readTranscript, readTranscriptCursor, type TranscriptTurn } from "./claude-transcript.js";
 import { PEER_STOP, wrapForPeer, type CliMode, type PeerFrame, type PeerStatus, type PeerTarget } from "./claude-peer.js";
 import type { AgentCapabilities, AgentDriver } from "./agents/index.js";
 import type { PendingPermission, PermissionBroker, PermissionDecision } from "./permission-broker.js";
 import type { SessionPatch, Stores } from "./stores.js";
-import type { FileRecord, PermissionModeValue, SessionRecord, SessionStatus } from "./types.js";
+import type { FileRecord, PermissionModeValue, SessionRecord, SessionStatus, SessionActivity } from "./types.js";
 
 export class ConflictError extends Error {}
 export class NotFoundError extends Error {}
@@ -76,6 +77,11 @@ export interface SessionManagerDeps {
    * Injected so tests do not depend on a real registry. Absent = never blocks.
    */
   isCliLive?: (s: SessionRecord) => boolean | null;
+  /**
+   * What the CLI process holding this session is doing (registry status). null = not open or cannot
+   * tell. Feeds `activity` for turns the person typed into the terminal, which tiny never sees start
+   */
+  cliState?: (s: SessionRecord) => LiveSessionEntry | null;
   /** Live join into the CLI (Step 2). Absent = a turn sent while the CLI holds the session is refused (409) */
   peer?: PeerBridge;
   /** Watcher timings. Tests shorten them; production uses the defaults */
@@ -108,8 +114,15 @@ interface LiveTurn {
   lastAssistantText: string | null;
 }
 
+/** Registry statuses that mean "a turn is in progress over there" (a permission prompt is mid-turn too) */
+const CLI_BUSY: ReadonlySet<string> = new Set(["busy", "waiting"]);
+
 export class SessionManager extends EventEmitter {
   private running = new Map<string, RunningTurn>();
+  /** Progress of the turns in `running`: when they started and, for adapters that report it, output so far */
+  private turnProgress = new Map<string, { since: string; outputTokens: number | null }>();
+  /** Newest turn seen in each session's transcript at the last import, and when that import ran */
+  private transcriptTurns = new Map<string, TranscriptTurn & { readAt: number }>();
   /** Turns currently running inside the user's CLI rather than tiny's own adapter, by session id */
   private liveTurns = new Map<string, LiveTurn>();
   /**
@@ -355,6 +368,7 @@ export class SessionManager extends EventEmitter {
       ...(s.sourceCursor ? {} : { turns: SessionManager.BACKFILL_TURNS }),
     });
     for (const ev of read.events) this.emitEvent(id, ev.type, ev.payload);
+    if (read.turn) this.transcriptTurns.set(id, { ...read.turn, readAt: Date.now() });
     const patch: SessionPatch = {};
     if (read.cursor && read.cursor !== s.sourceCursor) patch.sourceCursor = read.cursor;
     if (read.title && !s.title) patch.title = read.title;
@@ -364,7 +378,9 @@ export class SessionManager extends EventEmitter {
     // yielded none (a rotate caught mid-flight) would otherwise advance the stat while the cursor
     // stood still, and those records would never be imported. Leave the old entry: the next call retries
     if (read.cursor) this.transcriptStats.set(id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
-    const responded = read.events.some((ev) => ev.type === "assistant_text" || ev.type === "tool_started");
+    const responded = read.events.some(
+      (ev) => ev.type === "assistant_text" || ev.type === "assistant_thinking" || ev.type === "tool_started",
+    );
     // Record delivery/response evidence directly on the live turn (if any), not just in the return
     // value: this call can come from a live turn's own watcher tick OR from any other caller of
     // syncTranscript (e.g. GET /v1/sessions/:id/events, polled whenever the phone has the chat
@@ -486,15 +502,46 @@ export class SessionManager extends EventEmitter {
     if (isLive && !target) throw new ConflictError("session is open in the CLI");
     this.deps.stores.sessions.patch(id, { status: "running", title: s.title ?? prompt.slice(0, 60) });
     const abort = new AbortController();
+    this.turnProgress.set(id, { since: new Date().toISOString(), outputTokens: null });
+    const finish = (): void => {
+      this.running.delete(id);
+      this.turnProgress.delete(id);
+    };
     if (target) {
       const saved = this.persistUserMessage(id, prompt, images);
-      const done = this.runLiveTurn(s, prompt, saved.paths, target, abort.signal).finally(() => this.running.delete(id));
+      const done = this.runLiveTurn(s, prompt, saved.paths, target, abort.signal).finally(finish);
       this.running.set(id, { abort, done });
       return;
     }
     this.persistUserMessage(id, prompt, images);
-    const done = this.runTurn(s, prompt, images, abort.signal).finally(() => this.running.delete(id));
+    const done = this.runTurn(s, prompt, images, abort.signal).finally(finish);
     this.running.set(id, { abort, done });
+  }
+
+  /**
+   * The turn in progress on this session, from whichever side started it: a turn tiny runs (SDK or
+   * live join), or one the person typed into the CLI, which tiny only sees through the registry
+   * status and the transcript. null when idle. Nothing here is persisted — it is a live reading
+   */
+  activity(s: SessionRecord): SessionActivity | null {
+    const own = this.turnProgress.get(s.id);
+    if (own) {
+      // A live turn's output is written by the CLI, so the transcript is the only place it shows up
+      const fromTranscript = this.liveTurns.has(s.id) ? this.transcriptTurns.get(s.id)?.outputTokens ?? null : null;
+      return { since: own.since, outputTokens: own.outputTokens ?? fromTranscript };
+    }
+    const st = this.deps.cliState?.(s);
+    if (!st || !CLI_BUSY.has(st.status)) return null;
+    // The transcript's newest turn is only trustworthy if it was read after the CLI went busy;
+    // otherwise it is the PREVIOUS turn (nobody syncs the transcript while the phone sits on the
+    // session list), and its token count would be shown against the wrong turn
+    const seen = this.transcriptTurns.get(s.id);
+    const busySince = st.statusUpdatedAt ? Date.parse(st.statusUpdatedAt) : NaN;
+    const fresh = seen && (Number.isNaN(busySince) || seen.readAt >= busySince) ? seen : null;
+    return {
+      since: fresh?.startedAt ?? st.statusUpdatedAt,
+      outputTokens: fresh ? fresh.outputTokens : null,
+    };
   }
 
   /**
@@ -546,6 +593,10 @@ export class SessionManager extends EventEmitter {
         prompt,
         ...(images && images.length > 0 ? { images } : {}),
         emit: (ev) => this.emitEvent(s.id, ev.type, ev.payload),
+        progress: (p) => {
+          const t = this.turnProgress.get(s.id);
+          if (t) t.outputTokens = p.outputTokens;
+        },
         requestPermission: async (toolName, input, hint) => {
           const { id: reqId, decision } = this.deps.broker.request(s.id, toolName, input, hint);
           this.emitEvent(s.id, "permission_requested", {
@@ -737,11 +788,16 @@ export class SessionManager extends EventEmitter {
     await this.running.get(id)?.done;
   }
 
-  interrupt(id: string): void {
+  async interrupt(id: string): Promise<void> {
     const s = this.getSession(id);
     const live = this.liveTurns.get(id);
     if (!live) {
-      this.running.get(id)?.abort.abort();
+      const own = this.running.get(id);
+      if (own) {
+        own.abort.abort();
+        return;
+      }
+      await this.stopCliTurn(s);
       return;
     }
     // The CLI owns this turn and its socket has no cancel — but a "now" message makes it abandon
@@ -760,6 +816,23 @@ export class SessionManager extends EventEmitter {
         live.stopFailure = reason;
         console.error(`[tinyd] could not send stop to the CLI: ${reason}`);
       });
+  }
+
+  /**
+   * Stop a turn tiny did not start: the person typed it into the terminal (or another session sent
+   * it there), and the phone shows it running from the registry status. Who started a turn makes no
+   * difference to the person tapping Stop, so it is stopped the way a live turn is — with the same
+   * "now" message the CLI takes instead of continuing. Awaited so a socket failure reaches the tap
+   */
+  private async stopCliTurn(s: SessionRecord): Promise<void> {
+    const st = this.deps.cliState?.(s);
+    if (!st || !CLI_BUSY.has(st.status)) return; // nothing is running anywhere
+    const target = this.joinTarget(s);
+    if (!target) throw new ConflictError("the CLI holds this session but tiny cannot reach it");
+    const content = wrapForPeer(PEER_STOP, { name: "tiny", mode: this.deps.peer!.mode(s, target) });
+    await this.deps.peer!.send(s, target, {
+      agentSessionId: s.agentSessionId!, msgId: crypto.randomUUID(), content, priority: "now",
+    });
   }
 
   setDetached(id: string, detached: boolean): SessionRecord {

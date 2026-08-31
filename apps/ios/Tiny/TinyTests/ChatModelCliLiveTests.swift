@@ -6,7 +6,7 @@ import XCTest
 /// for isDetached, so the model refreshes it itself instead of trusting the stale pushed value).
 @MainActor
 final class ChatModelCliLiveTests: XCTestCase {
-    private final class MockBackend: TinyBackend {
+    private class MockBackend: TinyBackend {
         let isDemo = true
         var sessionsList: [SessionRecord] = []
 
@@ -36,11 +36,51 @@ final class ChatModelCliLiveTests: XCTestCase {
         }
     }
 
-    private func makeSession(cliLive: Bool?, cliJoin: Bool? = nil) -> SessionRecord {
+    private func makeSession(cliLive: Bool?, cliJoin: Bool? = nil, activity: SessionActivity? = nil) -> SessionRecord {
         SessionRecord(id: "s1", agentSessionId: nil, agent: "claude", profile: "default",
                       cwd: "/tmp", permissionMode: .default, model: nil, effort: nil,
                       title: nil, status: .idle, createdAt: "2026-08-31T00:00:00Z",
-                      updatedAt: "2026-08-31T00:00:00Z", cliLive: cliLive, cliJoin: cliJoin)
+                      updatedAt: "2026-08-31T00:00:00Z", cliLive: cliLive, cliJoin: cliJoin, activity: activity)
+    }
+
+    private let busy = SessionActivity(since: "2026-08-31T12:06:55.000Z", outputTokens: 597)
+
+    func testActivityFromThePushedSessionShowsRunning() {
+        let model = ChatModel(backend: MockBackend(), session: makeSession(cliLive: true, cliJoin: true, activity: busy))
+        XCTAssertTrue(model.isBusy, "a turn typed into the CLI is running here too")
+        XCTAssertEqual(model.busySince, EventRow.parseISO("2026-08-31T12:06:55.000Z"))
+        XCTAssertEqual(model.busyOutputTokens, 597)
+    }
+
+    func testRefreshPicksUpTheCLIStartingAndFinishingATurn() async {
+        let backend = MockBackend()
+        let model = ChatModel(backend: backend, session: makeSession(cliLive: true, cliJoin: true))
+        XCTAssertFalse(model.isBusy)
+        backend.sessionsList = [makeSession(cliLive: true, cliJoin: true, activity: busy)]
+        await model.refreshCliLive()
+        XCTAssertTrue(model.isBusy, "the CLI starting a turn must show Running without reopening the chat")
+        backend.sessionsList = [makeSession(cliLive: true, cliJoin: true)]
+        await model.refreshCliLive()
+        XCTAssertFalse(model.isBusy, "and going idle over there must take the Running row away")
+    }
+
+    func testTurnEndClearsActivityWithoutWaitingForAPoll() {
+        let model = ChatModel(backend: MockBackend(), session: makeSession(cliLive: true, cliJoin: true, activity: busy))
+        model.handle(EventRecord(id: 7, sessionId: "s1", type: "turn_completed", payload: .object([:]),
+                                 createdAt: "2026-08-31T12:10:00.000Z"))
+        XCTAssertFalse(model.isBusy)
+        XCTAssertNil(model.busySince)
+    }
+
+    func testStopFailureIsShown() async {
+        final class FailingBackend: MockBackend {
+            override func interrupt(sessionId: String) async throws {
+                throw APIError(status: 409, message: "the CLI holds this session but tiny cannot reach it")
+            }
+        }
+        let model = ChatModel(backend: FailingBackend(), session: makeSession(cliLive: true, cliJoin: true, activity: busy))
+        await model.interrupt()
+        XCTAssertEqual(model.errorBanner, "Could not stop: the CLI holds this session but tiny cannot reach it")
     }
 
     func testInitSourcesFromThePushedSession() {

@@ -163,8 +163,8 @@ struct SessionListView: View {
 
     private func row(_ s: SessionRecord) -> some View {
         HStack(spacing: 10) {
-            // Unread dot (the spinner wins while running)
-            if s.status == .running {
+            // Unread dot (the spinner wins while running — from either side)
+            if s.isBusy {
                 ProgressView().controlSize(.small)
             } else if ReadMarks.isUnread(s) {
                 Circle().fill(Color.tTint).frame(width: 9, height: 9)
@@ -183,7 +183,8 @@ struct SessionListView: View {
                             .padding(.vertical, 2)
                             .background(Color.secondary.opacity(0.15), in: Capsule())
                     }
-                    statusBadge(s.status)
+                    // A turn the CLI is running on its own is "Running" all the same
+                    statusBadge(s.isBusy ? .running : s.status)
                 }
                 HStack(spacing: 4) {
                     Text("\(s.profile) · \((s.cwd as NSString).lastPathComponent)")

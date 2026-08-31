@@ -25,6 +25,13 @@ final class ChatModel: ObservableObject {
     /// Sourced fresh here instead of read from the SessionRecord ChatView was pushed with, because that
     /// snapshot never changes while the chat stays open — see cliLiveTask below.
     @Published private(set) var isHeldByCLI: Bool
+    /// The turn the server sees in progress, from either side (a turn the CLI runs on its own has no
+    /// turn_started here, so this is the only way it shows as running). Polled with isHeldByCLI
+    @Published private(set) var activity: SessionActivity?
+    /// When the turn tiny is showing as running started (turn_started's timestamp), until a poll fills activity
+    private var runningSince: Date?
+    /// When the last turn ended here. A poll that began before it carries a stale activity and is ignored
+    private var lastTurnEndedAt: Date = .distantPast
     /// Context consumption of the latest turn (input+cache+output tokens). nil = unknown so far
     @Published private(set) var contextTokens: Int?
     /// History is being (re)fetched. events is kept, not cleared, so the UI can show
@@ -37,8 +44,19 @@ final class ChatModel: ObservableObject {
     /// history. Initial .max = nothing is new (no animation)
     @Published private(set) var animateFrom = Int.max
 
-    /// Presents as "running" including right after the send tap (before turn_started arrives)
-    var isBusy: Bool { isRunning || !pendingSends.isEmpty }
+    /// Presents as "running" including right after the send tap (before turn_started arrives) and
+    /// while the CLI runs a turn of its own (activity). Who started the turn makes no difference here
+    var isBusy: Bool { isRunning || !pendingSends.isEmpty || activity != nil }
+
+    /// When the running work began — for the elapsed clock on the Running row. The server's word
+    /// wins; before its first poll, turn_started's own timestamp or the send tap stands in
+    var busySince: Date? {
+        if let iso = activity?.since, let date = EventRow.parseISO(iso) { return date }
+        return runningSince ?? pendingSends.first?.createdAt
+    }
+
+    /// Output produced so far in the running turn (nil = the server does not know yet)
+    var busyOutputTokens: Int? { activity?.outputTokens }
 
     /// Whether it qualifies for the appear effect (rows on screen from the start as history do not)
     func isNewlyArrived(_ eventId: Int) -> Bool { eventId >= animateFrom }
@@ -54,6 +72,7 @@ final class ChatModel: ObservableObject {
         self.isRunning = session.status == .running
         self.isDetached = session.status == .detached
         self.isHeldByCLI = session.isHeldByCLI
+        self.activity = session.activity
     }
 
     /// Two-stage setup: history via REST, live via WS (avoids the drop window
@@ -102,15 +121,28 @@ final class ChatModel: ObservableObject {
         cliLiveTask = Task {
             while !Task.isCancelled {
                 await refreshCliLive()
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                // Tighter while something runs: the elapsed clock ticks locally, but the token count only moves with a poll
+                try? await Task.sleep(nanoseconds: isBusy ? 2_000_000_000 : 4_000_000_000)
             }
         }
     }
 
     func refreshCliLive() async {
+        let startedAt = Date()
         guard let list = try? await backend.sessions(),
               let match = list.first(where: { $0.id == sessionId }) else { return }
         isHeldByCLI = match.isHeldByCLI
+        // A response computed before turn_completed arrived would resurrect the Running row for a
+        // poll interval; only a snapshot taken after the turn ended may say something is running
+        if match.activity == nil || startedAt > lastTurnEndedAt { activity = match.activity }
+    }
+
+    /// The turn ended (from any terminal event): the Running row goes away now, not at the next poll
+    private func turnEnded() {
+        isRunning = false
+        runningSince = nil
+        activity = nil
+        lastTurnEndedAt = Date()
     }
 
     /// Apply one event arriving over WS (also directly callable from tests)
@@ -126,13 +158,15 @@ final class ChatModel: ObservableObject {
             } else if !pendingSends.isEmpty {
                 pendingSends.removeFirst()
             }
-        case .turnStarted: isRunning = true
+        case .turnStarted:
+            isRunning = true
+            runningSince = EventRow.parseISO(ev.createdAt) ?? Date()
         case .turnCompleted(_, _, let ctx):
-            isRunning = false
+            turnEnded()
             pendingSends.removeAll()   // safety net: clear all debris at turn end
             if let ctx { contextTokens = ctx }
         case .turnFailed, .authError:
-            isRunning = false
+            turnEnded()
             pendingSends.removeAll()
         case .permissionRequested(let reqId, let tool, let input):
             pending.append(PendingPermission(id: reqId, sessionId: sessionId, toolName: tool,
@@ -162,7 +196,10 @@ final class ChatModel: ObservableObject {
         for ev in events.reversed() {
             switch ev.event {
             case .turnStarted:
-                if running == nil { running = true }
+                if running == nil {
+                    running = true
+                    runningSince = EventRow.parseISO(ev.createdAt)
+                }
             case .turnCompleted(_, _, let ctx):
                 if running == nil { running = false }
                 if let ctx {
@@ -223,8 +260,17 @@ final class ChatModel: ObservableObject {
         return await deliver(placeholder, prompt: prompt, images: images)
     }
 
+    /// Stop whatever is running — a turn sent from here or one typed into the CLI; the server routes
+    /// it. A failure is shown: a Stop that silently did nothing reads as the app being broken
     func interrupt() async {
-        try? await backend.interrupt(sessionId: sessionId)
+        do {
+            try await backend.interrupt(sessionId: sessionId)
+            errorBanner = nil
+        } catch let e as APIError {
+            errorBanner = "Could not stop: \(e.message)"
+        } catch {
+            errorBanner = "Could not stop: \(error.localizedDescription)"
+        }
     }
 
     func respond(reqId: String, allow: Bool, updatedInput: JSONValue? = nil) async {

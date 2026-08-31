@@ -87,6 +87,16 @@ struct PermissionMode: RawRepresentable, Codable, Hashable {
     }
 }
 
+/// The turn in progress on a session, whichever side started it (a turn sent from the phone, one
+/// typed into the CLI, one another session sent there). Runtime-only on the server: exactly as
+/// fresh as the last poll. Older servers omit the key
+struct SessionActivity: Codable, Hashable {
+    /// When the work started (ISO 8601). nil = the server could not tell
+    var since: String? = nil
+    /// Output tokens the agent has produced so far in this turn. nil = unknown
+    var outputTokens: Int? = nil
+}
+
 struct SessionRecord: Codable, Identifiable, Hashable {
     let id: String
     let agentSessionId: String?
@@ -113,6 +123,13 @@ struct SessionRecord: Codable, Identifiable, Hashable {
     /// Only a definite "live and NOT joinable" locks the composer (and shows the CLI badge / note).
     /// "Cannot tell" must not take the session away, and a joinable session is not the user's concern
     var isHeldByCLI: Bool { cliLive == true && cliJoin != true }
+
+    /// What the server knows is running right now (nil = idle, or an older server)
+    var activity: SessionActivity? = nil
+
+    /// Something is running on this session — a turn tiny runs (status) or one the CLI is running
+    /// on its own (activity). Who started it makes no difference to how it is shown
+    var isBusy: Bool { status == .running || activity != nil }
 
     var displayTitle: String { title ?? (cwd as NSString).lastPathComponent }
 }
@@ -234,6 +251,8 @@ enum TinyEvent: Equatable {
     case userMessage(text: String, imageCount: Int, imageFileIds: [String])
     case turnStarted(agentSessionId: String)
     case assistantText(String)
+    /// The model's progress narration — what Claude Code's terminal shows as a summarized thinking line
+    case assistantThinking(String)
     // kind / summary are display hints attached by the server (ACP ToolKind vocabulary: read / edit /
     // delete / move / search / execute / think / fetch / other, plus a one-line summary). nil on older servers
     case toolStarted(toolName: String, toolUseId: String, input: JSONValue, kind: String?, summary: String?)
@@ -268,6 +287,8 @@ enum TinyEvent: Equatable {
             self = .turnStarted(agentSessionId: str("agentSessionId") ?? "")
         case "assistant_text":
             self = .assistantText(str("text") ?? "")
+        case "assistant_thinking":
+            self = .assistantThinking(str("text") ?? "")
         case "tool_started":
             self = .toolStarted(toolName: str("toolName") ?? "a tool",
                                 toolUseId: str("toolUseId") ?? "",

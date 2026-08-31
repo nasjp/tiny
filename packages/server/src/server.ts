@@ -4,7 +4,7 @@ import { buildAdapters } from "./adapters.js";
 import { ensureDirs, tinyPaths } from "./config.js";
 import { createApp } from "./api.js";
 import { AuthService } from "./auth.js";
-import { readLiveSessionIds } from "./claude-live.js";
+import { readLiveSessions, type LiveSessionEntry } from "./claude-live.js";
 import { readCliMode, readPeerStatus, readPeerToken, readProcessMode, resolvePeerTarget, sendPeerMessage } from "./claude-peer.js";
 import { findTranscript } from "./claude-transcript.js";
 import { FileOutbox } from "./outbox.js";
@@ -46,31 +46,38 @@ export async function startServer(env: Record<string, string | undefined> = proc
   // The session list polls every 4s and asks for every row, so read the registry at most once
   // per window instead of once per session
   const LIVE_TTL_MS = 2000;
-  let liveCache: { at: number; byDir: Map<string, Set<string> | null> } | null = null;
+  let liveCache: { at: number; byDir: Map<string, Map<string, LiveSessionEntry> | null> } | null = null;
 
-  function liveIds(configDir: string): Set<string> | null {
+  function liveEntries(configDir: string): Map<string, LiveSessionEntry> | null {
     const now = Date.now();
     if (!liveCache || now - liveCache.at > LIVE_TTL_MS) liveCache = { at: now, byDir: new Map() };
     const cached = liveCache.byDir.get(configDir);
     if (cached !== undefined) return cached;
-    const ids = readLiveSessionIds(configDir);
-    liveCache.byDir.set(configDir, ids);
-    return ids;
+    const entries = readLiveSessions(configDir);
+    liveCache.byDir.set(configDir, entries);
+    return entries;
   }
+
+  /** The registry's view of the CLI holding a session: undefined = not a Claude session / no config dir */
+  const liveEntriesOf = (s: SessionRecord): Map<string, LiveSessionEntry> | null | undefined => {
+    if (s.agent !== "claude" || !s.agentSessionId) return undefined;
+    try {
+      return liveEntries(profileDir(paths.profilesDir, s.profile));
+    } catch {
+      return undefined; // a profile whose configDir vanished must not break the list
+    }
+  };
 
   // Whether the agent's own CLI still holds a session. SessionManager uses it to refuse a turn that
   // would race the CLI, the API to report cliLive, so BOTH must get the same function
   const isCliLive = (s: SessionRecord): boolean | null => {
-    if (s.agent !== "claude" || !s.agentSessionId) return null;
-    let dir: string;
-    try {
-      dir = profileDir(paths.profilesDir, s.profile);
-    } catch {
-      return null; // a profile whose configDir vanished must not break the list
-    }
-    const ids = liveIds(dir);
-    return ids === null ? null : ids.has(s.agentSessionId);
+    const entries = liveEntriesOf(s);
+    if (entries === undefined || entries === null) return null;
+    return entries.has(s.agentSessionId!);
   };
+  // What that CLI is doing right now. Same registry read (and cache) as isCliLive, so the list's
+  // "Running" and its "CLI" badge can never disagree about whether the process is there
+  const cliState = (s: SessionRecord): LiveSessionEntry | null => liveEntriesOf(s)?.get(s.agentSessionId!) ?? null;
 
   // Live join (Step 2): everything the manager needs to hand a turn to the CLI process itself.
   // claude-peer.ts is the only module that knows how; here it is just wired to the profile's configDir
@@ -113,6 +120,7 @@ export async function startServer(env: Record<string, string | undefined> = proc
     mcpLaunch: makeMcpLaunch({ serverUrl: () => `http://127.0.0.1:${port}` }),
     sessionTokens: auth,
     isCliLive,
+    cliState,
     peer,
   });
 

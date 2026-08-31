@@ -55,10 +55,24 @@ export interface FileRecord {
   createdAt: string;
 }
 
+/**
+ * What a session is doing right now, whichever side started the work — a turn tiny runs, a turn
+ * it handed to the CLI, or a turn the person typed into the CLI themselves. Runtime-only: nothing
+ * here is persisted, so it is exactly as fresh as the last poll
+ */
+export interface SessionActivity {
+  /** When the current work started (ISO 8601). null when nothing says */
+  since: string | null;
+  /** Output tokens the agent has produced so far in this turn. null when unknown */
+  outputTokens: number | null;
+}
+
 /** What the API returns for a session: the record plus runtime-only fields */
 export interface SessionResponse extends SessionRecord {
   /** true = the agent's own CLI still has this session open. null = could not tell */
   cliLive: boolean | null;
   /** true = a turn sent now runs inside that CLI (live join) instead of being refused with 409 */
   cliJoin: boolean;
+  /** The turn in progress (from either side), or null when the session is idle */
+  activity: SessionActivity | null;
 }

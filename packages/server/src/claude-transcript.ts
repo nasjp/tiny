@@ -19,6 +19,19 @@ export interface TranscriptRead {
    * to learn the CLI accepted the message
    */
   peerMsgIds: string[];
+  /** The newest turn's progress, or null when the transcript holds no turn yet */
+  turn: TranscriptTurn | null;
+}
+
+/**
+ * Progress of the newest turn in a transcript — what Claude Code's own status line shows as
+ * "(5m 58s · ↓ 16.4k tokens)". Computed over the whole file, independent of the import cursor.
+ */
+export interface TranscriptTurn {
+  /** Timestamp of the record that started the turn (ISO 8601), null when it carries none */
+  startedAt: string | null;
+  /** Output tokens across the API responses since then, each response counted once */
+  outputTokens: number;
 }
 
 /** Claude Code encodes the cwd by replacing "/" and "." with "-" */
@@ -212,6 +225,56 @@ function startsHumanTurn(r: Record<string, unknown>): boolean {
 }
 
 /**
+ * A user record that starts a turn of the agent: something the person typed (a message or a slash
+ * command), or a message another process injected through the messaging socket (tiny's own live
+ * turns, other Claude sessions). Bash blocks, harness notices and the isMeta bookkeeping Claude Code
+ * writes mid-turn (caveats, skill bodies) do not start one — counting those would cut a turn's
+ * token total in half at the first `<task-notification>`
+ */
+function startsTurn(r: Record<string, unknown>): boolean {
+  if (r.type !== "user") return false;
+  const text = textOf((r.message as Record<string, unknown> | undefined)?.content);
+  if (text === null) return false;
+  if (r.isMeta === true) {
+    const origin = r.origin as { kind?: unknown } | undefined;
+    return origin?.kind === "peer";
+  }
+  const kind = classifyUserText(text).kind;
+  return kind === "human" || kind === "command" || kind === "peer";
+}
+
+/**
+ * Progress of the newest turn: the timestamp of the record that started it and the output tokens
+ * written since. Claude Code repeats one API response's `usage` on every record of that response
+ * (a thinking, a text and a tool_use record all carry output_tokens: 363), so responses are
+ * counted once by message id
+ */
+export function newestTurn(messages: Array<Record<string, unknown>>): TranscriptTurn | null {
+  let start = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (startsTurn(messages[i]!)) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  const first = messages[start]!;
+  const byResponse = new Map<string, number>();
+  let anonymous = 0;
+  for (const r of messages.slice(start + 1)) {
+    if (r.type !== "assistant") continue;
+    const message = r.message as { id?: unknown; usage?: { output_tokens?: unknown } } | undefined;
+    const out = message?.usage?.output_tokens;
+    if (typeof out !== "number" || !Number.isFinite(out)) continue;
+    const key = typeof message?.id === "string" ? message.id : `#${anonymous++}`;
+    byResponse.set(key, Math.max(byResponse.get(key) ?? 0, out));
+  }
+  let outputTokens = 0;
+  for (const n of byResponse.values()) outputTokens += n;
+  return { startedAt: typeof first.timestamp === "string" ? first.timestamp : null, outputTokens };
+}
+
+/**
  * The newest `turns` human turns, capped at `maxRecords` (newest kept). The record that starts the
  * oldest kept turn is included: cutting after it would strand a tool_finished whose tool_started
  * never made it in. Slicing by record count instead would fill a first import with nothing but tool
@@ -245,7 +308,7 @@ export function readTranscript(
   opts: { sinceUuid?: string | null; turns?: number; maxRecords?: number } = {},
 ): TranscriptRead {
   const records = parseRecords(file);
-  if (records === null) return { events: [], title: null, cursor: null, peerMsgIds: [] };
+  if (records === null) return { events: [], title: null, cursor: null, peerMsgIds: [], turn: null };
 
   let title: string | null = null;
   for (const r of records) {
@@ -332,6 +395,13 @@ export function readTranscript(
       continue;
     }
     for (const b of blocks(message.content)) {
+      // What Claude Code's terminal shows as the model's progress narration ("· summarized"). Fable 5
+      // records ordinary thinking with an empty body and only these narration blocks with text, so
+      // "non-empty" is the whole distinction; older models put their full reasoning here, and that
+      // is shown too, as the terminal does
+      if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim() !== "") {
+        events.push({ type: "assistant_thinking", payload: { text: b.thinking } });
+      }
       if (b.type === "text" && typeof b.text === "string" && b.text !== "") {
         events.push({ type: "assistant_text", payload: { text: b.text } });
       }
@@ -357,5 +427,5 @@ export function readTranscript(
     title = t ? t.slice(0, 60) : null;
   }
 
-  return { events, title, cursor: cursorOf(messages), peerMsgIds };
+  return { events, title, cursor: cursorOf(messages), peerMsgIds, turn: newestTurn(messages) };
 }

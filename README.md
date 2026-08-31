@@ -122,6 +122,11 @@ if nothing were different. tinyd hands your message to the running Claude Code p
 and the reply reaches both places. Stop works too (the terminal abandons the turn). Attached
 photos are saved under `~/.tiny/outbox` and referenced by path.
 
+The same goes for turns you start in the terminal yourself. The phone shows them as running —
+with the elapsed time and the output so far, the way Claude Code's own status line does — along
+with the model's progress notes and the tools it ran, and Stop works on them just the same. Who
+started a turn makes no difference to what you can do with it.
+
 One thing stays in the terminal's hands: permission prompts. While Claude Code waits for an
 answer there, the phone shows "Waiting in the terminal". Closing the terminal hands the session
 back to tinyd for the next message.
