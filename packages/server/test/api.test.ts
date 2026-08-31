@@ -51,8 +51,11 @@ describe("REST API", () => {
     cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-api-cwd-"));
     stores = createStores(openDb(":memory:"));
     outbox = new FileOutbox(fs.mkdtempSync(path.join(os.tmpdir(), "tiny-api-ob-")), stores.files);
+    // Same resolver for the manager and for createApp, exactly as startServer() wires it
+    const isCliLive = () => cliLive;
     manager = new SessionManager({
       stores, profilesDir, adapters: { claude: okAdapter }, broker: new PermissionBroker(1000), outbox,
+      isCliLive,
     });
     auth = new AuthService(stores, path.join(home, "secret"));
     token = auth.cliToken();
@@ -66,7 +69,7 @@ describe("REST API", () => {
     app = createApp({
       manager, auth, outbox, profilesDir, stores,
       serverUrl: () => "http://mac:7777", push, usage,
-      isCliLive: () => cliLive,
+      isCliLive,
     });
   });
 
@@ -566,6 +569,28 @@ describe("REST API", () => {
     });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ discarded: true });
+  });
+
+  // The guard lives in SessionManager, so it only works if the daemon hands the SAME resolver to
+  // the manager and to createApp. Exercised over HTTP because that is the path that regressed
+  it("refuses a turn while the agent's own CLI holds the session, and allows it otherwise", async () => {
+    const created = await app.request("/v1/sessions", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }),
+    });
+    const { id } = (await created.json()) as { id: string };
+
+    cliLive = true;
+    const blocked = await app.request(`/v1/sessions/${id}/turns`, {
+      method: "POST", headers: H(), body: JSON.stringify({ prompt: "hi" }),
+    });
+    expect(blocked.status).toBe(409);
+
+    cliLive = null;
+    const ok = await app.request(`/v1/sessions/${id}/turns`, {
+      method: "POST", headers: H(), body: JSON.stringify({ prompt: "hi" }),
+    });
+    expect(ok.status).toBe(202);
+    await manager.waitForIdle(id);
   });
 
   it("reports cliLive on the list and on a single session", async () => {

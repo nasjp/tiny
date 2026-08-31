@@ -14,6 +14,7 @@ import { SessionManager } from "./session-manager.js";
 import { loadSettings } from "./settings.js";
 import { makeMcpLaunch } from "./mcp-launch.js";
 import { createStores } from "./stores.js";
+import type { SessionRecord } from "./types.js";
 import { UsageService } from "./usage.js";
 import { registerWs } from "./ws.js";
 import os from "node:os";
@@ -39,6 +40,35 @@ export async function startServer(env: Record<string, string | undefined> = proc
   const outbox = new FileOutbox(paths.outboxDir, stores.files);
   const auth = new AuthService(stores, paths.secretFile);
   auth.cliToken(); // generate it on first startup
+  // The session list polls every 4s and asks for every row, so read the registry at most once
+  // per window instead of once per session
+  const LIVE_TTL_MS = 2000;
+  let liveCache: { at: number; byDir: Map<string, Set<string> | null> } | null = null;
+
+  function liveIds(configDir: string): Set<string> | null {
+    const now = Date.now();
+    if (!liveCache || now - liveCache.at > LIVE_TTL_MS) liveCache = { at: now, byDir: new Map() };
+    const cached = liveCache.byDir.get(configDir);
+    if (cached !== undefined) return cached;
+    const ids = readLiveSessionIds(configDir);
+    liveCache.byDir.set(configDir, ids);
+    return ids;
+  }
+
+  // Whether the agent's own CLI still holds a session. SessionManager uses it to refuse a turn that
+  // would race the CLI, the API to report cliLive, so BOTH must get the same function
+  const isCliLive = (s: SessionRecord): boolean | null => {
+    if (s.agent !== "claude" || !s.agentSessionId) return null;
+    let dir: string;
+    try {
+      dir = profileDir(paths.profilesDir, s.profile);
+    } catch {
+      return null; // a profile whose configDir vanished must not break the list
+    }
+    const ids = liveIds(dir);
+    return ids === null ? null : ids.has(s.agentSessionId);
+  };
+
   let port = paths.port;
   const manager = new SessionManager({
     stores,
@@ -49,6 +79,7 @@ export async function startServer(env: Record<string, string | undefined> = proc
     // The `tiny mcp-server` spawned by the agent calls tinyd on the same Mac over loopback (port is finalized after listen)
     mcpLaunch: makeMcpLaunch({ serverUrl: () => `http://127.0.0.1:${port}` }),
     sessionTokens: auth,
+    isCliLive,
   });
 
   // Settings are reloaded on every delivery, so `tiny push config` changes take effect without a restart.
@@ -69,34 +100,8 @@ export async function startServer(env: Record<string, string | undefined> = proc
   };
   const usage = new UsageService(paths.profilesDir);
 
-  // The session list polls every 4s and asks for every row, so read the registry at most once
-  // per window instead of once per session
-  const LIVE_TTL_MS = 2000;
-  let liveCache: { at: number; byDir: Map<string, Set<string> | null> } | null = null;
-
-  function liveIds(configDir: string): Set<string> | null {
-    const now = Date.now();
-    if (!liveCache || now - liveCache.at > LIVE_TTL_MS) liveCache = { at: now, byDir: new Map() };
-    const cached = liveCache.byDir.get(configDir);
-    if (cached !== undefined) return cached;
-    const ids = readLiveSessionIds(configDir);
-    liveCache.byDir.set(configDir, ids);
-    return ids;
-  }
-
   const app = createApp({
-    manager, auth, outbox, profilesDir: paths.profilesDir, stores, serverUrl, push, usage,
-    isCliLive: (s) => {
-      if (s.agent !== "claude" || !s.agentSessionId) return null;
-      let dir: string;
-      try {
-        dir = profileDir(paths.profilesDir, s.profile);
-      } catch {
-        return null; // a profile whose configDir vanished must not break the list
-      }
-      const ids = liveIds(dir);
-      return ids === null ? null : ids.has(s.agentSessionId);
-    },
+    manager, auth, outbox, profilesDir: paths.profilesDir, stores, serverUrl, push, usage, isCliLive,
   });
   const { injectWebSocket } = registerWs(app, { manager, auth, stores });
 
