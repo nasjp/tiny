@@ -992,6 +992,100 @@ describe("SessionManager", () => {
       expect(seen.filter((e) => e.type === "user_message")).toHaveLength(1);
     });
 
+    it("keeps delivery/response evidence even when a concurrent syncTranscript call consumes the transcript delta first", async () => {
+      // Simulates GET /v1/sessions/:id/events (polled whenever the phone has the chat open) reading
+      // the delta before the watcher's own tick gets to it
+      const { peer, sent, setStatus } = fakePeer();
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-race");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      setStatus({ status: "busy", waitingFor: null });
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId), assistantRecord("hi phone")]));
+      manager.syncTranscript(session.id); // steals the delta before the watcher's own poll tick
+      setStatus({ status: "idle", waitingFor: null });
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)!.type).toBe("turn_completed");
+      expect(seen.filter((e) => e.type === "assistant_text")).toHaveLength(1);
+    });
+
+    it("does not latch a response already in the transcript from before our message landed (backfill of an earlier turn)", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-preturn");
+      fs.writeFileSync(file, jsonl([assistantRecord("earlier reply")])); // a prior turn already sits in the transcript
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      // let the watcher's own first tick backfill the earlier turn on its own, before our message lands
+      await until(() => seen.some((e) => e.type === "assistant_text"));
+      setStatus({ status: "busy", waitingFor: null });
+      fs.appendFileSync(file, jsonl([peerRecord(sent[0]!.msgId)])); // delivered, no reply yet
+      setStatus({ status: "idle", waitingFor: null });
+      await new Promise((r) => setTimeout(r, FAST_LIVE.pollMs * 5));
+      expect(seen.some((e) => e.type === "turn_completed")).toBe(false);
+      fs.appendFileSync(file, jsonl([assistantRecord("hi phone")]));
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)!.type).toBe("turn_completed");
+    });
+
+    it("does not latch a response from the CLI's own concurrent turn before our message landed", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      setStatus({ status: "busy", waitingFor: null }); // the CLI is mid-way through its own, unrelated turn
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-concurrent");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      fs.writeFileSync(file, jsonl([assistantRecord("cli's own reply")])); // not ours — our msg_id is not in it
+      await until(() => seen.some((e) => e.type === "assistant_text")); // imported while still busy, undelivered
+      // only the peer record lands now (no fresh reply of ours), and the CLI goes idle
+      fs.appendFileSync(file, jsonl([peerRecord(sent[0]!.msgId)]));
+      setStatus({ status: "idle", waitingFor: null });
+      await new Promise((r) => setTimeout(r, FAST_LIVE.pollMs * 5));
+      expect(seen.some((e) => e.type === "turn_completed")).toBe(false);
+      fs.appendFileSync(file, jsonl([assistantRecord("hi phone")]));
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)!.type).toBe("turn_completed");
+    });
+
+    it("completes normally, not as interrupted, when the CLI answered before ever taking the stop message", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-stop-after-answer");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      setStatus({ status: "busy", waitingFor: null });
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId), assistantRecord("done already")]));
+      await until(() => seen.some((e) => e.type === "assistant_text"));
+      manager.interrupt(session.id);
+      await until(() => sent.length === 2);
+      // the CLI finished the original turn and goes idle before ever taking the stop message
+      setStatus({ status: "idle", waitingFor: null });
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)!.type).toBe("turn_completed");
+    });
+
+    it("ends the turn with turn_failed, without an unhandled rejection, when the session row disappears mid-turn", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session } = liveSession(manager, home, "agent-deleted");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      setStatus({ status: "busy", waitingFor: null });
+      stores.sessions.delete(session.id); // the next poll tick's getSession() now throws NotFoundError
+      await manager.waitForIdle(session.id); // must resolve, not reject
+      expect(seen.find((e) => e.type === "turn_failed")).toBeDefined();
+    });
+
     it("puts attached images on disk and tells the CLI where they are", async () => {
       const { peer, sent } = fakePeer();
       const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
