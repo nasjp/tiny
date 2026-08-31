@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { readAcpChoices } from "../acp-choices.js";
 import type { AgentDriver } from "./index.js";
 
 // OpenCode (`opencode acp`, bundled in the binary). Measured (HANDOFF "OpenCode ACP measurements"):
@@ -54,10 +55,12 @@ export const opencodeDriver: AgentDriver = {
   isLoggedIn: opencodeLoggedIn,
   login: () => ({ bin: "opencode", args: ["auth", "login"] }),
   attach: (s) => ({ bin: "opencode", args: ["--session", s.agentSessionId] }),
-  capabilities: () => ({
-    // Models / efforts: ACP configOptions is the source of truth (100+ entries, provider-dependent). Mirroring is future work. Empty = the app shows no choices
-    models: [],
-    efforts: [],
+  capabilities: (profileDir) => ({
+    // Models / efforts: mirrored from the ACP configOptions the agent last reported (cached at
+    // <profileDir>/acp-choices.json by the adapter on every session/new|resume and seeded by
+    // `tiny profiles login`). Empty until first contact = the app shows no choices
+    models: readAcpChoices(profileDir)?.models ?? [],
+    efforts: readAcpChoices(profileDir)?.efforts ?? [],
     permissionModes: [
       { id: "ask", label: "Ask first" },
       { id: "auto", label: "Auto-approve" },

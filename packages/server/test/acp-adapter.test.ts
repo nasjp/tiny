@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { AcpAdapter } from "../src/acp-adapter.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { AcpAdapter, fetchAcpChoices } from "../src/acp-adapter.js";
+import { readAcpChoices } from "../src/acp-choices.js";
 import type { RunTurnParams, TurnEventInput } from "../src/adapter.js";
 import type { AgentDriver } from "../src/agents/index.js";
 import { assertTurnEventInvariants } from "./adapter-contract.js";
@@ -454,5 +458,58 @@ describe("AcpAdapter thought narration", () => {
     expect(events[2]!.payload).toEqual({ text: "Then a note." });
     expect(result.resultText).toBe("First.\nSecond.");
     assertTurnEventInvariants(events);
+  });
+});
+
+describe("AcpAdapter choices mirror", () => {
+  const CONFIG_OPTIONS = [
+    {
+      id: "model", name: "Model", category: "model", type: "select", currentValue: "opencode/claude-haiku-4-5",
+      options: [
+        { value: "opencode/claude-haiku-4-5", name: "Claude Haiku 4.5" },
+        { value: "google-vertex/claude-fable-5@default", name: "Vertex/Claude Fable 5" },
+      ],
+    },
+    { id: "effort", category: "thought_level", type: "select", options: [{ value: "high", name: "High" }, { value: "max", name: "Max" }] },
+    { id: "mode", category: "mode", type: "select", options: [{ value: "build" }, { value: "plan" }] },
+  ];
+
+  it("harvests session/new configOptions into the profile's choices cache during a turn", async () => {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-acp-prof-"));
+    const fake = fakeAcpAgent({
+      newSession: { configOptions: CONFIG_OPTIONS },
+      onPrompt: async (ctx) => {
+        upd(ctx, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } });
+        return { stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+      },
+    });
+    const { p } = baseParams({ profileDir });
+    await new AcpAdapter(driver, { spawn: fake.spawn }).runTurn(p);
+    expect(readAcpChoices(profileDir)).toMatchObject({
+      models: [
+        { id: "opencode/claude-haiku-4-5", label: "Claude Haiku 4.5" },
+        { id: "google-vertex/claude-fable-5@default", label: "Vertex/Claude Fable 5" },
+      ],
+      efforts: ["high", "max"],
+    });
+  });
+
+  it("fetchAcpChoices seeds the cache without running a turn, authenticating when required", async () => {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-acp-prof-"));
+    const fake = fakeAcpAgent({ newSession: { configOptions: CONFIG_OPTIONS }, requireAuthUntilAuthenticated: true, onPrompt: async () => { throw new Error("fetch must not prompt"); } });
+    const c = await fetchAcpChoices(driver, profileDir, { spawn: fake.spawn, cwd: "/tmp" });
+    expect(c?.models).toHaveLength(2);
+    expect(c?.efforts).toEqual(["high", "max"]);
+    expect(readAcpChoices(profileDir)?.models).toHaveLength(2);
+    const methods = fake.received.map((r) => r.method);
+    expect(methods).toContain("authenticate");
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("fetchAcpChoices returns null instead of throwing when the agent will not talk", async () => {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-acp-prof-"));
+    const fake = fakeAcpAgent({ requireAuthUntilAuthenticated: true, initialize: { protocolVersion: 1, agentCapabilities: {}, authMethods: [] }, onPrompt: async () => { throw new Error("fetch must not prompt"); } });
+    expect(await fetchAcpChoices(driver, profileDir, { spawn: fake.spawn, cwd: "/tmp" })).toBeNull();
+    expect(readAcpChoices(profileDir)).toBeNull();
   });
 });

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { agentEnv, getDriver, listDrivers } from "../src/agents/index.js";
+import { writeAcpChoices } from "../src/acp-choices.js";
 import { writeTinyMcpServer } from "../src/agents/codex.js";
 import { cursorLoggedIn } from "../src/agents/cursor.js";
 import { claudeLoggedIn, readClaudeOauthAccount } from "../src/agents/claude.js";
@@ -427,5 +428,17 @@ describe("claude default config dir", () => {
       const env = agentEnv(getDriver("claude"), "/srv/profiles/work", { PATH: "/usr/bin" });
       expect(env.CLAUDE_CONFIG_DIR).toBe("/srv/profiles/work");
     });
+  });
+});
+
+describe("ACP drivers mirror cached choices", () => {
+  it.each(["opencode", "cursor"])("%s capabilities serve the cached models / efforts when present", (id) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-agents-choices-"));
+    writeAcpChoices(dir, { models: [{ id: "opencode/claude-haiku-4-5", label: "Claude Haiku 4.5" }], efforts: ["high", "max"] });
+    const caps = getDriver(id).capabilities(dir);
+    expect(caps.models).toEqual([{ id: "opencode/claude-haiku-4-5", label: "Claude Haiku 4.5" }]);
+    expect(caps.efforts).toEqual(["high", "max"]);
+    // the rest of the catalog is untouched by the mirror
+    expect(caps.permissionModes.map((m) => m.id)).toEqual(["ask", "auto"]);
   });
 });
