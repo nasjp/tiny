@@ -11,7 +11,7 @@ import type { PushClient } from "./push-client.js";
 import { ConflictError, NotFoundError, SessionManager, ValidationError } from "./session-manager.js";
 import { TINY_VERSION } from "./version.js";
 import type { Stores } from "./stores.js";
-import type { SessionStatus } from "./types.js";
+import type { SessionRecord, SessionResponse, SessionStatus } from "./types.js";
 import type { UsageService } from "./usage.js";
 import { isOnPath } from "./which.js";
 
@@ -24,6 +24,8 @@ export interface ApiDeps {
   serverUrl: () => string;
   push: PushClient;
   usage: UsageService;
+  /** Whether the agent's own CLI still holds a session. null = cannot tell */
+  isCliLive: (s: SessionRecord) => boolean | null;
 }
 
 // The set of valid permissionMode / effort values is per-agent (driver capabilities),
@@ -56,6 +58,16 @@ const turnSchema = z.object({
     .optional(),
 });
 const detachSchema = z.object({ detached: z.boolean() });
+const adoptSessionSchema = z.object({
+  agent: z.string().min(1).max(50).optional(),
+  profile: z.string(),
+  cwd: z.string(),
+  agentSessionId: z.string().min(1).max(200),
+  permissionMode: z.string().min(1).max(50).optional(),
+  model: z.string().min(1).max(100).optional(),
+  effort: z.string().min(1).max(50).optional(),
+});
+const discardEmptySchema = z.object({ agentSessionId: z.string().min(1).max(200) });
 // `tiny mcp-server` → tinyd. Absolute paths only (the MCP server's cwd differs from the agent's)
 const userFileSchema = z.object({
   path: z.string().min(1),
@@ -83,6 +95,8 @@ type HonoContext = Context<AppEnv>;
 
 export function createApp(deps: ApiDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
+
+  const withLive = (s: SessionRecord): SessionResponse => ({ ...s, cliLive: deps.isCliLive(s) });
 
   app.onError((err, c) => {
     if (err instanceof NotFoundError) return c.json({ error: err.message }, 404);
@@ -149,7 +163,7 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
   app.get("/v1/sessions", (c) => {
     const status = c.req.query("status") as SessionStatus | undefined;
     const archived = c.req.query("archived") === "true";
-    return c.json({ sessions: deps.manager.listSessions(status, archived) });
+    return c.json({ sessions: deps.manager.listSessions(status, archived).map(withLive) });
   });
 
   // Working-directory candidates for New Session (includes cwds of archived sessions; only ones that still exist)
@@ -160,12 +174,30 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
     return c.json(deps.manager.createSession(body), 201);
   });
 
-  app.get("/v1/sessions/:id", (c) => c.json(deps.manager.getSession(c.req.param("id"))));
+  // `tiny handoff`: register a session started in the agent's own CLI. Idempotent (SessionStart
+  // hooks fire again on resume / fork / clear), so an existing session comes back as 200
+  app.post("/v1/sessions/adopt", async (c) => {
+    const body = adoptSessionSchema.parse(await c.req.json());
+    const { session, adopted } = deps.manager.adoptSession(body);
+    return c.json(withLive(session), adopted ? 201 : 200);
+  });
+
+  // SessionEnd path: drop a handoff session that never got a single event
+  app.post("/v1/sessions/discard-empty", async (c) => {
+    const body = discardEmptySchema.parse(await c.req.json());
+    return c.json({ discarded: deps.manager.discardIfEmpty(body.agentSessionId) });
+  });
+
+  app.get("/v1/sessions/:id", (c) => c.json(withLive(deps.manager.getSession(c.req.param("id")))));
 
   app.get("/v1/sessions/:id/events", (c) => {
-    deps.manager.getSession(c.req.param("id"));
-    const since = Number(c.req.query("since") ?? "0");
-    return c.json({ events: deps.stores.events.listSince(c.req.param("id"), since) });
+    const id = c.req.param("id");
+    const since = Number(c.req.query("since") ?? 0);
+    // Catch up with what the agent's own CLI wrote. Only while the CLI holds the session, and
+    // never from the list endpoint (that polls every 4s across every session)
+    const s = deps.manager.getSession(id);
+    if (deps.isCliLive(s) === true) deps.manager.syncTranscript(id);
+    return c.json({ events: deps.stores.events.listSince(id, Number.isFinite(since) ? since : 0) });
   });
 
   app.patch("/v1/sessions/:id", async (c) => {

@@ -4,9 +4,11 @@ import { buildAdapters } from "./adapters.js";
 import { ensureDirs, tinyPaths } from "./config.js";
 import { createApp } from "./api.js";
 import { AuthService } from "./auth.js";
+import { readLiveSessionIds } from "./claude-live.js";
 import { FileOutbox } from "./outbox.js";
 import { openDb } from "./db.js";
 import { PermissionBroker } from "./permission-broker.js";
+import { profileDir } from "./profiles.js";
 import { PushClient } from "./push-client.js";
 import { SessionManager } from "./session-manager.js";
 import { loadSettings } from "./settings.js";
@@ -66,7 +68,36 @@ export async function startServer(env: Record<string, string | undefined> = proc
     return configured !== "" ? configured : `http://${os.hostname()}:${port}`;
   };
   const usage = new UsageService(paths.profilesDir);
-  const app = createApp({ manager, auth, outbox, profilesDir: paths.profilesDir, stores, serverUrl, push, usage });
+
+  // The session list polls every 4s and asks for every row, so read the registry at most once
+  // per window instead of once per session
+  const LIVE_TTL_MS = 2000;
+  let liveCache: { at: number; byDir: Map<string, Set<string> | null> } | null = null;
+
+  function liveIds(configDir: string): Set<string> | null {
+    const now = Date.now();
+    if (!liveCache || now - liveCache.at > LIVE_TTL_MS) liveCache = { at: now, byDir: new Map() };
+    const cached = liveCache.byDir.get(configDir);
+    if (cached !== undefined) return cached;
+    const ids = readLiveSessionIds(configDir);
+    liveCache.byDir.set(configDir, ids);
+    return ids;
+  }
+
+  const app = createApp({
+    manager, auth, outbox, profilesDir: paths.profilesDir, stores, serverUrl, push, usage,
+    isCliLive: (s) => {
+      if (s.agent !== "claude" || !s.agentSessionId) return null;
+      let dir: string;
+      try {
+        dir = profileDir(paths.profilesDir, s.profile);
+      } catch {
+        return null; // a profile whose configDir vanished must not break the list
+      }
+      const ids = liveIds(dir);
+      return ids === null ? null : ids.has(s.agentSessionId);
+    },
+  });
   const { injectWebSocket } = registerWs(app, { manager, auth, stores });
 
   const server = await new Promise<ReturnType<typeof serve>>((resolve) => {

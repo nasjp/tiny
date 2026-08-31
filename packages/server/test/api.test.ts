@@ -40,10 +40,13 @@ describe("REST API", () => {
   let cwd: string;
   let usage: UsageService;
   let auth: AuthService;
+  let profilesDir: string;
+  let cliLive: boolean | null = null;
 
   beforeEach(() => {
+    cliLive = null;
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-api-"));
-    const profilesDir = path.join(home, "profiles");
+    profilesDir = path.join(home, "profiles");
     addProfile(profilesDir, "work");
     cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-api-cwd-"));
     stores = createStores(openDb(":memory:"));
@@ -60,7 +63,11 @@ describe("REST API", () => {
         new Response(JSON.stringify({ ok: true, status: 200, apnsId: "ID" }), { status: 200 })) as unknown as typeof fetch,
     });
     usage = new UsageService(profilesDir, { fetcher: async () => usageFixture, isLoggedIn: () => true });
-    app = createApp({ manager, auth, outbox, profilesDir, stores, serverUrl: () => "http://mac:7777", push, usage });
+    app = createApp({
+      manager, auth, outbox, profilesDir, stores,
+      serverUrl: () => "http://mac:7777", push, usage,
+      isCliLive: () => cliLive,
+    });
   });
 
   const H = () => ({ Authorization: `Bearer ${token}`, "Content-Type": "application/json" });
@@ -524,5 +531,52 @@ describe("REST API", () => {
       const D = { Authorization: `Bearer ${devTok}`, "Content-Type": "application/json" };
       expect((await app.request(`/v1/sessions/${s.id}/files`, { method: "POST", headers: D, body: JSON.stringify({ path: file }) })).status).toBe(403);
     });
+  });
+
+  it("adopts a CLI session and returns it, idempotently", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(profilesDir, "local", "claude", configDir);
+    const body = JSON.stringify({ profile: "local", cwd, agentSessionId: "agent-42" });
+    const first = await app.request("/v1/sessions/adopt", { method: "POST", headers: H(), body });
+    expect(first.status).toBe(201);
+    const s1 = (await first.json()) as { id: string; agentSessionId: string };
+    expect(s1.agentSessionId).toBe("agent-42");
+
+    const second = await app.request("/v1/sessions/adopt", { method: "POST", headers: H(), body });
+    expect(second.status).toBe(200);
+    expect(((await second.json()) as { id: string }).id).toBe(s1.id);
+  });
+
+  it("rejects adopt without agentSessionId", async () => {
+    const res = await app.request("/v1/sessions/adopt", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("discards an adopted session that has no events", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(profilesDir, "local2", "claude", configDir);
+    await app.request("/v1/sessions/adopt", {
+      method: "POST", headers: H(),
+      body: JSON.stringify({ profile: "local2", cwd, agentSessionId: "agent-empty" }),
+    });
+    const res = await app.request("/v1/sessions/discard-empty", {
+      method: "POST", headers: H(), body: JSON.stringify({ agentSessionId: "agent-empty" }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ discarded: true });
+  });
+
+  it("reports cliLive on the list and on a single session", async () => {
+    await app.request("/v1/sessions", { method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }) });
+    const res0 = await app.request("/v1/sessions", { headers: H() });
+    const { sessions } = (await res0.json()) as { sessions: Array<{ id: string; cliLive: boolean | null }> };
+    expect(sessions[0]!.cliLive).toBeNull();
+
+    cliLive = true;
+    const res1 = await app.request(`/v1/sessions/${sessions[0]!.id}`, { headers: H() });
+    expect(((await res1.json()) as { cliLive: boolean | null }).cliLive).toBe(true);
+    cliLive = null;
   });
 });
