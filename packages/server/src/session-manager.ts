@@ -45,6 +45,11 @@ export interface SessionManagerDeps {
   mcpLaunch?: (sessionId: string, token: string) => McpLaunch;
   /** Per-turn session token issuer. Without it, no MCP is attached to the adapter even if mcpLaunch exists (never falls back to the CLI token) */
   sessionTokens?: SessionTokenIssuer;
+  /**
+   * Whether the agent's own CLI still has this session open. null = cannot tell.
+   * Injected so tests do not depend on a real registry. Absent = never blocks.
+   */
+  isCliLive?: (s: SessionRecord) => boolean | null;
 }
 
 interface RunningTurn {
@@ -248,6 +253,9 @@ export class SessionManager extends EventEmitter {
     const s = this.getSession(id);
     if (s.status === "running") throw new ConflictError("turn already running");
     if (s.status === "detached") throw new ConflictError("session is attached from CLI");
+    // Step 1 has no live-join yet: a turn sent while the CLI holds the session would run in a
+    // separate process and the CLI can overwrite the transcript leaf on exit, stranding it
+    if (this.deps.isCliLive?.(s) === true) throw new ConflictError("session is open in the CLI");
     const abort = new AbortController();
     this.deps.stores.sessions.patch(id, { status: "running", title: s.title ?? prompt.slice(0, 60) });
     // Persist the user's message as an event too. Without this, the client's history view

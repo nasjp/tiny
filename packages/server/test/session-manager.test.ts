@@ -262,6 +262,50 @@ describe("SessionManager", () => {
     expect(manager.getSession(s.id).status).toBe("idle");
   });
 
+  it("refuses a turn while the agent's own CLI has the session open", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    addProfile(profilesDir, "work");
+    const stores = createStores(openDb(":memory:"));
+    let live: boolean | null = true;
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: okAdapter },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+      isCliLive: () => live,
+    });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const s = manager.createSession({ profile: "work", cwd });
+
+    expect(() => manager.startTurn(s.id, "hi")).toThrow(ConflictError);
+
+    // once the CLI is gone, sending works again
+    live = false;
+    expect(() => manager.startTurn(s.id, "hi")).not.toThrow();
+    await manager.waitForIdle(s.id);
+  });
+
+  it("allows a turn when liveness cannot be determined", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    addProfile(profilesDir, "work");
+    const stores = createStores(openDb(":memory:"));
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: okAdapter },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+      isCliLive: () => null,
+    });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const s = manager.createSession({ profile: "work", cwd });
+    expect(() => manager.startTurn(s.id, "hi")).not.toThrow();
+    await manager.waitForIdle(s.id);
+  });
+
   it("emits turn_failed and returns to idle when the adapter throws", async () => {
     const failing: AgentAdapter = {
       async runTurn() {
