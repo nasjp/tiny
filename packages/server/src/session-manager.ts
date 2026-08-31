@@ -5,7 +5,7 @@ import type { AgentAdapter, TurnImage } from "./adapter.js";
 import type { McpLaunch } from "./mcp-launch.js";
 import type { FileOutbox } from "./outbox.js";
 import { profileDir, profileDriver } from "./profiles.js";
-import { findTranscript, readTranscript } from "./claude-transcript.js";
+import { findTranscript, readTranscript, readTranscriptCursor } from "./claude-transcript.js";
 import type { AgentCapabilities, AgentDriver } from "./agents/index.js";
 import type { PendingPermission, PermissionBroker, PermissionDecision } from "./permission-broker.js";
 import type { SessionPatch, Stores } from "./stores.js";
@@ -145,7 +145,7 @@ export class SessionManager extends EventEmitter {
     const { driver, caps } = this.resolveProfile(input);
     const existing = this.deps.stores.sessions.byAgentSessionId(input.agentSessionId);
     if (existing) {
-      this.syncTranscript(existing.id);
+      this.importOrSeed(existing.id);
       return { session: this.getSession(existing.id), adopted: false };
     }
     const now = new Date().toISOString();
@@ -166,8 +166,48 @@ export class SessionManager extends EventEmitter {
       updatedAt: now,
     };
     this.deps.stores.sessions.create(rec);
-    this.syncTranscript(rec.id);
+    this.importOrSeed(rec.id);
     return { session: this.getSession(rec.id), adopted: true };
+  }
+
+  /**
+   * Import the CLI's transcript into a session — unless it already carries events but has no
+   * cursor. Tiny and the CLI append to the SAME file, so importing there would replay turns tiny
+   * already emitted natively (the phone would show the exchange twice). Seed the cursor instead,
+   * so the import starts at the tail and only what the CLI writes from now on comes in.
+   */
+  private importOrSeed(id: string): void {
+    const s = this.getSession(id);
+    if (s.sourceCursor === null && this.deps.stores.events.count(id) > 0) {
+      this.advanceCursor(s);
+      return;
+    }
+    this.syncTranscript(id);
+  }
+
+  /**
+   * Move the cursor to the transcript's current tail without emitting anything.
+   * Never throws — an unreadable transcript just leaves the cursor where it is.
+   */
+  private advanceCursor(s: SessionRecord): void {
+    try {
+      const file = this.transcriptFile(s);
+      if (!file) return;
+      const cursor = readTranscriptCursor(file);
+      if (cursor && cursor !== s.sourceCursor) this.deps.stores.sessions.patch(s.id, { sourceCursor: cursor });
+    } catch {
+      // same non-throwing contract as syncTranscript: a missing transcript is normal
+    }
+  }
+
+  /** The CLI transcript backing a session, or null when there is none (or the agent keeps no transcripts) */
+  private transcriptFile(s: SessionRecord): string | null {
+    if (!s.agentSessionId || s.agent !== "claude") return null;
+    try {
+      return findTranscript(profileDir(this.deps.profilesDir, s.profile), s.cwd, s.agentSessionId);
+    } catch {
+      return null; // the profile's config dir went away
+    }
   }
 
   /**
@@ -176,13 +216,7 @@ export class SessionManager extends EventEmitter {
    */
   syncTranscript(id: string): number {
     const s = this.getSession(id);
-    if (!s.agentSessionId || s.agent !== "claude") return 0;
-    let file: string | null = null;
-    try {
-      file = findTranscript(profileDir(this.deps.profilesDir, s.profile), s.cwd, s.agentSessionId);
-    } catch {
-      return 0;
-    }
+    const file = this.transcriptFile(s);
     if (!file) return 0;
     const read = readTranscript(file, {
       sinceUuid: s.sourceCursor,
@@ -331,6 +365,10 @@ export class SessionManager extends EventEmitter {
         signal,
       });
       this.deps.stores.sessions.patch(s.id, { status: "idle", agentSessionId: result.agentSessionId });
+      // This turn appended to the same transcript the user's CLI writes, and every one of those
+      // records was already emitted natively above. Skip past them so a later sync cannot replay them
+      const after = this.deps.stores.sessions.get(s.id);
+      if (after?.sourceCursor) this.advanceCursor(after);
     } catch (err) {
       const raw = err instanceof Error ? err.message : String(err);
       // A throw while interrupting means the adapter was still starting up (session/new, load, thread/start, ...).

@@ -166,6 +166,71 @@ describe("SessionManager", () => {
     expect(manager.syncTranscript(session.id)).toBe(0);
   });
 
+  // Tiny and the user's CLI append to the SAME transcript file, so a session that already carries
+  // natively emitted events must not import them back when the CLI hook adopts it again
+  it("seeds the cursor without importing when the session already has events", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const s = manager.createSession({ profile: "local", cwd });
+    stores.sessions.patch(s.id, { agentSessionId: "agent-1" });
+    stores.events.append(s.id, "user_message", { text: "sent from the phone" });
+    expect(stores.sessions.get(s.id)!.sourceCursor).toBeNull();
+
+    // the same exchange, as Claude Code wrote it to the transcript
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-1.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "sent from the phone" } }),
+      JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "on it" }] } }),
+    ].join("\n") + "\n");
+
+    const r = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-1" });
+    expect(r.adopted).toBe(false);
+    expect(r.session.id).toBe(s.id);
+    // nothing re-imported, and the cursor now sits at the tail so later CLI records still arrive
+    expect(stores.events.count(s.id)).toBe(1);
+    expect(r.session.sourceCursor).toBe("a1");
+
+    fs.appendFileSync(file, JSON.stringify({ type: "user", uuid: "u2", message: { role: "user", content: "from the CLI" } }) + "\n");
+    expect(manager.syncTranscript(s.id)).toBe(1);
+  });
+
+  it("advances the cursor past tiny's own turn so the next sync does not replay it", async () => {
+    let onTurn: (() => void) | null = null;
+    const writesTranscript: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        p.emit({ type: "assistant_text", payload: { text: "done" } });
+        onTurn?.();
+        return { agentSessionId: "agent-3", costUsd: null, resultText: "ok" };
+      },
+    };
+    const { manager, stores, home } = makeManager(writesTranscript);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-3.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }) + "\n");
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-3" });
+    expect(session.sourceCursor).toBe("u1");
+
+    // the SDK resumes the same session, so tiny's turn lands in the same file
+    onTurn = () => fs.appendFileSync(file, [
+      JSON.stringify({ type: "user", uuid: "u2", message: { role: "user", content: "from the phone" } }),
+      JSON.stringify({ type: "assistant", uuid: "a2", message: { content: [{ type: "text", text: "done" }] } }),
+    ].join("\n") + "\n");
+    manager.startTurn(session.id, "from the phone");
+    await manager.waitForIdle(session.id);
+
+    const count = stores.events.count(session.id);
+    expect(manager.getSession(session.id).sourceCursor).toBe("a2");
+    expect(manager.syncTranscript(session.id)).toBe(0);
+    expect(stores.events.count(session.id)).toBe(count);
+  });
+
   it("syncTranscript is a no-op for a non-claude agent", () => {
     const { manager, stores } = makeManager(okAdapter);
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
