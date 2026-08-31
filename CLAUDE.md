@@ -48,6 +48,8 @@ pnpm tiny daemon install              # run it under launchd
 pnpm tiny setup                       # one path: prerequisites → profile → login → URL → daemon → QR
 pnpm tiny doctor                      # environment diagnosis (setup / doctor both take [--agent <id>] [--profile <name>])
 pnpm tiny ls | new | attach <id>      # list / create / hand a session to the CLI
+pnpm tiny handoff [--auto] [--ended] [--profile <name>] [--session <id>] [--config-dir <dir>]  # hand the current session to tiny (reverse of attach)
+pnpm tiny live [on|off]               # toggle automatic handoff of every new session (default: manual — off)
 pnpm tiny profiles ls | add <name> | rename <old> <new> | login <name>
 pnpm tiny pair                        # show the pairing QR
 pnpm tiny devices                     # list paired devices
