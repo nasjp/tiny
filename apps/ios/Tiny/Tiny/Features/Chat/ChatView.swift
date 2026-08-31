@@ -41,6 +41,8 @@ struct ChatView: View {
     @State private var scrollDebug = ScrollDebug()
     /// Holds a weak reference to the UIScrollView for the ↓ button (a class, so mutating it does not redraw)
     @State private var scrollHolder = ScrollViewHolder()
+    /// Keeps a freshly opened chat pinned to the newest message (a class, so mutating it does not redraw)
+    @State private var bottomPin = BottomPin()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -123,8 +125,16 @@ struct ChatView: View {
                 .onPreferenceChange(ChatBottomDistanceKey.self) { maxY in
                     if #unavailable(iOS 18.0) {
                         updateBottomDistance(maxY - viewportHeight)
+                        bottomPin.extend()
+                        pinToBottomWhileOpening()
                     }
                 }
+                // Every time the content grows while opening, land on the bottom again
+                // (see pinToBottomWhileOpening)
+                .modifier(ScrollContentSizeChangeModifier {
+                    bottomPin.extend()   // late rows keep the opening window alive
+                    pinToBottomWhileOpening()
+                })
                 // Putting the composer in safeAreaInset lets the ScrollView extend behind
                 // it, so the chat body flows behind the translucent composer
                 // (the look of the official Claude / ChatGPT apps)
@@ -226,6 +236,12 @@ struct ChatView: View {
             }
         }
         .onAppear {
+            // Land on the newest message (see pinToBottomWhileOpening) and keep landing
+            // there for as long as history and row heights are still settling
+            bottomPin.arm()
+            for delay in [0.0, 0.05, 0.2, 0.5, 1.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { pinToBottomWhileOpening() }
+            }
             // Reuse the AppModel cache. The previous events appear the instant we come
             // back, and start()'s resync runs in the background (anti-flicker)
             if model.inner == nil {
@@ -521,6 +537,26 @@ struct ChatView: View {
         return true
     }
 
+    /// Land a freshly opened chat on the newest message.
+    /// History arrives after the first layout (REST → WS → transcript sync) and row
+    /// heights settle later still (images, tables, markdown). SwiftUI's
+    /// `defaultScrollAnchor(.bottom)` is supposed to follow that, but on device it has
+    /// been seen to lose the race and leave the chat sitting at the very top (device
+    /// report). So drive the UIScrollView ourselves while the chat is opening, and
+    /// step aside the instant the user touches the list — never fight their scrolling.
+    private func pinToBottomWhileOpening() {
+        guard bottomPin.active, let sv = scrollHolder.scrollView else { return }
+        // The user took over (or the window closed): stop for the rest of this visit
+        if sv.isTracking || sv.isDragging || sv.isDecelerating || Date() > bottomPin.until {
+            bottomPin.active = false
+            return
+        }
+        let bottom = max(-sv.adjustedContentInset.top,
+                         sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom)
+        guard abs(sv.contentOffset.y - bottom) > 0.5 else { return }
+        sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: bottom), animated: false)
+    }
+
     /// Toggle the ↓ button based on distance from the bottom.
     /// Update state only when crossing the threshold (avoid redrawing on every scroll tick)
     private func updateBottomDistance(_ dist: CGFloat) {
@@ -706,6 +742,36 @@ private struct CameraPicker: UIViewControllerRepresentable {
     }
 }
 
+/// Window in which a freshly opened chat is kept pinned to the newest message.
+/// A class, so extending the window does not redraw the view
+final class BottomPin {
+    /// Still opening (no user interaction yet)
+    var active = true
+    /// Pinning stops here. Content still landing pushes it back, up to `hardDeadline`
+    private(set) var until = Date.distantPast
+    private var hardDeadline = Date.distantPast
+
+    /// Opening window. Long enough to cover a slow first fetch over Tailscale
+    static let window: TimeInterval = 6
+    /// Each late row buys this much more time…
+    static let perChange: TimeInterval = 1
+    /// …but a chat that keeps growing (a running turn) never pins beyond this
+    static let hardWindow: TimeInterval = 20
+
+    /// Called when the chat appears
+    func arm(now: Date = Date()) {
+        active = true
+        hardDeadline = now.addingTimeInterval(Self.hardWindow)
+        until = now.addingTimeInterval(Self.window)
+    }
+
+    /// Content moved again — stay a little longer, but never past the hard deadline
+    func extend(now: Date = Date()) {
+        guard active else { return }
+        until = min(hardDeadline, max(until, now.addingTimeInterval(Self.perChange)))
+    }
+}
+
 /// Box holding a weak reference to the UIScrollView backing SwiftUI's ScrollView
 final class ScrollViewHolder {
     weak var scrollView: UIScrollView?
@@ -757,6 +823,22 @@ private struct HorizontalDriftGuard: ViewModifier {
             }
         } else {
             content
+        }
+    }
+}
+
+/// Reports every change of the scroll content's size (iOS 18+). Used to keep a chat
+/// that is still filling in landed on its newest message
+private struct ScrollContentSizeChangeModifier: ViewModifier {
+    let onChange: () -> Void
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollGeometryChange(for: CGSize.self) { $0.contentSize } action: { _, _ in
+                onChange()
+            }
+        } else {
+            content   // iOS 17 goes through ChatBottomDistanceKey
         }
     }
 }

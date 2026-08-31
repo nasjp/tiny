@@ -75,6 +75,11 @@ final class ChatViewWidthTests: XCTestCase {
         let host = UIHostingController(rootView:
             NavigationStack { ChatView(session: session) }.environmentObject(appModel))
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 402, height: 874))
+        // Without a scene the window gets no update pass and the view would stay frozen
+        // on its first (empty) render, making every assertion below vacuous
+        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+            window.windowScene = scene
+        }
         window.rootViewController = host
         window.makeKeyAndVisible()
         host.view.layoutIfNeeded()
