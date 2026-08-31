@@ -70,7 +70,7 @@ always re-run `tiny daemon install` after updating (a forgotten re-install is ca
 ## Everyday commands
 
 ```bash
-tiny doctor                              # environment diagnosis (node / daemon / server URL / push / each agent's presence and login)
+tiny doctor                              # environment diagnosis (node / daemon / server URL / push / always-handoff per profile / each agent's presence and login)
 tiny agents                              # list supported agents
 
 tiny ls                                  # list sessions

@@ -33,7 +33,7 @@ function deps(over: Partial<DoctorDeps> = {}): DoctorDeps {
     profiles: [profile("work", "claude", true)],
     fileExists: () => true,
     sameFile: (a, b) => a === b,
-    alwaysHandoff: false,
+    alwaysHandoff: [{ name: "~/.claude (this shell)", on: false }],
     ...over,
   };
 }
@@ -117,13 +117,30 @@ describe("collectDoctor", () => {
     expect(r.checks.map((c) => c.name)).not.toContain("agent Droid");
   });
 
-  it("reports always handoff on/off", async () => {
-    const off = await collectDoctor(deps({ alwaysHandoff: false }));
-    expect(byName(off, "always handoff").status).toBe("ok");
-    expect(byName(off, "always handoff").detail).toContain("off");
-    const on = await collectDoctor(deps({ alwaysHandoff: true }));
-    expect(byName(on, "always handoff").status).toBe("ok");
-    expect(byName(on, "always handoff").detail).toContain("on");
+  // `tiny live` is per config dir, and every profile has its own, so one on/off says nothing
+  it("reports always handoff per place it can be set", async () => {
+    const r = await collectDoctor(deps({
+      alwaysHandoff: [
+        { name: "~/.claude (this shell)", on: true },
+        { name: "profile-1", on: true },
+        { name: "profile-2", on: false },
+      ],
+    }));
+    const c = byName(r, "always handoff");
+    expect(c.status).toBe("ok");
+    expect(c.detail).toBe("on: ~/.claude (this shell), profile-1 · off: profile-2");
+    expect(c.hint).toBeUndefined();
+  });
+
+  it("says so plainly, with the way to turn it on, when it is off everywhere", async () => {
+    const r = await collectDoctor(deps({
+      alwaysHandoff: [{ name: "~/.claude (this shell)", on: false }, { name: "profile-1", on: false }],
+    }));
+    const c = byName(r, "always handoff");
+    expect(c.status).toBe("ok");
+    expect(c.detail).toContain("off everywhere");
+    expect(c.detail).toContain("~/.claude (this shell), profile-1");
+    expect(c.hint).toContain("tiny live on");
   });
 
   it("shows the CLI live-join picture: open sessions and stale sockets", async () => {

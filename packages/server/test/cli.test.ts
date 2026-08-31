@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  alwaysHandoffTargets,
   buildAttachCommand,
   ensureHandoffProfile,
   formatDeviceRow,
@@ -18,7 +19,7 @@ import {
   resolveSessionId,
   runProfileRename,
 } from "../src/cli.js";
-import { addProfile, listProfiles, readProfileConfigDir } from "../src/profiles.js";
+import { addProfile, listProfiles, readProfileConfigDir, type ProfileInfo } from "../src/profiles.js";
 import type { SessionRecord } from "../src/types.js";
 
 function sess(over: Partial<SessionRecord>): SessionRecord {
@@ -273,6 +274,55 @@ describe("handoff", () => {
     expect(readProfileConfigDir(path.join(root, "local"))).toBe(configDir);
     expect(ensureHandoffProfile(root, configDir)).toBe("local");
     expect(listProfiles(root)).toHaveLength(1);
+  });
+
+  // What `tiny doctor` reports for always-handoff. One on/off is meaningless: the mode lives in
+  // each config dir's own settings.json, and every profile has one
+  describe("alwaysHandoffTargets", () => {
+    const prof = (name: string, dir: string, agent = "claude"): ProfileInfo => ({
+      name, dir, agent, label: agent, loggedIn: true,
+      capabilities: EMPTY_CAPABILITIES, defaultModel: null, defaultEffort: null, email: null,
+    });
+
+    it("puts the caller's own config dir first and reads each profile's mode", () => {
+      const on = new Set(["/home/u/.tiny/profiles/profile-1"]);
+      expect(alwaysHandoffTargets(
+        [prof("profile-1", "/home/u/.tiny/profiles/profile-1"), prof("profile-2", "/home/u/.tiny/profiles/profile-2")],
+        "/home/u/.claude",
+        (dir) => on.has(dir),
+      )).toEqual([
+        { name: "/home/u/.claude (this shell)", on: false },
+        { name: "profile-1", on: true },
+        { name: "profile-2", on: false },
+      ]);
+    });
+
+    // A profile can point at the very directory the shell uses (`tiny handoff` makes those).
+    // Listing it twice would read as two different settings to keep in sync
+    it("names the shell's dir after the profile pointing at it, once", () => {
+      expect(alwaysHandoffTargets([prof("local", "/home/u/.claude")], "/home/u/.claude", () => true))
+        .toEqual([{ name: "local (this shell)", on: true }]);
+    });
+
+    // SessionStart/SessionEnd hooks are Claude Code's; there is nothing to set for other agents
+    it("leaves out profiles of other agents", () => {
+      const targets = alwaysHandoffTargets(
+        [prof("oc", "/home/u/.tiny/profiles/oc", "opencode"), prof("profile-1", "/home/u/.tiny/profiles/profile-1")],
+        "/home/u/.claude",
+        () => false,
+      );
+      expect(targets.map((t) => t.name)).toEqual(["/home/u/.claude (this shell)", "profile-1"]);
+    });
+
+    // A profile whose external config dir is gone must not take the whole report down
+    it("skips a profile whose mode cannot be read", () => {
+      const targets = alwaysHandoffTargets(
+        [prof("broken", "/gone"), prof("profile-1", "/home/u/.tiny/profiles/profile-1")],
+        "/home/u/.claude",
+        (dir) => { if (dir === "/gone") throw new Error("nope"); return false; },
+      );
+      expect(targets.map((t) => t.name)).toEqual(["/home/u/.claude (this shell)", "profile-1"]);
+    });
   });
 
   // `tiny live` writes hooks into ONE settings.json, so which directory that is has to be

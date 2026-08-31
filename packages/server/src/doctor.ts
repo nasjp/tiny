@@ -39,10 +39,20 @@ export interface DoctorDeps {
   fileExists: (p: string) => boolean;
   /** Whether two paths are the same file (realpath comparison; string comparison in tests) */
   sameFile: (a: string, b: string) => boolean;
-  /** Whether `tiny live` is on (the SessionStart/SessionEnd hooks are installed in the agent's settings.json) */
-  alwaysHandoff: boolean;
+  /**
+   * Where `tiny live` can be set and whether it is on there. The mode is the SessionStart /
+   * SessionEnd hook pair in one settings.json, and each config dir (every profile, plus the one
+   * the caller's own shell uses) has its own, so this is a list rather than a single flag
+   */
+  alwaysHandoff: AlwaysHandoffTarget[];
   /** Claude Code sessions reachable for live join (claude-peer.summarizePeerInboxes). Undefined = not collected */
   peerInboxes?: { open: number; sockets: number; stale: number } | null;
+}
+
+/** One place `tiny live` can be turned on: a profile name, or a path for a dir that is not a profile */
+export interface AlwaysHandoffTarget {
+  name: string;
+  on: boolean;
 }
 
 export const MIN_NODE_MAJOR = 22;
@@ -97,9 +107,19 @@ function checkPush(d: DoctorDeps): DoctorCheck {
 
 function checkAlwaysHandoff(d: DoctorDeps): DoctorCheck {
   const name = "always handoff";
-  return d.alwaysHandoff
-    ? { status: "ok", name, detail: "on (every new session is handed to tiny automatically)" }
-    : { status: "ok", name, detail: "off (manual `tiny handoff` only; enable with tiny live on)" };
+  const on = d.alwaysHandoff.filter((t) => t.on).map((t) => t.name);
+  const off = d.alwaysHandoff.filter((t) => !t.on).map((t) => t.name);
+  if (on.length === 0) {
+    return {
+      status: "ok",
+      name,
+      detail: `off everywhere — manual \`tiny handoff\` only (${off.join(", ")})`,
+      hint: "tiny live on [--profile <name>]",
+    };
+  }
+  const parts = [`on: ${on.join(", ")}`];
+  if (off.length > 0) parts.push(`off: ${off.join(", ")}`);
+  return { status: "ok", name, detail: parts.join(" · ") };
 }
 
 function checkPeerInboxes(d: DoctorDeps): DoctorCheck | null {
