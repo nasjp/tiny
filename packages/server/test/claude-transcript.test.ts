@@ -298,4 +298,95 @@ describe("claude-transcript", () => {
     expect(r.title).toBeNull();
     expect(r.cursor).toBeNull();
   });
+
+  // `!cmd` in Claude Code is recorded as plain user records with no isMeta / promptSource marker.
+  // They are operation log, not dialogue, and must render as tool activity like everything else
+  describe("bash blocks (!cmd)", () => {
+    it("turns a bash-input/bash-stdout pair into a linked tool_started/tool_finished", () => {
+      const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+      writeJsonl(file, [
+        {
+          type: "user", uuid: "b1",
+          message: { role: "user", content: "<bash-input>tiny handoff</bash-input>" },
+        },
+        {
+          type: "user", uuid: "b2",
+          message: { role: "user", content: "<bash-stdout>Handed off: abc123</bash-stdout><bash-stderr></bash-stderr>" },
+        },
+      ]);
+      const r = readTranscript(file);
+      expect(r.events.map((e) => e.type)).toEqual(["tool_started", "tool_finished"]);
+      const started = r.events[0]!;
+      const finished = r.events[1]!;
+      expect(started.payload.kind).toBe("execute");
+      expect(started.payload.summary).toBe("tiny handoff");
+      expect(started.payload.toolUseId).toBe(finished.payload.toolUseId);
+      expect(started.payload.toolUseId).toBe("b1");
+    });
+
+    it("sets isError true only when bash-stderr is non-empty", () => {
+      const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+      writeJsonl(file, [
+        { type: "user", uuid: "b1", message: { role: "user", content: "<bash-input>false</bash-input>" } },
+        {
+          type: "user", uuid: "b2",
+          message: { role: "user", content: "<bash-stdout></bash-stdout><bash-stderr>boom</bash-stderr>" },
+        },
+      ]);
+      const r = readTranscript(file);
+      expect(r.events.find((e) => e.type === "tool_finished")!.payload.isError).toBe(true);
+    });
+
+    it("drops a bash-stdout with no pending bash-input", () => {
+      const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+      writeJsonl(file, [
+        {
+          type: "user", uuid: "b1",
+          message: { role: "user", content: "<bash-stdout>orphan</bash-stdout><bash-stderr></bash-stderr>" },
+        },
+      ]);
+      const r = readTranscript(file);
+      expect(r.events).toEqual([]);
+    });
+
+    it("still emits tool_started for a bash-input with no following stdout", () => {
+      const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+      writeJsonl(file, [
+        { type: "user", uuid: "b1", message: { role: "user", content: "<bash-input>tiny handoff</bash-input>" } },
+      ]);
+      const r = readTranscript(file);
+      expect(r.events.map((e) => e.type)).toEqual(["tool_started"]);
+    });
+
+    it("does not count bash blocks toward the human-turn backfill window", () => {
+      const records: Array<Record<string, unknown>> = [];
+      for (let k = 0; k < 5; k++) {
+        records.push({ type: "user", uuid: `bi${k}`, message: { role: "user", content: "<bash-input>ls</bash-input>" } });
+        records.push({
+          type: "user", uuid: `bo${k}`,
+          message: { role: "user", content: "<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>" },
+        });
+      }
+      records.push({ type: "user", uuid: "u0", message: { role: "user", content: "the real question" } });
+      const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+      writeJsonl(file, records);
+      const r = readTranscript(file, { turns: 1 });
+      const said = r.events.filter((e) => e.type === "user_message").map((e) => e.payload.text);
+      expect(said).toEqual(["the real question"]);
+    });
+
+    it("keeps an ordinary message that merely mentions <bash-input> as conversation", () => {
+      const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+      writeJsonl(file, [
+        {
+          type: "user", uuid: "u1",
+          message: { role: "user", content: "what does <bash-input> even mean here?" },
+        },
+      ]);
+      const r = readTranscript(file);
+      expect(r.events).toEqual([
+        { type: "user_message", payload: { text: "what does <bash-input> even mean here?" } },
+      ]);
+    });
+  });
 });
