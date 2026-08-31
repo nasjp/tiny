@@ -10,6 +10,7 @@ import { FileOutbox } from "../src/outbox.js";
 import { SessionManager } from "../src/session-manager.js";
 import { AuthService } from "../src/auth.js";
 import { createApp } from "../src/api.js";
+import type { EventRecord } from "../src/types.js";
 import type { AgentAdapter } from "../src/adapter.js";
 import { PushClient } from "../src/push-client.js";
 import { UsageService } from "../src/usage.js";
@@ -142,6 +143,40 @@ describe("REST API", () => {
     });
     expect(conflict.status).toBe(409);
     expect((await app.request("/v1/sessions/missing", { headers: H() })).status).toBe(404);
+  });
+
+  // Typing during a turn queues in the CLI; the phone used to get "turn already running" instead
+  it("POST /v1/sessions/:id/turns queues a message sent during a turn", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const slow: SessionManager = new SessionManager({
+      stores, profilesDir, broker: new PermissionBroker(1000), outbox,
+      adapters: { claude: { async runTurn(p) {
+        p.emit({ type: "turn_started", payload: {} });
+        await gate;
+        return { agentSessionId: "agent-1", costUsd: null, resultText: "ok" };
+      } } },
+    });
+    const one = createApp({
+      manager: slow, auth, outbox, profilesDir, stores,
+      serverUrl: () => "http://mac:7777", push, usage, isCliLive: () => cliLive,
+    });
+    const sess = await (await one.request("/v1/sessions", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }),
+    })).json();
+    const turn = (prompt: string) => one.request(`/v1/sessions/${sess.id}/turns`, {
+      method: "POST", headers: H(), body: JSON.stringify({ prompt }),
+    });
+    expect(await (await turn("first")).json()).toEqual({ ok: true, queued: false });
+    const second = await turn("second");
+    expect(second.status).toBe(202);
+    expect(await second.json()).toEqual({ ok: true, queued: true });
+    // The queued message is in the conversation right away
+    const events = await (await one.request(`/v1/sessions/${sess.id}/events`, { headers: H() })).json();
+    expect(events.events.filter((e: EventRecord) => e.type === "user_message").map((e: EventRecord) => e.payload.text))
+      .toEqual(["first", "second"]);
+    release();
+    await slow.waitForIdle(sess.id);
   });
 
   it("PATCH /v1/sessions/:id changes model and permission mode mid-session", async () => {

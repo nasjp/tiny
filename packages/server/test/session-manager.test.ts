@@ -639,26 +639,90 @@ describe("SessionManager", () => {
     expect(fs.readFileSync(rec!.storedPath)).toEqual(bytes);
   });
 
-  it("startTurn while running and while detached is a ConflictError", async () => {
-    let release!: () => void;
-    const blocked = new Promise<void>((r) => (release = r));
-    const slow: AgentAdapter = {
-      async runTurn(p) {
-        p.emit({ type: "turn_started", payload: {} });
-        await blocked;
-        return { agentSessionId: "agent-1", costUsd: null, resultText: null };
+  /** An adapter whose turns only finish when the test lets them, recording every prompt it saw */
+  function gatedAdapter(): { adapter: AgentAdapter; prompts: string[]; releaseAll: () => void } {
+    const prompts: string[] = [];
+    const gates: Array<() => void> = [];
+    let open = false;   // once released, later turns run straight through
+    return {
+      prompts,
+      releaseAll: () => { open = true; for (const g of gates.splice(0)) g(); },
+      adapter: {
+        async runTurn(p) {
+          prompts.push(p.prompt);
+          p.emit({ type: "turn_started", payload: {} });
+          await new Promise<void>((r) => (open ? r() : gates.push(r)));
+          p.emit({ type: "turn_completed", payload: {} });
+          return { agentSessionId: "agent-1", costUsd: null, resultText: null };
+        },
       },
     };
-    const { manager } = makeManager(slow);
+  }
+
+  // Typing during a turn queues in Claude Code's own CLI; refusing it here made the phone the
+  // odd one out (device report: "tiny can't queue, it just errors")
+  it("queues a message sent during a turn and runs it when the turn ends, in order", async () => {
+    const { adapter, prompts, releaseAll } = gatedAdapter();
+    const { manager, stores } = makeManager(adapter);
     const s = manager.createSession({ profile: "work", cwd });
-    manager.startTurn(s.id, "a");
-    expect(() => manager.startTurn(s.id, "b")).toThrow(ConflictError);
-    release();
+    expect(manager.startTurn(s.id, "a")).toEqual({ queued: false });
+    expect(manager.startTurn(s.id, "b")).toEqual({ queued: true });
+    expect(manager.startTurn(s.id, "c")).toEqual({ queued: true });
+    // The queued messages are in the conversation immediately — the person can see what they sent
+    expect(stores.events.listSince(s.id, 0).filter((e) => e.type === "user_message").map((e) => e.payload.text))
+      .toEqual(["a", "b", "c"]);
+    expect(prompts).toEqual(["a"]);
+    releaseAll();
     await manager.waitForIdle(s.id);
+    expect(prompts).toEqual(["a", "b", "c"]);
+    expect(manager.getSession(s.id).status).toBe("idle");
+  });
+
+  it("still refuses a turn while the CLI has the session attached", async () => {
+    const { manager } = makeManager(okAdapter);
+    const s = manager.createSession({ profile: "work", cwd });
     manager.setDetached(s.id, true);
-    expect(manager.getSession(s.id).status).toBe("detached");
     expect(() => manager.startTurn(s.id, "c")).toThrow(ConflictError);
     manager.setDetached(s.id, false);
+    expect(manager.getSession(s.id).status).toBe("idle");
+  });
+
+  // A phone can send faster than turns finish; an unbounded queue would hold messages the person
+  // has long forgotten about
+  it("caps the queue and says so", async () => {
+    const { adapter, releaseAll } = gatedAdapter();
+    const { manager } = makeManager(adapter);
+    const s = manager.createSession({ profile: "work", cwd });
+    manager.startTurn(s.id, "running");
+    for (let i = 0; i < SessionManager.MAX_QUEUED; i++) manager.startTurn(s.id, `q${i}`);
+    expect(() => manager.startTurn(s.id, "one too many")).toThrow(/queued/i);
+    releaseAll();
+    await manager.waitForIdle(s.id);
+  });
+
+  // Stop means stop: the CLI drops what you queued too
+  it("drops the queue when the turn is stopped", async () => {
+    const { adapter, prompts, releaseAll } = gatedAdapter();
+    const { manager } = makeManager(adapter);
+    const s = manager.createSession({ profile: "work", cwd });
+    manager.startTurn(s.id, "a");
+    manager.startTurn(s.id, "b");
+    await manager.interrupt(s.id);
+    releaseAll();
+    await manager.waitForIdle(s.id);
+    expect(prompts).toEqual(["a"]);
+    expect(manager.getSession(s.id).status).toBe("idle");
+  });
+
+  // The daemon can be killed mid-turn. The row is then marked running with nothing running, and
+  // every later turn used to be refused ("A turn is already running") until tinyd restarted —
+  // which is exactly the "it errors and then nothing updates any more" the device report described
+  it("recovers a running status that outlived its turn instead of refusing forever", async () => {
+    const { manager, stores } = makeManager(okAdapter);
+    const s = manager.createSession({ profile: "work", cwd });
+    stores.sessions.patch(s.id, { status: "running" });
+    expect(manager.startTurn(s.id, "hello")).toEqual({ queued: false });
+    await manager.waitForIdle(s.id);
     expect(manager.getSession(s.id).status).toBe("idle");
   });
 

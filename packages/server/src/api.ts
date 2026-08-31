@@ -219,8 +219,9 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
 
   app.post("/v1/sessions/:id/turns", async (c) => {
     const body = turnSchema.parse(await c.req.json());
-    deps.manager.startTurn(c.req.param("id"), body.prompt, body.images);
-    return c.json({ ok: true }, 202);
+    // queued = a turn was already running, so this message runs next (the CLI queues the same way)
+    const { queued } = deps.manager.startTurn(c.req.param("id"), body.prompt, body.images);
+    return c.json({ ok: true, queued }, 202);
   });
 
   app.post("/v1/sessions/:id/interrupt", async (c) => {

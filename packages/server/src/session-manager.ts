@@ -117,6 +117,14 @@ interface LiveTurn {
 /** Registry statuses that mean "a turn is in progress over there" (a permission prompt is mid-turn too) */
 const CLI_BUSY: ReadonlySet<string> = new Set(["busy", "waiting"]);
 
+/** A message waiting for the running turn to end. Already in the conversation when it gets here */
+interface QueuedTurn {
+  prompt: string;
+  images?: TurnImage[];
+  /** Outbox paths of the attachments, for a live turn to point the CLI at */
+  paths: string[];
+}
+
 export class SessionManager extends EventEmitter {
   private running = new Map<string, RunningTurn>();
   /** Progress of the turns in `running`: when they started and, for adapters that report it, output so far */
@@ -125,6 +133,13 @@ export class SessionManager extends EventEmitter {
   private transcriptTurns = new Map<string, TranscriptTurn & { readAt: number }>();
   /** Turns currently running inside the user's CLI rather than tiny's own adapter, by session id */
   private liveTurns = new Map<string, LiveTurn>();
+  /**
+   * Messages that arrived while a turn was running, in order. Typing during a turn queues in
+   * Claude Code's own CLI, so it queues here too — refusing them made the phone the odd one out.
+   * The message is already in the conversation when it lands here (persisted at queue time), so
+   * what is kept is only what running it later needs
+   */
+  private queued = new Map<string, QueuedTurn[]>();
   /**
    * Last transcript stat per session. Parsing a transcript is expensive (a 139MB one costs ~250ms
    * and ~800MB of RSS) and the events endpoint asks on every poll, so an unchanged file must cost
@@ -216,6 +231,9 @@ export class SessionManager extends EventEmitter {
    * 50-200 records on real transcripts, which stays clear of readTranscript's 300-record ceiling
    */
   private static readonly BACKFILL_TURNS = 5;
+
+  /** A phone can send faster than turns finish; a queue nobody can see the end of is not a feature */
+  static readonly MAX_QUEUED = 10;
 
   /**
    * Register a session that was started in the agent's own CLI (`tiny handoff`).
@@ -358,7 +376,9 @@ export class SessionManager extends EventEmitter {
     // writers of the jsonl (the user's CLI, tiny's SDK child) and the writers of the cursor
     // (syncTranscript, turn completion) can no longer interleave.
     // A LIVE turn is the exception: the only writer is the user's CLI, so importing is the point
-    if (s.status === "running" && !this.liveTurns.has(id)) return SessionManager.noImport();
+    // Keyed on the turn actually in flight, not on the stored status: a status left behind by a
+    // killed daemon would otherwise stop the transcript from ever being imported again
+    if (this.running.has(id) && !this.liveTurns.has(id)) return SessionManager.noImport();
     const file = this.transcriptFile(s);
     if (!file) return SessionManager.noImport();
     const stat = this.transcriptChange(id, file);
@@ -491,10 +511,47 @@ export class SessionManager extends EventEmitter {
     return this.joinTarget(s) !== null;
   }
 
-  startTurn(id: string, prompt: string, images?: TurnImage[]): void {
+  /**
+   * Send a message. While a turn is running the message is queued instead of refused (`queued:
+   * true`), the way typing during a turn queues in the CLI, and runs as its own turn as soon as
+   * the current one ends.
+   */
+  startTurn(id: string, prompt: string, images?: TurnImage[]): { queued: boolean } {
     const s = this.getSession(id);
-    if (s.status === "running") throw new ConflictError("turn already running");
     if (s.status === "detached") throw new ConflictError("session is attached from CLI");
+    if (s.status === "running") {
+      if (this.running.has(id)) {
+        const q = this.queued.get(id) ?? [];
+        if (q.length >= SessionManager.MAX_QUEUED) {
+          throw new ConflictError(`too many queued messages (${SessionManager.MAX_QUEUED}); wait for the turn to finish`);
+        }
+        // Persist now: a queued message the person cannot see is a message they will send twice
+        const saved = this.persistUserMessage(id, prompt, images);
+        q.push({ prompt, ...(images ? { images } : {}), paths: saved.paths });
+        this.queued.set(id, q);
+        return { queued: true };
+      }
+      // The status outlived whatever set it — tinyd was killed mid-turn, or a turn crashed the
+      // process. Nothing is running, so refusing every later turn (and, through the same flag,
+      // never importing the transcript again) would keep the session broken until a restart
+      console.error(`[tinyd] session ${id} was marked running with no turn in flight; clearing it`);
+      this.deps.stores.sessions.patch(id, { status: "idle" });
+    }
+    this.launchTurn(this.getSession(id), prompt, images, null);
+    return { queued: false };
+  }
+
+  /**
+   * Start a turn for real. `saved` is set when the message was already persisted (it came off the
+   * queue), so it is not written into the conversation twice.
+   */
+  private launchTurn(
+    s: SessionRecord,
+    prompt: string,
+    images: TurnImage[] | undefined,
+    saved: { paths: string[] } | null,
+  ): void {
+    const id = s.id;
     // The CLI holds the session. Running the turn in a second process would race it on the
     // transcript, so either hand the message to that very process (live join) or refuse
     const isLive = this.deps.isCliLive?.(s) === true;
@@ -506,16 +563,46 @@ export class SessionManager extends EventEmitter {
     const finish = (): void => {
       this.running.delete(id);
       this.turnProgress.delete(id);
+      this.startNextQueued(id);
     };
+    // In the map BEFORE anything can run: an SDK turn trips the agent's SessionStart hook while
+    // still on this call stack, and that re-enters the manager (adoptSession -> syncTranscript),
+    // which must see the turn in flight or it imports records tiny is in the middle of emitting
+    const entry: RunningTurn = { abort, done: Promise.resolve() };
+    this.running.set(id, entry);
     if (target) {
-      const saved = this.persistUserMessage(id, prompt, images);
-      const done = this.runLiveTurn(s, prompt, saved.paths, target, abort.signal).finally(finish);
-      this.running.set(id, { abort, done });
+      const paths = saved ? saved.paths : this.persistUserMessage(id, prompt, images).paths;
+      entry.done = this.runLiveTurn(s, prompt, paths, target, abort.signal).finally(finish);
       return;
     }
-    this.persistUserMessage(id, prompt, images);
-    const done = this.runTurn(s, prompt, images, abort.signal).finally(finish);
-    this.running.set(id, { abort, done });
+    if (!saved) this.persistUserMessage(id, prompt, images);
+    entry.done = this.runTurn(s, prompt, images, abort.signal).finally(finish);
+  }
+
+  /**
+   * Run the next queued message, if any. Called as each turn ends. A message that cannot be
+   * launched (the CLI took the session over in the meantime) is reported as a failed turn, and the
+   * rest of the queue goes with it: whatever blocked this one blocks them all
+   */
+  private startNextQueued(id: string): void {
+    const q = this.queued.get(id);
+    const next = q?.shift();
+    if (!next) {
+      this.queued.delete(id);
+      return;
+    }
+    if (q!.length === 0) this.queued.delete(id);
+    try {
+      this.launchTurn(this.getSession(id), next.prompt, next.images, { paths: next.paths });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.queued.delete(id);
+      try {
+        this.emitEvent(id, "turn_failed", { error: reason });
+      } catch {
+        // the session row is gone (deleted under the queue); there is nowhere to record it
+      }
+    }
   }
 
   /**
@@ -784,12 +871,19 @@ export class SessionManager extends EventEmitter {
     return rec;
   }
 
+  /** Resolves when nothing is running for this session any more — including anything queued behind it */
   async waitForIdle(id: string): Promise<void> {
-    await this.running.get(id)?.done;
+    for (;;) {
+      const turn = this.running.get(id);
+      if (!turn) return;
+      await turn.done;
+    }
   }
 
   async interrupt(id: string): Promise<void> {
     const s = this.getSession(id);
+    // Stop means stop: what was queued behind this turn goes too, as it does in the CLI
+    this.queued.delete(id);
     const live = this.liveTurns.get(id);
     if (!live) {
       const own = this.running.get(id);
