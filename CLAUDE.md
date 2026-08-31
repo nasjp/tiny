@@ -51,7 +51,7 @@ pnpm tiny ls | new | attach <id>      # list / create / hand a session to the CL
 pnpm tiny handoff [--auto] [--ended] [--profile <name>] [--session <id>] [--config-dir <dir>]  # hand the current session to tiny (reverse of attach)
 #   ^ run it from inside the Claude Code session you want to hand over, typed as `!tiny handoff`.
 #     Asking the agent in prose misfires: `handoff` collides with a skill name and the skill runs instead.
-pnpm tiny live [on|off] [--profile <name> | --config-dir <dir>]  # toggle automatic handoff of every new session (default: manual — off; without a target it acts on the caller's own CLAUDE_CONFIG_DIR)
+pnpm tiny live [on|off]               # auto-handoff of new sessions (default off; claude = hooks, codex/opencode = add `--profile <name>` to turn on the tinyd storage scan)
 pnpm tiny profiles ls | add <name> | rename <old> <new> | login <name>
 pnpm tiny pair                        # show the pairing QR
 pnpm tiny devices                     # list paired devices
@@ -115,7 +115,7 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
 - **Any code that spawns child processes must strip `ANTHROPIC_API_KEY` from the env**
   (leaving it set bills the API pay-as-you-go instead of the subscription; every
   existing spawn path already strips it)
-- Read test counts, not just pass/fail (currently server 604 / relay 37 / iOS unit 158
+- Read test counts, not just pass/fail (currently server 618 / relay 37 / iOS unit 158
   + 1 demo-UI + 3 live E2E [need a real tinyd — see HANDOFF]). **`xcodebuild test |
   tail` exits 0 even on failure** — always check for the literal
   `** TEST FAILED **` / `** TEST SUCCEEDED **` strings
@@ -142,7 +142,10 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
   through the `PeerBridge` dependency of `SessionManager`, and every function there
   degrades to null (or throws from send) so the caller falls back to refusing the turn
   with 409. Do not read those files anywhere else. `src/claude-live.ts` (read-only
-  liveness) is the one pre-existing exception
+  liveness) is the one pre-existing exception. **The same confinement holds per agent:
+  Codex's rollout jsonl / thread-writer-locks live only in `src/codex-live.ts`, and
+  OpenCode's opencode.db / locks only in `src/opencode-live.ts`** (both read-only,
+  degrading to null/empty)
 - **The rtk hook rewrites `git diff` / `grep` / `awk` pipelines too**, not just `npx` —
   a review diff generated through it showed modified lines as unchanged context. Run
   scripts that produce diffs for another reader with `rtk proxy bash <script>`, and

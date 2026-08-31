@@ -115,6 +115,12 @@ Every new Claude Code session is then handed over on its own, and you never type
 again. Turn it off with `tiny live off`; it only adds two hooks to your agent's own
 `settings.json` and removes exactly those when you turn it off.
 
+Codex and OpenCode have no hooks, so for their profiles `tiny live on --profile <name>`
+makes tinyd watch the agent's own session storage instead: a session you start in the
+terminal shows up on the phone once you have said something in it, its history follows
+along, and while the terminal is working a turn the phone shows it running (sending
+waits until the terminal is idle).
+
 That acts on the config directory your own shell uses (`$CLAUDE_CONFIG_DIR`, or `~/.claude`).
 Each tiny profile has its own, so name the profile to turn it on there:
 
