@@ -7,6 +7,7 @@ import path from "node:path";
 import { agentEnv, getDriver, listDrivers } from "../src/agents/index.js";
 import { writeTinyMcpServer } from "../src/agents/codex.js";
 import { cursorLoggedIn } from "../src/agents/cursor.js";
+import { claudeLoggedIn, readClaudeOauthAccount } from "../src/agents/claude.js";
 
 describe("agent drivers", () => {
   it("claude driver: label, home env, stripped env", () => {
@@ -385,6 +386,39 @@ describe("claude default config dir", () => {
     withHome((home) => {
       const env = agentEnv(getDriver("claude"), path.join(home, ".claude") + "/", { PATH: "/usr/bin" });
       expect(Object.hasOwn(env, "CLAUDE_CONFIG_DIR")).toBe(false);
+    });
+  });
+
+  // Same asymmetry on the read side: for the default dir the account info lives in ~/.claude.json,
+  // not in <dir>/.claude.json, so a handoff profile would otherwise be reported as logged out
+  it("login detection reads ~/.claude.json for the default dir", () => {
+    withHome((home) => {
+      const dir = path.join(home, ".claude");
+      fs.mkdirSync(dir, { recursive: true });
+      expect(claudeLoggedIn(dir)).toBe(false);
+      fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "a@b.c" } }));
+      expect(claudeLoggedIn(dir)).toBe(true);
+      expect(readClaudeOauthAccount(dir)).toEqual({ emailAddress: "a@b.c" });
+    });
+  });
+
+  it("an accountless <default dir>/.claude.json does not mask the real one", () => {
+    withHome((home) => {
+      const dir = path.join(home, ".claude");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, ".claude.json"), JSON.stringify({ mcpServers: {} }));
+      fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "a@b.c" } }));
+      expect(claudeLoggedIn(dir)).toBe(true);
+    });
+  });
+
+  it("any other config dir keeps reading <dir>/.claude.json", () => {
+    withHome((home) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cfg-"));
+      fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "a@b.c" } }));
+      expect(claudeLoggedIn(dir)).toBe(false);
+      fs.writeFileSync(path.join(dir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "d@e.f" } }));
+      expect(readClaudeOauthAccount(dir)).toEqual({ emailAddress: "d@e.f" });
     });
   });
 

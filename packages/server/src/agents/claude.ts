@@ -35,13 +35,21 @@ export function claudeConfigDirEnv(dir: string): { CLAUDE_CONFIG_DIR: string | u
   return { CLAUDE_CONFIG_DIR: isDefaultClaudeConfigDir(dir) ? undefined : dir };
 }
 
+/**
+ * Where Claude Code keeps the config file for a config dir. Same asymmetry as claudeConfigDirEnv:
+ * the default dir's config file sits next to it in the home root, not inside it
+ */
+export function claudeConfigFile(dir: string): string {
+  return isDefaultClaudeConfigDir(dir) ? path.join(os.homedir(), ".claude.json") : path.join(dir, ".claude.json");
+}
+
 // Login detection:
 // - Linux etc.: the token is written to $CLAUDE_CONFIG_DIR/.credentials.json
 // - macOS: the token goes into the Keychain (Claude Code-credentials-<hash>) and
 //   account info is written to oauthAccount in .claude.json instead
 export function readClaudeOauthAccount(dir: string): { emailAddress?: unknown } | null {
   try {
-    const raw = fs.readFileSync(path.join(dir, ".claude.json"), "utf8");
+    const raw = fs.readFileSync(claudeConfigFile(dir), "utf8");
     const parsed = JSON.parse(raw) as { oauthAccount?: { emailAddress?: unknown } | null };
     return parsed.oauthAccount ?? null;
   } catch {
