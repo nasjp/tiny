@@ -10,7 +10,8 @@ import { tinyPaths } from "./config.js";
 import { installDaemon, readInstalledDaemon, uninstallDaemon } from "./daemon.js";
 import { collectDoctor, formatDoctorReport } from "./doctor.js";
 import { openDb } from "./db.js";
-import { tinyEntry } from "./entry.js";
+import { tinyEntry, tinyLaunch } from "./entry.js";
+import { buildHookCommand, readLiveMode, setLiveMode } from "./claude-hooks.js";
 import { detectTailscaleIp } from "./tailscale.js";
 import { findOnPath } from "./which.js";
 import { migrateClaudeCredential, type KeychainMigration } from "./keychain.js";
@@ -347,6 +348,23 @@ program
     }
   });
 
+program
+  .command("live [state]")
+  .description("always hand new Claude Code sessions to tiny (state: on|off; omit to show)")
+  .option("--config-dir <dir>", "CLAUDE_CONFIG_DIR to configure (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
+  .action((state: string | undefined, opts: { configDir?: string }) => {
+    const configDir = opts.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+    const l = tinyLaunch();
+    const command = buildHookCommand(l.command, l.args);
+    if (state === undefined) {
+      console.log(`${readLiveMode(configDir) ? "on" : "off"}  (${configDir})`);
+      return;
+    }
+    if (state !== "on" && state !== "off") throw new Error(`state must be on or off (got ${state})`);
+    setLiveMode(configDir, state === "on", command);
+    console.log(`Always-handoff is now ${state} (${configDir})`);
+  });
+
 // Launched by agents as an MCP server (stdio). Not meant to be run by humans, so hidden from help
 program.command("mcp-server", { hidden: true }).action(async () => {
   const { runTinyMcpServer } = await import("./mcp-server.js");
@@ -377,6 +395,7 @@ program
       profiles: listProfiles(p.profilesDir),
       fileExists: (f) => fs.existsSync(f),
       sameFile,
+      alwaysHandoff: readLiveMode(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude")),
     });
     console.log(formatDoctorReport(report));
     if (!report.ok) process.exitCode = 1;
