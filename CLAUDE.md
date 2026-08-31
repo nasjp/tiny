@@ -51,7 +51,7 @@ pnpm tiny ls | new | attach <id>      # list / create / hand a session to the CL
 pnpm tiny handoff [--auto] [--ended] [--profile <name>] [--session <id>] [--config-dir <dir>]  # hand the current session to tiny (reverse of attach)
 #   ^ run it from inside the Claude Code session you want to hand over, typed as `!tiny handoff`.
 #     Asking the agent in prose misfires: `handoff` collides with a skill name and the skill runs instead.
-pnpm tiny live [on|off]               # auto-handoff of new sessions (default off; claude = hooks, codex/opencode = add `--profile <name>` to turn on the tinyd storage scan)
+pnpm tiny live [on|off] [--profile <name> | --config-dir <dir>]  # auto-handoff of new sessions (default off; claude = hooks in the targeted config dir, codex/opencode = `--profile <name>` turns on the tinyd storage scan)
 pnpm tiny profiles ls | add <name> | rename <old> <new> | login <name>
 pnpm tiny pair                        # show the pairing QR
 pnpm tiny devices                     # list paired devices
