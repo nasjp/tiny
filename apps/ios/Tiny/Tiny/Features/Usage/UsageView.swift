@@ -10,13 +10,15 @@ struct UsageView: View {
 
     @State private var profiles: [ProfileInfo] = []
     @State private var usages: [String: ProfileUsage] = [:]
-    @State private var errors: [String: String] = [:]
+    @State private var failures: [String: UsageFailure] = [:]
     @State private var loading = true
+    /// Profiles whose raw error the reader has opened (Details)
+    @State private var expandedDetails: Set<String> = []
 
     var body: some View {
         NavigationStack {
             List {
-                if loading && usages.isEmpty && errors.isEmpty {
+                if loading && usages.isEmpty && failures.isEmpty {
                     HStack { Spacer(); ProgressView(); Spacer() }
                 }
                 ForEach(sortedLoggedIn) { profile in
@@ -25,8 +27,8 @@ struct UsageView: View {
                             ForEach(usage.limits) { limit in
                                 limitRow(limit)
                             }
-                        } else if let err = errors[profile.name] {
-                            Text(err).font(.caption).foregroundStyle(Color.tRuby)
+                        } else if let failure = failures[profile.name] {
+                            failureRow(profile.name, failure)
                         } else {
                             ProgressView()
                         }
@@ -61,6 +63,51 @@ struct UsageView: View {
             if b.name == focus { return false }
             return a.name < b.name
         }
+    }
+
+    /// One line saying what is wrong, the command that fixes it, and the raw text behind Details
+    @ViewBuilder
+    private func failureRow(_ profile: String, _ failure: UsageFailure) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if failure.tone == .alert {
+                Label(failure.title, systemImage: "exclamationmark.triangle.fill")
+                    .font(.tinyCallout)
+                    .foregroundStyle(Color.tRuby)
+            } else {
+                // Not an error, so it does not get error weight: an aside in the profile's own card
+                Text(failure.title).font(.tinyCaption).foregroundStyle(Color.tInkSub)
+            }
+            if let hint = failure.hint {
+                // The fix is a command for the Mac, so it reads (and copies) as one
+                Text(hint)
+                    .font(.tinyCaption).fontDesign(.monospaced)
+                    .foregroundStyle(Color.tInk)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.tBg))
+                    .copyable(hint)
+            }
+            if let detail = failure.detail {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        if expandedDetails.contains(profile) { expandedDetails.remove(profile) }
+                        else { expandedDetails.insert(profile) }
+                    }
+                } label: {
+                    Label("Details", systemImage: expandedDetails.contains(profile) ? "chevron.down" : "chevron.right")
+                        .font(.tinyCaption).foregroundStyle(Color.tInkSub)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("usageDetailsToggle")
+                if expandedDetails.contains(profile) {
+                    Text(detail)
+                        .font(.tinyCaption2).fontDesign(.monospaced)
+                        .foregroundStyle(Color.tInkSub)
+                        .copyable(detail)
+                }
+            }
+        }
+        .padding(.vertical, 2)
     }
 
     private func limitRow(_ limit: UsageLimit) -> some View {
@@ -115,8 +162,8 @@ struct UsageView: View {
             }
             for await (name, result) in group {
                 switch result {
-                case .success(let u): usages[name] = u; errors[name] = nil
-                case .failure(let e): errors[name] = e.localizedDescription
+                case .success(let u): usages[name] = u; failures[name] = nil
+                case .failure(let e): failures[name] = UsageFailure.from(e)
                 }
             }
         }

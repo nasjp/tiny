@@ -4,7 +4,6 @@ import { agentEnv, findDriver } from "./agents/index.js";
 import { codexDriver } from "./agents/codex.js";
 import { spawnCodexProcess, type CodexSpawn } from "./codex-adapter.js";
 import { readProfileAgent, profileDir } from "./profiles.js";
-import { NotFoundError } from "./session-manager.js";
 import { TINY_VERSION } from "./version.js";
 
 // Equivalent of Claude Code's /usage. The numbers come from Claude Code itself via the
@@ -33,8 +32,54 @@ export interface ProfileUsage {
 /** Takes the profile's CLAUDE_CONFIG_DIR and returns the raw /usage data (rate_limits) */
 export type UsageFetcher = (configDir: string) => Promise<unknown>;
 
-/** Profile is not a subscription (API key, Bedrock, etc.) or its login lacks the usage scope */
-export class UsageUnavailableError extends Error {}
+/**
+ * Why a usage lookup did not produce numbers. The phone renders each kind differently, so this —
+ * not the wording — is what it keys off:
+ *   signed_out  the agent's login expired or was invalidated (fix it with `hint`)
+ *   unavailable this login has no usage data at all (API key / console login / no usage scope)
+ *   unsupported the agent has no usage API tiny can read
+ *   failed      something broke on the way (spawn, timeout, network)
+ */
+export type UsageProblem = "signed_out" | "unavailable" | "unsupported" | "failed";
+
+/**
+ * A usage lookup that produced no numbers. `message` is one short line for a person, `hint` the
+ * command that fixes it, and `detail` the raw upstream text — the app keeps that behind a
+ * disclosure instead of pasting a 401 body across the screen.
+ */
+export class UsageError extends Error {
+  constructor(
+    readonly problem: UsageProblem,
+    message: string,
+    readonly hint?: string,
+    readonly detail?: string,
+  ) {
+    super(message);
+  }
+
+  /** Nothing here is a bug in tinyd; only `failed` is an actual breakage on the way */
+  get status(): 409 | 502 {
+    return this.problem === "failed" ? 502 : 409;
+  }
+}
+
+/** Login expired / invalidated / never happened, as reported by an agent that has no error codes for it */
+const SIGNED_OUT_RE =
+  /\b401\b|unauthorized|token[_ ]?(?:invalidated|expired)|invalid_grant|sign(?:ing)? in again|not logged in|login required|please log ?in/i;
+
+/**
+ * Turn whatever an agent threw into something the phone can show in two lines. The upstream text
+ * is never thrown away — it moves to `detail`, where the app keeps it one tap out of sight.
+ */
+export function classifyUsageError(err: unknown, agent: string, profile: string): UsageError {
+  if (err instanceof UsageError) return err;
+  const raw = err instanceof Error ? err.message : String(err);
+  const label = findDriver(agent)?.label ?? agent;
+  if (SIGNED_OUT_RE.test(raw)) {
+    return new UsageError("signed_out", `${label} is signed out on your Mac`, `tiny profiles login ${profile}`, raw);
+  }
+  return new UsageError("failed", `Could not read usage from ${label}`, undefined, raw);
+}
 
 type QueryFn = typeof sdkQuery;
 
@@ -82,8 +127,9 @@ export function createSdkUsageFetcher(opts: SdkUsageOptions = {}): UsageFetcher 
       // If an SDK bump renames it, typecheck fails — keep it confined to this one call site
       const res = await Promise.race([q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(), timeout]);
       if (!res.rate_limits_available || res.rate_limits == null) {
-        throw new UsageUnavailableError(
-          "usage is not available for this profile (not a Claude subscription, or the login lacks the usage scope)",
+        throw new UsageError(
+          "unavailable",
+          "Usage is not available for this login (an API-key or console login, or a plan that does not report usage)",
         );
       }
       return res.rate_limits;
@@ -292,11 +338,17 @@ export class UsageService {
     const dir = this.resolveDir(profileName); // validates the name and that it exists
     const agent = this.resolveAgent(profileName);
     const fetcher = this.fetchers[agent];
-    if (!fetcher) throw new UsageUnavailableError(`usage is not available for agent: ${agent}`);
-    if (!this.isLoggedIn(dir, agent)) throw new NotFoundError(`profile not logged in: ${profileName}`);
+    const label = findDriver(agent)?.label ?? agent;
+    if (!fetcher) throw new UsageError("unsupported", `Usage is not available for ${label}`);
+    if (!this.isLoggedIn(dir, agent)) {
+      throw new UsageError("signed_out", `${label} is signed out on your Mac`, `tiny profiles login ${profileName}`);
+    }
 
     const task = (async () => {
-      const value = normalizeUsage(profileName, await fetcher(dir));
+      const raw = await fetcher(dir).catch((err: unknown) => {
+        throw classifyUsageError(err, agent, profileName);
+      });
+      const value = normalizeUsage(profileName, raw);
       this.cache.set(profileName, { at: Date.now(), value });
       return value;
     })().finally(() => this.inflight.delete(profileName));
