@@ -1128,10 +1128,32 @@ describe("SessionManager", () => {
       await until(() => sent.length === 1);
       await new Promise((r) => setTimeout(r, FAST_LIVE.deliveryTimeoutMs * 2)); // well past the idle-only timeout
       expect(seen.some((e) => e.type === "turn_failed")).toBe(false);
-      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId), assistantRecord("late reply")]));
+      fs.writeFileSync(file, jsonl([assistantRecord("cli own work"), peerRecord(sent[0]!.msgId), assistantRecord("late reply")]));
       setStatus({ status: "idle", waitingFor: null });
       await manager.waitForIdle(session.id);
       expect(seen.at(-1)!.type).toBe("turn_completed");
+      // the push preview is the reply that followed our message, not the CLI's own earlier text
+      expect(seen.at(-1)!.payload.resultText).toBe("late reply");
+    });
+
+    it("never carries text from the CLI's own concurrent turn into the completed turn's reply", async () => {
+      // Our message is answered by tool use alone, so the only assistant text in the transcript is
+      // the CLI's own earlier turn. That text belongs to nobody on the phone: resultText stays null
+      const { peer, sent, setStatus } = fakePeer();
+      setStatus({ status: "busy", waitingFor: null }); // the CLI is mid-way through its own work
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-own-text");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      fs.writeFileSync(file, jsonl([assistantRecord("cli own work")]));
+      await until(() => seen.some((e) => e.type === "assistant_text")); // imported while still undelivered
+      fs.appendFileSync(file, jsonl([peerRecord(sent[0]!.msgId), toolRecord()]));
+      setStatus({ status: "idle", waitingFor: null });
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)!.type).toBe("turn_completed");
+      expect(seen.at(-1)!.payload.resultText).toBeNull();
     });
 
     it("times out a message held for review (status stays 'waiting', not idle) instead of hanging for the full turn", async () => {
@@ -1408,6 +1430,14 @@ function peerRecord(msgId: string): Record<string, unknown> {
 
 function assistantRecord(text: string): Record<string, unknown> {
   return { type: "assistant", uuid: `a-${text}`, message: { content: [{ type: "text", text }] } };
+}
+
+/** A reply made of tool use only: it counts as a response, but contributes no assistant text */
+function toolRecord(): Record<string, unknown> {
+  return {
+    type: "assistant", uuid: "t-read",
+    message: { content: [{ type: "tool_use", id: "tu-read", name: "Read", input: { file_path: "notes.md" } }] },
+  };
 }
 
 const jsonl = (records: Array<Record<string, unknown>>) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";

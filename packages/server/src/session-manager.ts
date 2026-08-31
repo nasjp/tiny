@@ -363,9 +363,13 @@ export class SessionManager extends EventEmitter {
       // was never ours
       if (live.deliveredAt !== null && responded) live.sawResponse = true;
       // Keep the newest reply text: turn_completed carries it to the phone, and the push notification
-      // has nothing else to show (the SDK's own result text does not exist on this path)
-      for (const ev of read.events) {
-        if (ev.type === "assistant_text" && typeof ev.payload.text === "string") live.lastAssistantText = ev.payload.text;
+      // has nothing else to show (the SDK's own result text does not exist on this path). Gated on
+      // delivery exactly like sawResponse — text from before our message landed belongs to the CLI's
+      // own concurrent turn, and a reply of ours made purely of tool use would otherwise inherit it
+      if (live.deliveredAt !== null) {
+        for (const ev of read.events) {
+          if (ev.type === "assistant_text" && typeof ev.payload.text === "string") live.lastAssistantText = ev.payload.text;
+        }
       }
     }
     return { imported: read.events.length, peerMsgIds: read.peerMsgIds, responded };
