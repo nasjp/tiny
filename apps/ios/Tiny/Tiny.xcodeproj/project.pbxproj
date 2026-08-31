@@ -25,6 +25,7 @@
 		4A2E8516598B7F9A01102532 /* AppModelCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78B6867B39EF17D636C8F5BB /* AppModelCacheTests.swift */; };
 		4B07205D0B2A0B4E1049CD1A /* PushCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80681FE26187071771FA4EAE /* PushCrypto.swift */; };
 		53C1CC68EE17DBCE8FC76226 /* SharedKeychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = C99B8BFD3581663C2E62B098 /* SharedKeychain.swift */; };
+		5766720FD287084AD7B52EB1 /* ChatModelCliLiveTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CBC5CBDDD8DA60222DF484B /* ChatModelCliLiveTests.swift */; };
 		6645B8DC0ED1826521E9E90C /* TinyApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D4970D875E1B6C8649AA9AA /* TinyApp.swift */; };
 		66771653B3044625AA42E0A4 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 134AD98023026BAC41E60302 /* Models.swift */; };
 		6D6AFDE9A9D09AD637A66EC3 /* WebViewHardeningTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C54C5EF9C17B0A119A28FBDF /* WebViewHardeningTests.swift */; };
@@ -121,6 +122,7 @@
 		2320C18AEBE8F2B2829D8F78 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		27D407E3C63B230676370AD0 /* Tiny.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Tiny.entitlements; sourceTree = "<group>"; };
 		28FC16244A73C5B2A4252A1C /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingView.swift; sourceTree = "<group>"; };
+		2CBC5CBDDD8DA60222DF484B /* ChatModelCliLiveTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModelCliLiveTests.swift; sourceTree = "<group>"; };
 		2CC85AA4184A5FFC6386164F /* QuestionBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuestionBanner.swift; sourceTree = "<group>"; };
 		35B0321A3D2C90E0EE2B8F54 /* PairingViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingViewTests.swift; sourceTree = "<group>"; };
 		373982D5020C3A6D12CC1CD4 /* MarkdownText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownText.swift; sourceTree = "<group>"; };
@@ -267,6 +269,7 @@
 				3BEF3187682B03BF68431F6F /* AboutTests.swift */,
 				9909D3BB2122A05699F122A1 /* APIClientTests.swift */,
 				78B6867B39EF17D636C8F5BB /* AppModelCacheTests.swift */,
+				2CBC5CBDDD8DA60222DF484B /* ChatModelCliLiveTests.swift */,
 				7AA198CD738B8EB5109BE99C /* ChatModelOptimisticSendTests.swift */,
 				17506FCF543DB529A0491FF3 /* ChatRowWidthTests.swift */,
 				F2037EA61E2C5C7EB524D943 /* ChatViewWidthTests.swift */,
@@ -560,6 +563,7 @@
 				0DE11FD5FC88E6F54818E75E /* APIClientTests.swift in Sources */,
 				033F6BDEBDF833EE3E15526D /* AboutTests.swift in Sources */,
 				4A2E8516598B7F9A01102532 /* AppModelCacheTests.swift in Sources */,
+				5766720FD287084AD7B52EB1 /* ChatModelCliLiveTests.swift in Sources */,
 				EAC537A3AE697F065CC641F7 /* ChatModelOptimisticSendTests.swift in Sources */,
 				00E826888CF6204279911D5B /* ChatRowWidthTests.swift in Sources */,
 				B2C98EDDD6647FCC5CD7C313 /* ChatViewWidthTests.swift in Sources */,

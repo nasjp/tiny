@@ -24,6 +24,25 @@ export interface ProfileInfo {
 const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 const PROFILE_META = "tiny-profile.json";
 
+/** Metadata directory of a profile: always under profilesDir, even when configDir points elsewhere */
+function profileMetaDir(profilesDir: string, name: string): string {
+  if (!NAME_RE.test(name)) throw new Error(`invalid profile name: ${name}`);
+  const dir = path.join(profilesDir, name);
+  if (!fs.existsSync(dir)) throw new Error(`profile not found: ${name}`);
+  return dir;
+}
+
+/** External CLAUDE_CONFIG_DIR of a profile (tiny-profile.json "configDir"). null when the profile owns its directory */
+export function readProfileConfigDir(dir: string): string | null {
+  try {
+    const raw = fs.readFileSync(path.join(dir, PROFILE_META), "utf8");
+    const parsed = JSON.parse(raw) as { configDir?: unknown };
+    return typeof parsed.configDir === "string" && parsed.configDir !== "" ? parsed.configDir : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Agent kind of a profile. Existing profiles with a missing/broken tiny-profile.json are claude */
 export function readProfileAgent(dir: string): string {
   try {
@@ -35,9 +54,9 @@ export function readProfileAgent(dir: string): string {
   }
 }
 
-/** Driver for a profile (throws for an unregistered agent) */
+/** Driver for a profile (throws for an unregistered agent). tiny-profile.json lives in the metadata dir */
 export function profileDriver(profilesDir: string, name: string): AgentDriver {
-  return getDriver(readProfileAgent(profileDir(profilesDir, name)));
+  return getDriver(readProfileAgent(profileMetaDir(profilesDir, name)));
 }
 
 // What "default (follow the CLI's settings)" actually means = model/effort in the profile's
@@ -61,8 +80,10 @@ export function isProfileLoggedIn(dir: string): boolean {
 }
 
 function info(profilesDir: string, name: string): ProfileInfo {
-  const dir = path.join(profilesDir, name);
-  const agent = readProfileAgent(dir);
+  const metaDir = path.join(profilesDir, name);
+  const agent = readProfileAgent(metaDir);
+  // The agent's real CLAUDE_CONFIG_DIR. A handoff profile points at an external one (e.g. ~/.claude)
+  const dir = readProfileConfigDir(metaDir) ?? metaDir;
   const driver = findDriver(agent);
   const oauth = agent === "claude" ? readClaudeOauthAccount(dir) : null;
   const email = typeof oauth?.emailAddress === "string" ? oauth.emailAddress : null;
@@ -88,22 +109,27 @@ export function listProfiles(profilesDir: string): ProfileInfo[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function addProfile(profilesDir: string, name: string, agent = "claude"): ProfileInfo {
+export function addProfile(profilesDir: string, name: string, agent = "claude", configDir?: string): ProfileInfo {
   if (!NAME_RE.test(name)) throw new Error(`invalid profile name: ${name}`);
   const driver = getDriver(agent); // throws if unregistered
-  const dir = path.join(profilesDir, name);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, PROFILE_META), JSON.stringify({ agent }, null, 2) + "\n");
-  driver.prepareProfile?.(dir);
+  const metaDir = path.join(profilesDir, name);
+  fs.mkdirSync(metaDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(metaDir, PROFILE_META),
+    JSON.stringify({ agent, ...(configDir ? { configDir } : {}) }, null, 2) + "\n",
+  );
+  // Never scaffold into someone else's CLAUDE_CONFIG_DIR
+  if (!configDir) driver.prepareProfile?.(metaDir);
   return info(profilesDir, name);
 }
 
 /**
  * Renames the profile directory. The Keychain item (macOS token) and the DB's
  * sessions.profile must be moved separately — the CLI's `profiles rename` ties them together.
+ * Only the metadata directory moves: a configDir profile points at a directory tiny does not own.
  */
 export function renameProfile(profilesDir: string, from: string, to: string): ProfileInfo {
-  const src = profileDir(profilesDir, from); // doubles as name validation and existence check
+  const src = profileMetaDir(profilesDir, from); // metadata only — never the external configDir
   if (!NAME_RE.test(to)) throw new Error(`invalid profile name: ${to}`);
   if (from === to) throw new Error(`profile is already named ${to}`);
   const dst = path.join(profilesDir, to);
@@ -114,7 +140,10 @@ export function renameProfile(profilesDir: string, from: string, to: string): Pr
 
 export function profileDir(profilesDir: string, name: string): string {
   if (!NAME_RE.test(name)) throw new Error(`invalid profile name: ${name}`);
-  const dir = path.join(profilesDir, name);
-  if (!fs.existsSync(dir)) throw new Error(`profile not found: ${name}`);
-  return dir;
+  const metaDir = path.join(profilesDir, name);
+  if (!fs.existsSync(metaDir)) throw new Error(`profile not found: ${name}`);
+  const external = readProfileConfigDir(metaDir);
+  if (external === null) return metaDir;
+  if (!fs.existsSync(external)) throw new Error(`profile config dir not found: ${external}`);
+  return external;
 }

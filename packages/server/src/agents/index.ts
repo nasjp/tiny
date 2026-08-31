@@ -61,8 +61,11 @@ export interface AgentDriver {
   adapter: AdapterKind;
   /** Launch command when adapter is "acp" */
   launch?: AgentLaunch;
-  /** Env vars that pass the profile directory as the agent's home */
-  homeEnv(profileDir: string): Record<string, string>;
+  /**
+   * Env vars that pass the profile directory as the agent's home.
+   * A value of `undefined` means "remove this variable from the child env" (see claudeConfigDirEnv)
+   */
+  homeEnv(profileDir: string): Record<string, string | undefined>;
   /** Env vars that MUST be stripped from child processes (leaving them causes pay-per-use API billing instead of the subscription, etc.) */
   stripEnv: string[];
   isLoggedIn(profileDir: string): boolean;
@@ -110,7 +113,11 @@ export function listDrivers(): AgentDriver[] {
   return [...drivers.values()];
 }
 
-/** Env for child processes: strip stripEnv from the base, then add the home env */
+/**
+ * Env for child processes: strip stripEnv from the base, then apply the home env.
+ * A homeEnv entry whose value is `undefined` deletes the key outright, so the variable is absent
+ * from the child env even when the base (usually process.env) carries it
+ */
 export function agentEnv(
   driver: AgentDriver,
   profileDir: string,
@@ -118,5 +125,9 @@ export function agentEnv(
 ): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...base };
   for (const k of driver.stripEnv) delete env[k];
-  return { ...env, ...driver.homeEnv(profileDir) };
+  for (const [k, v] of Object.entries(driver.homeEnv(profileDir))) {
+    if (v === undefined) delete env[k];
+    else env[k] = v;
+  }
+  return env;
 }

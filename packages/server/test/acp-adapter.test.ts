@@ -36,6 +36,7 @@ function baseParams(over: Partial<RunTurnParams> = {}): { p: RunTurnParams; even
     permissionMode: "ask",
     model: null,
     effort: null,
+    tinySessionId: "tiny-oc-1",
     prompt: "hello",
     emit: (ev) => events.push(ev),
     requestPermission: async () => ({ behavior: "allow" }),

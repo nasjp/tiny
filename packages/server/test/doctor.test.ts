@@ -33,6 +33,7 @@ function deps(over: Partial<DoctorDeps> = {}): DoctorDeps {
     profiles: [profile("work", "claude", true)],
     fileExists: () => true,
     sameFile: (a, b) => a === b,
+    alwaysHandoff: false,
     ...over,
   };
 }
@@ -114,6 +115,15 @@ describe("collectDoctor", () => {
   it("agents missing from the registry do not appear (droid / gemini)", async () => {
     const r = await collectDoctor(deps());
     expect(r.checks.map((c) => c.name)).not.toContain("agent Droid");
+  });
+
+  it("reports always handoff on/off", async () => {
+    const off = await collectDoctor(deps({ alwaysHandoff: false }));
+    expect(byName(off, "always handoff").status).toBe("ok");
+    expect(byName(off, "always handoff").detail).toContain("off");
+    const on = await collectDoctor(deps({ alwaysHandoff: true }));
+    expect(byName(on, "always handoff").status).toBe("ok");
+    expect(byName(on, "always handoff").detail).toContain("on");
   });
 });
 

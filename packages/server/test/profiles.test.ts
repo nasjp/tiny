@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { addProfile, listProfiles, profileDir, renameProfile } from "../src/profiles.js";
+import { addProfile, listProfiles, profileDir, profileDriver, renameProfile } from "../src/profiles.js";
 import { EMPTY_CAPABILITIES, registerDriver } from "../src/agents/index.js";
 
 describe("profiles", () => {
@@ -96,6 +96,48 @@ describe("profiles", () => {
     expect(() => renameProfile(root, "work", "other")).toThrow(/already exists/);
     expect(() => renameProfile(root, "work", "work")).toThrow(/already named/);
     expect(fs.existsSync(path.join(root, "work"))).toBe(true);
+  });
+
+  it("resolves configDir to an external directory", () => {
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    const p = addProfile(root, "local", "claude", external);
+    expect(p.dir).toBe(external);
+    expect(profileDir(root, "local")).toBe(external);
+    // the meta file itself stays under profilesDir
+    expect(fs.existsSync(path.join(root, "local", "tiny-profile.json"))).toBe(true);
+  });
+
+  it("reads loggedIn from the external configDir, not the meta dir", () => {
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(root, "local", "claude", external);
+    expect(listProfiles(root).find((x) => x.name === "local")?.loggedIn).toBe(false);
+    fs.writeFileSync(path.join(external, ".credentials.json"), "{}");
+    expect(listProfiles(root).find((x) => x.name === "local")?.loggedIn).toBe(true);
+  });
+
+  it("throws when the external configDir is missing", () => {
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(root, "local", "claude", external);
+    fs.rmSync(external, { recursive: true, force: true });
+    expect(() => profileDir(root, "local")).toThrow(/config dir not found/);
+  });
+
+  it("renameProfile moves only the metadata dir, never the external configDir", () => {
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    fs.writeFileSync(path.join(external, "marker"), "keep me");
+    addProfile(root, "local", "claude", external);
+    renameProfile(root, "local", "local2");
+    // the user's real config dir must stay exactly where it was, with its contents
+    expect(fs.existsSync(path.join(external, "marker"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "local"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "local2", "tiny-profile.json"))).toBe(true);
+    expect(profileDir(root, "local2")).toBe(external);
+  });
+
+  it("profileDriver reads the agent from the metadata dir, not the external configDir", () => {
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(root, "oc-local", "opencode", external);
+    expect(profileDriver(root, "oc-local").id).toBe("opencode");
   });
 });
 

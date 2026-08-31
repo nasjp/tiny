@@ -97,6 +97,483 @@ describe("SessionManager", () => {
     expect(() => manager.getSession("missing")).toThrow(NotFoundError);
   });
 
+  it("adopts a CLI session idempotently and backfills the transcript", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-9.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: "ai-title", aiTitle: "From CLI" }),
+      JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "hello" } }),
+      JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "hi" }] } }),
+    ].join("\n") + "\n");
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+
+    const first = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-9" });
+    expect(first.adopted).toBe(true);
+    expect(first.session.agentSessionId).toBe("agent-9");
+    expect(first.session.title).toBe("From CLI");
+    expect(first.session.sourceCursor).toBe("a1");
+    expect(stores.events.listSince(first.session.id, 0).map((e) => e.type))
+      .toEqual(["user_message", "assistant_text"]);
+
+    // SessionStart fires again on resume: must not create a second row
+    const second = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-9" });
+    expect(second.adopted).toBe(false);
+    expect(second.session.id).toBe(first.session.id);
+    expect(stores.sessions.list().filter((s) => s.agentSessionId === "agent-9")).toHaveLength(1);
+    // and must not duplicate the events
+    expect(stores.events.listSince(first.session.id, 0)).toHaveLength(2);
+  });
+
+  it("adopts a session with no transcript yet", () => {
+    const { manager, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const r = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-x" });
+    expect(r.adopted).toBe(true);
+    expect(r.session.title).toBeNull();
+    expect(r.session.sourceCursor).toBeNull();
+  });
+
+  it("rejects adopting into a cwd that does not exist", () => {
+    const { manager, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    expect(() => manager.adoptSession({ profile: "local", cwd: "/no/such/dir", agentSessionId: "a" }))
+      .toThrow(NotFoundError);
+  });
+
+  it("syncTranscript appends only new records", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-7.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "one" } }) + "\n");
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-7" });
+    expect(stores.events.count(session.id)).toBe(1);
+
+    fs.appendFileSync(file, JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "two" }] } }) + "\n");
+    expect(manager.syncTranscript(session.id)).toBe(1);
+    expect(stores.events.count(session.id)).toBe(2);
+    // a second sync with no new records adds nothing
+    expect(manager.syncTranscript(session.id)).toBe(0);
+  });
+
+  // Tiny and the user's CLI append to the SAME transcript file, so a session that already carries
+  // natively emitted events must not import them back when the CLI hook adopts it again
+  it("seeds the cursor without importing when the session already has events", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const s = manager.createSession({ profile: "local", cwd });
+    stores.sessions.patch(s.id, { agentSessionId: "agent-1" });
+    stores.events.append(s.id, "user_message", { text: "sent from the phone" });
+    expect(stores.sessions.get(s.id)!.sourceCursor).toBeNull();
+
+    // the same exchange, as Claude Code wrote it to the transcript
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-1.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "sent from the phone" } }),
+      JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "on it" }] } }),
+    ].join("\n") + "\n");
+
+    const r = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-1" });
+    expect(r.adopted).toBe(false);
+    expect(r.session.id).toBe(s.id);
+    // nothing re-imported, and the cursor now sits at the tail so later CLI records still arrive
+    expect(stores.events.count(s.id)).toBe(1);
+    expect(r.session.sourceCursor).toBe("a1");
+
+    fs.appendFileSync(file, JSON.stringify({ type: "user", uuid: "u2", message: { role: "user", content: "from the CLI" } }) + "\n");
+    expect(manager.syncTranscript(s.id)).toBe(1);
+  });
+
+  it("advances the cursor past tiny's own turn so the next sync does not replay it", async () => {
+    let onTurn: (() => void) | null = null;
+    const writesTranscript: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        p.emit({ type: "assistant_text", payload: { text: "done" } });
+        onTurn?.();
+        return { agentSessionId: "agent-3", costUsd: null, resultText: "ok" };
+      },
+    };
+    const { manager, stores, home } = makeManager(writesTranscript);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-3.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }) + "\n");
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-3" });
+    expect(session.sourceCursor).toBe("u1");
+
+    // the SDK resumes the same session, so tiny's turn lands in the same file
+    onTurn = () => fs.appendFileSync(file, [
+      JSON.stringify({ type: "user", uuid: "u2", message: { role: "user", content: "from the phone" } }),
+      JSON.stringify({ type: "assistant", uuid: "a2", message: { content: [{ type: "text", text: "done" }] } }),
+    ].join("\n") + "\n");
+    manager.startTurn(session.id, "from the phone");
+    await manager.waitForIdle(session.id);
+
+    const count = stores.events.count(session.id);
+    expect(manager.getSession(session.id).sourceCursor).toBe("a2");
+    expect(manager.syncTranscript(session.id)).toBe(0);
+    expect(stores.events.count(session.id)).toBe(count);
+  });
+
+  // A 139MB transcript costs ~250ms and ~800MB of RSS to parse, and the events endpoint asks on
+  // every poll, so an unchanged file must cost a single stat
+  // The regression guard for C2 as a whole: nothing else in this suite crosses the
+  // adopt -> turn -> adopt boundary, which is exactly where the double import lived.
+  // Two sessions, because the three halves fire in different states: seeding needs a null cursor,
+  // the completion advance needs a non-null one, and the running guard covers the hook that fires
+  // WHILE the turn is still writing
+  it("a session that was adopted, then ran one turn, gains no duplicate events when adopted again", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    addProfile(profilesDir, "local", "claude", configDir);
+    const stores = createStores(openDb(":memory:"));
+
+    // stands in for the SDK: appends to the same transcript the CLI writes, and — because the SDK
+    // reads every settings source — trips the SessionStart hook while the turn is still running
+    let file = "";
+    let agentId = "";
+    let hook: (() => void) | null = null;
+    const sdkLike: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        fs.appendFileSync(file, JSON.stringify({ type: "user", uuid: "t-u", message: { role: "user", content: "from the phone" } }) + "\n");
+        hook?.();
+        p.emit({ type: "assistant_text", payload: { text: "done" } });
+        fs.appendFileSync(file, JSON.stringify({ type: "assistant", uuid: "t-a", message: { content: [{ type: "text", text: "done" }] } }) + "\n");
+        hook?.();
+        return { agentSessionId: agentId, costUsd: null, resultText: "ok" };
+      },
+    };
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: sdkLike },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+    });
+
+    // (1) adopted from a CLI session that already had a conversation: cursor is non-null
+    const cwdA = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    agentId = "agent-x";
+    file = path.join(configDir, "projects", cwdA.replace(/[/.]/g, "-"), "agent-x.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }) + "\n");
+    const a = manager.adoptSession({ profile: "local", cwd: cwdA, agentSessionId: "agent-x" }).session;
+    expect(a.sourceCursor).toBe("u1");
+    hook = () => manager.adoptSession({ profile: "local", cwd: cwdA, agentSessionId: "agent-x" });
+    manager.startTurn(a.id, "from the phone");
+    await manager.waitForIdle(a.id);
+    manager.adoptSession({ profile: "local", cwd: cwdA, agentSessionId: "agent-x" });
+    // the CLI's line, then the turn — each exactly once. Counting only across the final adopt would
+    // miss the hook that fired mid-turn, whose duplicates are already in the log by then
+    expect(stores.events.listSince(a.id, 0).map((e) => [e.type, (e.payload as { text?: string }).text]))
+      .toEqual([
+        ["user_message", "from the CLI"],
+        ["user_message", "from the phone"],
+        ["assistant_text", "done"],
+      ]);
+
+    // (2) the same round trip for a session tiny created itself: no transcript at adopt time,
+    // so the cursor is still null when the turn ends
+    const cwdB = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    agentId = "agent-y";
+    file = path.join(configDir, "projects", cwdB.replace(/[/.]/g, "-"), "agent-y.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "");
+    const b = manager.createSession({ profile: "local", cwd: cwdB });
+    stores.sessions.patch(b.id, { agentSessionId: "agent-y" });
+    expect(manager.getSession(b.id).sourceCursor).toBeNull();
+    hook = () => manager.adoptSession({ profile: "local", cwd: cwdB, agentSessionId: "agent-y" });
+    manager.startTurn(b.id, "from the phone");
+    await manager.waitForIdle(b.id);
+    manager.adoptSession({ profile: "local", cwd: cwdB, agentSessionId: "agent-y" });
+    expect(stores.events.listSince(b.id, 0).map((e) => [e.type, (e.payload as { text?: string }).text]))
+      .toEqual([
+        ["user_message", "from the phone"],
+        ["assistant_text", "done"],
+      ]);
+  });
+
+  // Interrupting is a normal action with a button in the app. At that moment the transcript already
+  // holds the prompt and a partial response, both of which tiny emitted natively as the turn ran
+  it("advances the cursor even when the turn fails or is interrupted", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    addProfile(profilesDir, "local", "claude", configDir);
+    const stores = createStores(openDb(":memory:"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-f.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }) + "\n");
+
+    // writes the prompt and a partial answer, then throws — what an interrupt looks like from here
+    const throwing: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        fs.appendFileSync(file, [
+          JSON.stringify({ type: "user", uuid: "t-u", message: { role: "user", content: "from the phone" } }),
+          JSON.stringify({ type: "assistant", uuid: "t-a", message: { content: [{ type: "text", text: "half an" }] } }),
+        ].join("\n") + "\n");
+        p.emit({ type: "assistant_text", payload: { text: "half an" } });
+        throw new Error("interrupted");
+      },
+    };
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: throwing },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+    });
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-f" });
+    expect(session.sourceCursor).toBe("u1");
+
+    manager.startTurn(session.id, "from the phone");
+    await manager.waitForIdle(session.id);
+    expect(manager.getSession(session.id).status).toBe("idle");
+    expect(manager.getSession(session.id).sourceCursor).toBe("t-a");
+
+    const count = stores.events.count(session.id);
+    expect(manager.syncTranscript(session.id)).toBe(0);
+    expect(stores.events.count(session.id)).toBe(count);
+  });
+
+  // Only the path that actually imports events may record a stat. If advanceCursor recorded one it
+  // would mark the file "consumed" after reading nothing but the tail uuid, and the next real sync
+  // would skip it — silently dropping genuine appended conversation
+  // The stat is captured before the read on purpose, so an append landing mid-read is picked up
+  // next time. But committing it when the read produced no cursor advances the stat while the
+  // cursor stands still, and those records are then never imported
+  it("a read that yields no cursor does not poison the stat cache", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-n.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+
+    // a conversation record, and a bookkeeping line padded to its exact byte length. The first
+    // state carries no message records at all, so the read comes back with no cursor
+    const real = JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } });
+    let filler = "";
+    for (let pad = 0; filler.length !== real.length; pad++) {
+      filler = JSON.stringify({ type: "mode", pad: "x".repeat(pad) });
+      if (filler.length > real.length) throw new Error("cannot pad to the same length");
+    }
+    const t = new Date(1_700_000_000_000);
+    fs.writeFileSync(file, filler + "\n");
+    fs.utimesSync(file, t, t);
+
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-n" });
+    expect(stores.events.count(session.id)).toBe(0);
+    expect(session.sourceCursor).toBeNull();
+
+    // the real record lands in a file of identical size and mtime: only a stat committed by that
+    // cursorless read could make this one skip
+    fs.writeFileSync(file, real + "\n");
+    fs.utimesSync(file, t, t);
+    expect(manager.syncTranscript(session.id)).toBe(1);
+    expect(manager.getSession(session.id).sourceCursor).toBe("u1");
+  });
+
+  it("advanceCursor does not mark the transcript as read", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    addProfile(profilesDir, "local", "claude", configDir);
+    const stores = createStores(openDb(":memory:"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-c.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+
+    // a record the CLI adds later, and a bookkeeping line padded to its exact byte length, so the
+    // two file states are indistinguishable by size — only the recorded stat decides
+    const later = JSON.stringify({ type: "user", uuid: "c1", message: { role: "user", content: "from the CLI, later" } });
+    let filler = "";
+    for (let pad = 0; filler.length !== later.length; pad++) {
+      filler = JSON.stringify({ type: "mode", pad: "x".repeat(pad) });
+      if (filler.length > later.length) throw new Error("cannot pad to the same length");
+    }
+    const t = new Date(1_700_000_000_000);
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }) + "\n");
+
+    const writesThenStamps: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        p.emit({ type: "assistant_text", payload: { text: "done" } });
+        fs.appendFileSync(file, [
+          JSON.stringify({ type: "user", uuid: "t-u", message: { role: "user", content: "from the phone" } }),
+          JSON.stringify({ type: "assistant", uuid: "t-a", message: { content: [{ type: "text", text: "done" }] } }),
+          filler,
+        ].join("\n") + "\n");
+        // fixed timestamp, so the stat advanceCursor sees and the one after the swap agree exactly
+        fs.utimesSync(file, t, t);
+        return { agentSessionId: "agent-c", costUsd: null, resultText: "ok" };
+      },
+    };
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: writesThenStamps },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+    });
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-c" });
+    manager.startTurn(session.id, "from the phone");
+    await manager.waitForIdle(session.id);
+    expect(manager.getSession(session.id).sourceCursor).toBe("t-a");
+
+    // the CLI's next line lands in a file of identical size and mtime
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }),
+      JSON.stringify({ type: "user", uuid: "t-u", message: { role: "user", content: "from the phone" } }),
+      JSON.stringify({ type: "assistant", uuid: "t-a", message: { content: [{ type: "text", text: "done" }] } }),
+      later,
+    ].join("\n") + "\n");
+    fs.utimesSync(file, t, t);
+
+    // only the import path may have recorded a stat, so this must still be read
+    expect(manager.syncTranscript(session.id)).toBe(1);
+    expect(stores.events.listSince(session.id, 0).at(-1)!.payload).toEqual({ text: "from the CLI, later" });
+  });
+
+  it("syncTranscript does not re-read a transcript whose path, size and mtime are unchanged", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-8.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+
+    const first = JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "one" } });
+    // an assistant record the second write smuggles in, and a bookkeeping record padded to its exact
+    // byte length: only a re-read of the file could tell the two versions apart
+    const later = JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "two" }] } });
+    let filler = "";
+    for (let pad = 0; filler.length !== later.length; pad++) {
+      filler = JSON.stringify({ type: "mode", pad: "x".repeat(pad) });
+      if (filler.length > later.length) throw new Error("cannot pad to the same length");
+    }
+    // one fixed timestamp for both writes, so the two stats agree to the nanosecond
+    const t = new Date(1_700_000_000_000);
+    fs.writeFileSync(file, `${first}\n${filler}\n`);
+    fs.utimesSync(file, t, t);
+
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-8" });
+    expect(stores.events.count(session.id)).toBe(1);
+    expect(manager.getSession(session.id).sourceCursor).toBe("u1");
+
+    fs.writeFileSync(file, `${first}\n${later}\n`);
+    fs.utimesSync(file, t, t);
+    expect(manager.syncTranscript(session.id)).toBe(0);
+    expect(stores.events.count(session.id)).toBe(1);
+
+    // a real append changes the size, so it is read — and brings the smuggled record along
+    fs.appendFileSync(file, JSON.stringify({ type: "user", uuid: "u2", message: { role: "user", content: "three" } }) + "\n");
+    expect(manager.syncTranscript(session.id)).toBe(2);
+  });
+
+  it("syncTranscript is a no-op for a non-claude agent", () => {
+    const { manager, stores } = makeManager(okAdapter);
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    // makeManager creates an opencode profile named "oc"
+    const s = manager.createSession({ profile: "oc", cwd });
+    stores.sessions.patch(s.id, { agentSessionId: "agent-oc" });
+    expect(manager.syncTranscript(s.id)).toBe(0);
+  });
+
+  it("syncTranscript returns 0 when the profile's config dir has gone away", () => {
+    const { manager, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "vanishing-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "gone", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "gone", cwd, agentSessionId: "agent-gone" });
+    // the user moved or deleted their CLAUDE_CONFIG_DIR after adoption
+    fs.rmSync(configDir, { recursive: true, force: true });
+    expect(() => manager.syncTranscript(session.id)).not.toThrow();
+    expect(manager.syncTranscript(session.id)).toBe(0);
+  });
+
+  it("discardIfEmpty imports the transcript before judging the session empty", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-late.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+
+    // SessionStart fires before the user has typed anything: the transcript is still empty
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-late" });
+    expect(stores.events.count(session.id)).toBe(0);
+    expect(manager.getSession(session.id).title).toBeNull();
+
+    // the turn runs and the CLI writes it out; nothing has asked tiny to sync
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "what does this repo do" } }),
+      JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "it drives agents" }] } }),
+    ].join("\n") + "\n");
+
+    // SessionEnd must not throw away a session that held a real exchange
+    expect(manager.discardIfEmpty("agent-late")).toBe(false);
+    expect(stores.sessions.get(session.id)).not.toBeNull();
+    expect(stores.events.listSince(session.id, 0).map((e) => e.type))
+      .toEqual(["user_message", "assistant_text"]);
+    // the title fallback rides along with the import
+    expect(manager.getSession(session.id).title).toBe("what does this repo do");
+  });
+
+  it("discardIfEmpty keeps a session whose import was skipped because it is running", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-busy.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-busy" });
+    fs.writeFileSync(file, JSON.stringify({
+      type: "user", uuid: "u1", message: { role: "user", content: "mid-turn" },
+    }) + "\n");
+    stores.sessions.patch(session.id, { status: "running" });
+
+    // syncTranscript declines to import mid-turn; deleting on the strength of a look we did not
+    // take would be the same bug in a new place
+    expect(manager.discardIfEmpty("agent-busy")).toBe(false);
+    expect(stores.sessions.get(session.id)).not.toBeNull();
+  });
+
+  it("discardIfEmpty removes a session with no events and keeps one with events", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-empty" });
+    expect(stores.events.count(session.id)).toBe(0);
+    expect(manager.discardIfEmpty("agent-empty")).toBe(true);
+    expect(stores.sessions.get(session.id)).toBeNull();
+    // unknown id is a no-op
+    expect(manager.discardIfEmpty("agent-empty")).toBe(false);
+  });
+
   it("on startTurn completion: agentSessionId, title, back to idle, and events persisted", async () => {
     const { manager, stores } = makeManager(okAdapter);
     const s = manager.createSession({ profile: "work", cwd });
@@ -155,6 +632,50 @@ describe("SessionManager", () => {
     expect(() => manager.startTurn(s.id, "c")).toThrow(ConflictError);
     manager.setDetached(s.id, false);
     expect(manager.getSession(s.id).status).toBe("idle");
+  });
+
+  it("refuses a turn while the agent's own CLI has the session open", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    addProfile(profilesDir, "work");
+    const stores = createStores(openDb(":memory:"));
+    let live: boolean | null = true;
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: okAdapter },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+      isCliLive: () => live,
+    });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const s = manager.createSession({ profile: "work", cwd });
+
+    expect(() => manager.startTurn(s.id, "hi")).toThrow(ConflictError);
+
+    // once the CLI is gone, sending works again
+    live = false;
+    expect(() => manager.startTurn(s.id, "hi")).not.toThrow();
+    await manager.waitForIdle(s.id);
+  });
+
+  it("allows a turn when liveness cannot be determined", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    addProfile(profilesDir, "work");
+    const stores = createStores(openDb(":memory:"));
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: okAdapter },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+      isCliLive: () => null,
+    });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const s = manager.createSession({ profile: "work", cwd });
+    expect(() => manager.startTurn(s.id, "hi")).not.toThrow();
+    await manager.waitForIdle(s.id);
   });
 
   it("emits turn_failed and returns to idle when the adapter throws", async () => {

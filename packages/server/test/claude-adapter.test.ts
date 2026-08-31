@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { ClaudeAdapter } from "../src/claude-adapter.js";
 import type { RunTurnParams, TurnEventInput } from "../src/adapter.js";
 import { assertTurnEventInvariants } from "./adapter-contract.js";
@@ -30,6 +33,7 @@ function baseParams(over: Partial<RunTurnParams> = {}): { p: RunTurnParams; even
     profileDir: "/tmp/profiles/work",
     cwd: "/tmp/repo",
     permissionMode: "default", model: null, effort: null,
+    tinySessionId: "tiny-session-1",
     prompt: "hello",
     emit: (ev) => events.push(ev),
     requestPermission: async () => ({ behavior: "allow" }),
@@ -89,11 +93,39 @@ describe("ClaudeAdapter", () => {
       await adapter.runTurn(p);
       expect(capture.options.env.CLAUDE_CONFIG_DIR).toBe("/tmp/profiles/work");
       expect(capture.options.env.ANTHROPIC_API_KEY).toBeUndefined();
+      // Hooks in the user's own settings.json run inside this agent and inherit its env.
+      // `tiny handoff` reads this to recognize it is inside an agent tiny started
+      expect(capture.options.env.TINY_SESSION_ID).toBe("tiny-session-1");
       expect(capture.options.resume).toBe("prev-sess");
       expect(capture.options.cwd).toBe("/tmp/repo");
       expect(capture.options.permissionMode).toBe("default");
     } finally {
       delete process.env.ANTHROPIC_API_KEY;
+    }
+  });
+
+  // Claude Code reads ~/.claude.json when CLAUDE_CONFIG_DIR is unset, but $X/.claude.json when it is
+  // set to $X. Setting it to the default data directory therefore breaks every turn of an adopted
+  // (`tiny handoff`) session, whose profile points at exactly that directory
+  it("omits CLAUDE_CONFIG_DIR entirely when the profile dir is Claude Code's default config dir", async () => {
+    const prevHome = process.env.HOME;
+    const prevCfg = process.env.CLAUDE_CONFIG_DIR;
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tiny-home-")));
+    process.env.HOME = home;
+    process.env.CLAUDE_CONFIG_DIR = "/srv/stale";
+    try {
+      const capture: any = {};
+      const adapter = new ClaudeAdapter(fakeQuery([INIT, RESULT], capture) as any);
+      const { p } = baseParams({ profileDir: path.join(home, ".claude") });
+      await adapter.runTurn(p);
+      // present-and-undefined or the string "undefined" would both break the child
+      expect(Object.hasOwn(capture.options.env, "CLAUDE_CONFIG_DIR")).toBe(false);
+      expect(capture.options.env.TINY_SESSION_ID).toBe("tiny-session-1");
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevCfg === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prevCfg;
     }
   });
 

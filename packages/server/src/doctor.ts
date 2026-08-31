@@ -39,6 +39,8 @@ export interface DoctorDeps {
   fileExists: (p: string) => boolean;
   /** Whether two paths are the same file (realpath comparison; string comparison in tests) */
   sameFile: (a: string, b: string) => boolean;
+  /** Whether `tiny live` is on (the SessionStart/SessionEnd hooks are installed in the agent's settings.json) */
+  alwaysHandoff: boolean;
 }
 
 export const MIN_NODE_MAJOR = 22;
@@ -91,6 +93,13 @@ function checkPush(d: DoctorDeps): DoctorCheck {
   return { status: "ok", name, detail: `relay ${d.settings.relayUrl}` };
 }
 
+function checkAlwaysHandoff(d: DoctorDeps): DoctorCheck {
+  const name = "always handoff";
+  return d.alwaysHandoff
+    ? { status: "ok", name, detail: "on (every new session is handed to tiny automatically)" }
+    : { status: "ok", name, detail: "off (manual `tiny handoff` only; enable with tiny live on)" };
+}
+
 function checkAgent(d: DoctorDeps, driver: AgentDriver): DoctorCheck {
   const name = `agent ${driver.label}`;
   const bin = d.findOnPath(driver.bin);
@@ -122,6 +131,7 @@ export async function collectDoctor(d: DoctorDeps): Promise<DoctorReport> {
   checks.push(await checkDaemonRunning(d));
   checks.push(checkServerUrl(d));
   checks.push(checkPush(d));
+  checks.push(checkAlwaysHandoff(d));
   const agentChecks = d.drivers.map((drv) => checkAgent(d, drv));
   const installedCount = d.drivers.filter((drv) => d.findOnPath(drv.bin) !== null).length;
   checks.push(

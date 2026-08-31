@@ -1,0 +1,301 @@
+import { beforeEach, describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { findTranscript, readTranscript, readTranscriptCursor } from "../src/claude-transcript.js";
+
+const SID = "3424c289-0fc1-4ec3-a0ca-3e5f324839fa";
+
+function writeJsonl(file: string, records: Array<Record<string, unknown>>): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+}
+
+function sample(): Array<Record<string, unknown>> {
+  return [
+    { type: "last-prompt", leafUuid: "u2", sessionId: SID },
+    { type: "ai-title", aiTitle: "Handoff design", sessionId: SID },
+    {
+      type: "user", uuid: "u1", parentUuid: null, timestamp: "2026-08-31T03:25:11.588Z",
+      message: { role: "user", content: "hello there" },
+    },
+    {
+      type: "assistant", uuid: "a1", parentUuid: "u1", timestamp: "2026-08-31T03:25:26.265Z",
+      message: {
+        model: "claude-opus-5",
+        content: [
+          { type: "text", text: "hi back" },
+          { type: "tool_use", id: "t1", name: "Read", input: { file_path: "/tmp/x" } },
+        ],
+      },
+    },
+    {
+      type: "user", uuid: "u2", parentUuid: "a1", timestamp: "2026-08-31T03:25:30.000Z",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", is_error: false }] },
+    },
+  ];
+}
+
+describe("claude-transcript", () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-tr-"));
+  });
+
+  it("finds the transcript by encoded cwd", () => {
+    const cwd = "/srv/a/ghq/github.com/x";
+    const file = path.join(root, "projects", "-srv-a-ghq-github-com-x", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    expect(findTranscript(root, cwd, SID)).toBe(file);
+  });
+
+  it("falls back to scanning projects/ when the encoding does not match", () => {
+    const file = path.join(root, "projects", "some-other-name", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    expect(findTranscript(root, "/srv/a/whatever", SID)).toBe(file);
+  });
+
+  it("returns null when there is no transcript", () => {
+    expect(findTranscript(root, "/srv/a/x", SID)).toBeNull();
+  });
+
+  it("converts user, assistant text and tool records into events", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    const r = readTranscript(file);
+    expect(r.title).toBe("Handoff design");
+    expect(r.cursor).toBe("u2");
+    expect(r.events.map((e) => e.type)).toEqual([
+      "user_message", "assistant_text", "tool_started", "tool_finished",
+    ]);
+    expect(r.events[0]!.payload.text).toBe("hello there");
+    expect(r.events[1]!.payload.text).toBe("hi back");
+    expect(r.events[2]!.payload.toolName).toBe("Read");
+    expect(r.events[2]!.payload.kind).toBe("read");
+    expect(r.events[2]!.payload.summary).toBe("x");
+    expect(r.events[3]!.payload.toolUseId).toBe("t1");
+  });
+
+  it("reads only records after sinceUuid", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    const r = readTranscript(file, { sinceUuid: "a1" });
+    expect(r.events.map((e) => e.type)).toEqual(["tool_finished"]);
+    expect(r.cursor).toBe("u2");
+  });
+
+  it("keeps only the last `turns` human turns on a first read", () => {
+    const many: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < 10; i++) {
+      many.push({ type: "user", uuid: `u${i}`, message: { role: "user", content: `m${i}` } });
+    }
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, many);
+    const r = readTranscript(file, { turns: 3 });
+    expect(r.events).toHaveLength(3);
+    expect(r.events[0]!.payload.text).toBe("m7");
+    expect(r.cursor).toBe("u9");
+  });
+
+  // The point of a backfill is the conversation. Slicing by record count on a real transcript
+  // yields almost nothing but tool traffic, so slice by what the person actually said
+  it("counts human turns, not records, so tool traffic cannot crowd out the conversation", () => {
+    const records: Array<Record<string, unknown>> = [];
+    for (let turn = 0; turn < 4; turn++) {
+      records.push({ type: "user", uuid: `u${turn}`, message: { role: "user", content: `ask ${turn}` } });
+      // each turn drags along a pile of tool traffic
+      for (let k = 0; k < 20; k++) {
+        records.push({
+          type: "assistant", uuid: `a${turn}-${k}`,
+          message: { content: [{ type: "tool_use", id: `t${turn}-${k}`, name: "Read", input: { file_path: "/srv/x" } }] },
+        });
+        records.push({
+          type: "user", uuid: `r${turn}-${k}`,
+          message: { role: "user", content: [{ type: "tool_result", tool_use_id: `t${turn}-${k}`, is_error: false }] },
+        });
+      }
+    }
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, records);
+    const r = readTranscript(file, { turns: 2 });
+    const said = r.events.filter((e) => e.type === "user_message").map((e) => e.payload.text);
+    expect(said).toEqual(["ask 2", "ask 3"]);
+  });
+
+  // Every real transcript carries 1-9 isMeta records: Claude Code's own interjections, not anything
+  // a person typed. They must not count as turns, and must not reach the client as user messages
+  it("drops isMeta records and keeps the real ones around them", () => {
+    const records: Array<Record<string, unknown>> = [];
+    records.push({ type: "user", uuid: "u0", message: { role: "user", content: "the real question" } });
+    for (let k = 0; k < 3; k++) {
+      records.push({ type: "user", uuid: `m${k}`, isMeta: true, message: { role: "user", content: `<meta ${k}>` } });
+    }
+    records.push({ type: "assistant", uuid: "a0", message: { content: [{ type: "text", text: "the real answer" }] } });
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, records);
+    const r = readTranscript(file, { turns: 2 });
+    expect(r.events.map((e) => e.payload.text)).toEqual(["the real question", "the real answer"]);
+    // and the cursor still covers them, so the next read does not offer them again
+    expect(r.cursor).toBe("a0");
+  });
+
+  it("does not take a title from an isMeta record", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      { type: "user", uuid: "m0", isMeta: true, message: { role: "user", content: "Caveat: generated while running local commands" } },
+      { type: "user", uuid: "u0", message: { role: "user", content: "what the person asked" } },
+    ]);
+    expect(readTranscript(file).title).toBe("what the person asked");
+  });
+
+  // The Nth turn is included, not cut away: starting after it strands a tool_finished whose
+  // tool_started was never imported
+  it("includes the record that starts the oldest kept turn", () => {
+    const records: Array<Record<string, unknown>> = [];
+    for (let turn = 0; turn < 3; turn++) {
+      records.push({ type: "user", uuid: `u${turn}`, message: { role: "user", content: `ask ${turn}` } });
+      records.push({
+        type: "assistant", uuid: `a${turn}`,
+        message: { content: [{ type: "tool_use", id: `t${turn}`, name: "Read", input: { file_path: "/srv/x" } }] },
+      });
+      records.push({
+        type: "user", uuid: `r${turn}`,
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: `t${turn}`, is_error: false }] },
+      });
+    }
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, records);
+    const r = readTranscript(file, { turns: 2 });
+    // starts at "ask 1" — and every tool_finished it contains has its tool_started ahead of it
+    expect(r.events.map((e) => e.type)).toEqual([
+      "user_message", "tool_started", "tool_finished",
+      "user_message", "tool_started", "tool_finished",
+    ]);
+    expect(r.events[0]!.payload.text).toBe("ask 1");
+  });
+
+  it("caps a first read at maxRecords, keeping the newest", () => {
+    const records: Array<Record<string, unknown>> = [];
+    records.push({ type: "user", uuid: "u0", message: { role: "user", content: "ask" } });
+    for (let k = 0; k < 50; k++) {
+      records.push({
+        type: "assistant", uuid: `a${k}`,
+        message: { content: [{ type: "text", text: `t${k}` }] },
+      });
+    }
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, records);
+    const r = readTranscript(file, { turns: 10, maxRecords: 5 });
+    expect(r.events.map((e) => e.payload.text)).toEqual(["t45", "t46", "t47", "t48", "t49"]);
+    expect(r.cursor).toBe("a49");
+  });
+
+  it("takes the whole conversation when it has fewer turns than asked for", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    const r = readTranscript(file, { turns: 10 });
+    expect(r.events.map((e) => e.type)).toEqual([
+      "user_message", "assistant_text", "tool_started", "tool_finished",
+    ]);
+  });
+
+  it("readTranscriptCursor returns the tail without producing events", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    expect(readTranscriptCursor(file)).toBe("u2");
+    expect(readTranscriptCursor(path.join(root, "no-such.jsonl"))).toBeNull();
+  });
+
+  it("survives malformed lines and unknown record types", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      "{not json",
+      JSON.stringify({ type: "atis-latch", sessionId: SID }),
+      JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "ok" } }),
+      "",
+    ].join("\n"));
+    const r = readTranscript(file);
+    expect(r.events.map((e) => e.type)).toEqual(["user_message"]);
+  });
+
+  it("falls back to the first user message when there is no ai-title", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      { type: "user", uuid: "u1", message: { role: "user", content: "a".repeat(100) } },
+    ]);
+    expect(readTranscript(file).title).toHaveLength(60);
+  });
+
+  it("classifies tool calls the same way the live adapter does", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      {
+        type: "assistant", uuid: "a1",
+        message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { description: "run the tests" } }] },
+      },
+    ]);
+    const ev = readTranscript(file).events[0]!;
+    expect(ev.type).toBe("tool_started");
+    expect(ev.payload.kind).toBe("execute");
+    expect(ev.payload.summary).toBe("run the tests");
+  });
+
+  it("imports nothing when sinceUuid is no longer in the transcript", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, sample());
+    // a cursor from a transcript that was forked or rotated away
+    const r = readTranscript(file, { sinceUuid: "gone-forever" });
+    expect(r.events).toEqual([]);
+    // the cursor still advances so the next sync resumes correctly
+    expect(r.cursor).toBe("u2");
+  });
+
+  it("emits one tool_finished per tool_result in a user record", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      {
+        type: "user", uuid: "u1",
+        message: {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "t1", is_error: false },
+            { type: "tool_result", tool_use_id: "t2", is_error: true },
+          ],
+        },
+      },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events.map((e) => e.type)).toEqual(["tool_finished", "tool_finished"]);
+    expect(r.events[0]!.payload.toolUseId).toBe("t1");
+    expect(r.events[0]!.payload.isError).toBe(false);
+    expect(r.events[1]!.payload.toolUseId).toBe("t2");
+    expect(r.events[1]!.payload.isError).toBe(true);
+  });
+
+  it("skips empty assistant text blocks", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      {
+        type: "assistant", uuid: "a1",
+        message: { content: [{ type: "text", text: "" }, { type: "text", text: "real" }] },
+      },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0]!.payload.text).toBe("real");
+  });
+
+  it("returns nothing for a transcript of only bookkeeping records", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      { type: "mode", mode: "normal", sessionId: SID },
+      { type: "permission-mode", permissionMode: "default", sessionId: SID },
+      { type: "file-history-snapshot", sessionId: SID },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events).toEqual([]);
+    expect(r.title).toBeNull();
+    expect(r.cursor).toBeNull();
+  });
+});

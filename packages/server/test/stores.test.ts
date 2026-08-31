@@ -20,6 +20,7 @@ function fixture(over: Partial<SessionRecord> = {}): SessionRecord {
     title: null,
     status: "idle",
     archivedAt: null,
+    sourceCursor: null,
     createdAt: now,
     updatedAt: now,
     ...over,
@@ -128,6 +129,41 @@ describe("stores", () => {
     expect(s.pairings.take("CODE1")).toBe(false);
     s.pairings.put("OLD", new Date(Date.now() - 1000).toISOString());
     expect(s.pairings.take("OLD")).toBe(false);
+  });
+
+  it("finds a session by agentSessionId and deletes it", () => {
+    const rec = {
+      id: "s1", agentSessionId: "agent-1", agent: "claude", profile: "work",
+      cwd: "/tmp", permissionMode: "default", model: null, effort: null, title: null,
+      status: "idle" as const, archivedAt: null, sourceCursor: null,
+      createdAt: "2026-08-31T00:00:00.000Z", updatedAt: "2026-08-31T00:00:00.000Z",
+    };
+    s.sessions.create(rec);
+    expect(s.sessions.byAgentSessionId("agent-1")?.id).toBe("s1");
+    expect(s.sessions.byAgentSessionId("nope")).toBeNull();
+    expect(s.sessions.delete("s1")).toBe(true);
+    expect(s.sessions.delete("s1")).toBe(false);
+    expect(s.sessions.get("s1")).toBeNull();
+  });
+
+  it("round-trips sourceCursor through create and patch", () => {
+    const rec = {
+      id: "s2", agentSessionId: null, agent: "claude", profile: "work",
+      cwd: "/tmp", permissionMode: "default", model: null, effort: null, title: null,
+      status: "idle" as const, archivedAt: null, sourceCursor: null,
+      createdAt: "2026-08-31T00:00:00.000Z", updatedAt: "2026-08-31T00:00:00.000Z",
+    };
+    s.sessions.create(rec);
+    expect(s.sessions.get("s2")?.sourceCursor).toBeNull();
+    s.sessions.patch("s2", { sourceCursor: "uuid-9" });
+    expect(s.sessions.get("s2")?.sourceCursor).toBe("uuid-9");
+  });
+
+  it("counts events per session", () => {
+    expect(s.events.count("s3")).toBe(0);
+    s.events.append("s3", "user_message", { text: "hi" });
+    s.events.append("s3", "assistant_text", { text: "yo" });
+    expect(s.events.count("s3")).toBe(2);
   });
 });
 

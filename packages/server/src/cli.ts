@@ -10,12 +10,14 @@ import { tinyPaths } from "./config.js";
 import { installDaemon, readInstalledDaemon, uninstallDaemon } from "./daemon.js";
 import { collectDoctor, formatDoctorReport } from "./doctor.js";
 import { openDb } from "./db.js";
-import { tinyEntry } from "./entry.js";
+import { tinyEntry, tinyLaunch } from "./entry.js";
+import { buildHookCommand, readLiveMode, setLiveMode } from "./claude-hooks.js";
 import { detectTailscaleIp } from "./tailscale.js";
 import { findOnPath } from "./which.js";
 import { migrateClaudeCredential, type KeychainMigration } from "./keychain.js";
 import { addProfile, listProfiles, profileDir, profileDriver, renameProfile, type ProfileInfo } from "./profiles.js";
 import { agentEnv, getDriver, listDrivers } from "./agents/index.js";
+import { defaultClaudeConfigDir } from "./agents/claude.js";
 import { runSetup } from "./setup.js";
 import { TINY_VERSION } from "./version.js";
 import { createStores } from "./stores.js";
@@ -42,6 +44,93 @@ export function buildAttachCommand(session: SessionRecord, profilesDir: string):
     cwd: session.cwd,
     env: agentEnv(driver, path.join(profilesDir, session.profile)),
   };
+}
+
+export interface HandoffInput {
+  /** Session id of the Claude Code process that invoked us. null when not run inside one */
+  agentSessionId: string | null;
+  /** CLAUDE_CONFIG_DIR the caller is running under */
+  configDir: string;
+}
+
+/**
+ * Where `tiny handoff` gets its inputs. CLAUDE_CODE_SESSION_ID is an official variable:
+ * the changelog documents it as matching the session_id passed to hooks.
+ */
+export function resolveHandoffInput(env: Record<string, string | undefined>): HandoffInput {
+  const sid = env.CLAUDE_CODE_SESSION_ID;
+  const dir = env.CLAUDE_CONFIG_DIR;
+  return {
+    agentSessionId: typeof sid === "string" && sid !== "" ? sid : null,
+    // An empty env var means "not set" here, same as for the session id above
+    configDir: typeof dir === "string" && dir !== "" ? dir : defaultClaudeConfigDir(),
+  };
+}
+
+/**
+ * Whether we are running inside an agent tiny itself spawned. TINY_SESSION_ID is only ever set in
+ * the environment tiny gives those agents, and there is nothing there to hand off: the session is
+ * already tiny's. The Agent SDK reads every settings source, so with `tiny live on` the
+ * SessionStart hook does fire in there, once per turn.
+ */
+export function isInsideTinyAgent(env: Record<string, string | undefined>): boolean {
+  const id = env.TINY_SESSION_ID;
+  return typeof id === "string" && id !== "";
+}
+
+/**
+ * Pull session_id out of the JSON object Claude Code writes to a hook's stdin.
+ * A fallback for CLAUDE_CODE_SESSION_ID: the whole always-on mode rests on that one variable.
+ */
+export function parseHookSessionId(raw: string): string | null {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return null; // not a hook invocation, or a truncated payload
+  }
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  const id = (payload as { session_id?: unknown }).session_id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/**
+ * Read stdin, giving up after `timeoutMs`. A hook payload arrives immediately; a human running
+ * `tiny handoff` in a terminal must never be left waiting on input they do not know to give.
+ */
+async function readStdinBriefly(timeoutMs = 300): Promise<string> {
+  if (process.stdin.isTTY) return "";
+  return await new Promise<string>((resolve) => {
+    let buf = "";
+    const finish = (): void => {
+      clearTimeout(timer);
+      process.stdin.off("data", onData);
+      process.stdin.off("end", finish);
+      process.stdin.off("error", finish);
+      process.stdin.pause();
+      resolve(buf);
+    };
+    const onData = (chunk: Buffer): void => {
+      buf += chunk.toString("utf8");
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    process.stdin.on("data", onData).on("end", finish).on("error", finish);
+  });
+}
+
+/** Find (or create) the profile that points at this CLAUDE_CONFIG_DIR. Returns its name */
+export function ensureHandoffProfile(profilesDir: string, configDir: string, name = "local"): string {
+  for (const p of listProfiles(profilesDir)) {
+    if (p.dir === configDir) return p.name;
+  }
+  let candidate = name;
+  let n = 1;
+  while (fs.existsSync(path.join(profilesDir, candidate))) {
+    n += 1;
+    candidate = `${name}-${n}`;
+  }
+  addProfile(profilesDir, candidate, "claude", configDir);
+  return candidate;
 }
 
 export function resolveSessionId(sessions: SessionRecord[], prefix: string): string {
@@ -264,6 +353,75 @@ program
     }
   });
 
+program
+  .command("handoff")
+  .description("hand the Claude Code session you are in over to tiny (the reverse of `tiny attach`)")
+  .option("--auto", "hook mode: never fail the caller (always exits 0)")
+  .option("--ended", "session ended: drop it if it never got a single event")
+  .option("--profile <name>", "profile to adopt into (default: the one pointing at CLAUDE_CONFIG_DIR)")
+  .option("--session <id>", "agent session id (default: $CLAUDE_CODE_SESSION_ID)")
+  .option("--config-dir <dir>", "CLAUDE_CONFIG_DIR to adopt from (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
+  .action(async (opts: {
+    auto?: boolean; ended?: boolean; profile?: string; session?: string; configDir?: string;
+  }) => {
+    // `tiny live on` installs the hook for a config dir the SDK also reads, so this runs inside
+    // tiny's own agents too — where the session is already tiny's and adopting it would add a ghost row
+    if (isInsideTinyAgent(process.env)) {
+      if (!opts.auto) console.log("Already inside a tiny session (TINY_SESSION_ID is set) — nothing to hand off.");
+      return;
+    }
+    try {
+      const env = resolveHandoffInput(process.env);
+      const configDir = opts.configDir ?? env.configDir;
+      // In hook mode the payload on stdin carries session_id too, so a Claude Code that stops
+      // exporting CLAUDE_CODE_SESSION_ID does not take always-on mode down with it
+      const agentSessionId = opts.session ?? env.agentSessionId
+        ?? (opts.auto ? parseHookSessionId(await readStdinBriefly()) : null);
+      if (!agentSessionId) {
+        throw new Error("no session id (run this inside Claude Code, or pass --session <id>)");
+      }
+      if (opts.ended) {
+        const r = (await api("/v1/sessions/discard-empty", {
+          method: "POST",
+          body: JSON.stringify({ agentSessionId }),
+        })) as { discarded: boolean };
+        if (!opts.auto) console.log(r.discarded ? "Discarded (no activity)" : "Kept");
+        return;
+      }
+      const profile = opts.profile ?? ensureHandoffProfile(tinyPaths().profilesDir, configDir);
+      const s = (await api("/v1/sessions/adopt", {
+        method: "POST",
+        body: JSON.stringify({ profile, cwd: process.cwd(), agentSessionId }),
+      })) as SessionRecord;
+      if (!opts.auto) console.log(`Handed off: ${s.id} (${s.title ?? s.cwd})`);
+    } catch (err) {
+      // In hook mode a failure must never get in the way of the agent starting up
+      const msg = err instanceof Error ? err.message : String(err);
+      if (opts.auto) {
+        console.error(`[tiny] handoff skipped: ${msg}`);
+        return;
+      }
+      throw err;
+    }
+  });
+
+program
+  .command("live [state]")
+  .description("always hand new Claude Code sessions to tiny (state: on|off; omit to show)")
+  .option("--config-dir <dir>", "CLAUDE_CONFIG_DIR to configure (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
+  .action((state: string | undefined, opts: { configDir?: string }) => {
+    const configDir = opts.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir();
+    const l = tinyLaunch();
+    const command = buildHookCommand(l.command, l.args);
+    if (state === undefined) {
+      console.log(`${readLiveMode(configDir) ? "on" : "off"}  (${configDir})`);
+      return;
+    }
+    if (state !== "on" && state !== "off") throw new Error(`state must be on or off (got ${state})`);
+    setLiveMode(configDir, state === "on", command);
+    console.log(`Always-handoff is now ${state} (${configDir})`);
+  });
+
 // Launched by agents as an MCP server (stdio). Not meant to be run by humans, so hidden from help
 program.command("mcp-server", { hidden: true }).action(async () => {
   const { runTinyMcpServer } = await import("./mcp-server.js");
@@ -294,6 +452,7 @@ program
       profiles: listProfiles(p.profilesDir),
       fileExists: (f) => fs.existsSync(f),
       sameFile,
+      alwaysHandoff: readLiveMode(process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir()),
     });
     console.log(formatDoctorReport(report));
     if (!report.ok) process.exitCode = 1;

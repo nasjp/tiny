@@ -7,6 +7,7 @@ import path from "node:path";
 import { agentEnv, getDriver, listDrivers } from "../src/agents/index.js";
 import { writeTinyMcpServer } from "../src/agents/codex.js";
 import { cursorLoggedIn } from "../src/agents/cursor.js";
+import { claudeLoggedIn, readClaudeOauthAccount } from "../src/agents/claude.js";
 
 describe("agent drivers", () => {
   it("claude driver: label, home env, stripped env", () => {
@@ -343,5 +344,88 @@ describe("agent drivers", () => {
     expect(listDrivers().map((d) => d.id)).toEqual(
       expect.arrayContaining(["claude", "opencode", "codex", "cursor"]),
     );
+  });
+});
+
+// Claude Code resolves its config file asymmetrically: with CLAUDE_CONFIG_DIR unset it reads
+// ~/.claude.json (home root), with it set to $X it reads $X/.claude.json. So naming the default
+// data directory explicitly is NOT a no-op — it points the lookup at ~/.claude/.claude.json,
+// which a normal installation does not have, and every turn fails with
+// "Claude configuration file not found". `tiny handoff` writes exactly that config dir
+describe("claude default config dir", () => {
+  function withHome<T>(fn: (home: string) => T): T {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tiny-home-")));
+    const prev = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      return fn(home);
+    } finally {
+      if (prev === undefined) delete process.env.HOME;
+      else process.env.HOME = prev;
+    }
+  }
+
+  it("homeEnv marks CLAUDE_CONFIG_DIR for removal when the dir is the default one", () => {
+    withHome((home) => {
+      expect(getDriver("claude").homeEnv(path.join(home, ".claude"))).toStrictEqual({ CLAUDE_CONFIG_DIR: undefined });
+    });
+  });
+
+  it("agentEnv leaves no CLAUDE_CONFIG_DIR key at all for the default dir", () => {
+    withHome((home) => {
+      const env = agentEnv(getDriver("claude"), path.join(home, ".claude"), {
+        PATH: "/usr/bin",
+        CLAUDE_CONFIG_DIR: "/srv/stale",
+      });
+      expect(Object.hasOwn(env, "CLAUDE_CONFIG_DIR")).toBe(false);
+      expect(env.PATH).toBe("/usr/bin");
+    });
+  });
+
+  it("a trailing slash does not defeat the match", () => {
+    withHome((home) => {
+      const env = agentEnv(getDriver("claude"), path.join(home, ".claude") + "/", { PATH: "/usr/bin" });
+      expect(Object.hasOwn(env, "CLAUDE_CONFIG_DIR")).toBe(false);
+    });
+  });
+
+  // Same asymmetry on the read side: for the default dir the account info lives in ~/.claude.json,
+  // not in <dir>/.claude.json, so a handoff profile would otherwise be reported as logged out
+  it("login detection reads ~/.claude.json for the default dir", () => {
+    withHome((home) => {
+      const dir = path.join(home, ".claude");
+      fs.mkdirSync(dir, { recursive: true });
+      expect(claudeLoggedIn(dir)).toBe(false);
+      fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "a@b.c" } }));
+      expect(claudeLoggedIn(dir)).toBe(true);
+      expect(readClaudeOauthAccount(dir)).toEqual({ emailAddress: "a@b.c" });
+    });
+  });
+
+  it("an accountless <default dir>/.claude.json does not mask the real one", () => {
+    withHome((home) => {
+      const dir = path.join(home, ".claude");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, ".claude.json"), JSON.stringify({ mcpServers: {} }));
+      fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "a@b.c" } }));
+      expect(claudeLoggedIn(dir)).toBe(true);
+    });
+  });
+
+  it("any other config dir keeps reading <dir>/.claude.json", () => {
+    withHome((home) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cfg-"));
+      fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "a@b.c" } }));
+      expect(claudeLoggedIn(dir)).toBe(false);
+      fs.writeFileSync(path.join(dir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "d@e.f" } }));
+      expect(readClaudeOauthAccount(dir)).toEqual({ emailAddress: "d@e.f" });
+    });
+  });
+
+  it("any other config dir still sets CLAUDE_CONFIG_DIR", () => {
+    withHome(() => {
+      const env = agentEnv(getDriver("claude"), "/srv/profiles/work", { PATH: "/usr/bin" });
+      expect(env.CLAUDE_CONFIG_DIR).toBe("/srv/profiles/work");
+    });
   });
 });

@@ -18,6 +18,8 @@ export interface SessionRecord {
   status: SessionStatus;
   /** Archive time (ISO). null means shown normally. Only affects list filtering */
   archivedAt: string | null;
+  /** Last transcript record uuid imported from the agent's own history. null = nothing imported */
+  sourceCursor: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -51,4 +53,10 @@ export interface FileRecord {
   mime: string;
   caption: string | null;
   createdAt: string;
+}
+
+/** What the API returns for a session: the record plus runtime-only fields */
+export interface SessionResponse extends SessionRecord {
+  /** true = the agent's own CLI still has this session open. null = could not tell */
+  cliLive: boolean | null;
 }

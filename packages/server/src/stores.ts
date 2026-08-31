@@ -3,7 +3,7 @@ import type { ApnsEnv, DeviceRecord, EventRecord, FileRecord, SessionRecord, Ses
 
 interface SessionRow {
   id: string; agent_session_id: string | null; agent: string; profile: string;
-  cwd: string; permission_mode: string; model: string | null; effort: string | null; title: string | null; status: string; archived_at: string | null;
+  cwd: string; permission_mode: string; model: string | null; effort: string | null; title: string | null; status: string; archived_at: string | null; source_cursor: string | null;
   created_at: string; updated_at: string;
 }
 
@@ -20,6 +20,7 @@ function rowToSession(r: SessionRow): SessionRecord {
     title: r.title,
     status: r.status as SessionStatus,
     archivedAt: r.archived_at,
+    sourceCursor: r.source_cursor,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -33,14 +34,15 @@ export interface SessionPatch {
   effort?: string | null;
   permissionMode?: SessionRecord["permissionMode"];
   archivedAt?: string | null;
+  sourceCursor?: string | null;
 }
 
 export function createStores(db: Database.Database) {
   const sessions = {
     create(rec: SessionRecord): void {
       db.prepare(
-        `INSERT INTO sessions (id, agent_session_id, agent, profile, cwd, permission_mode, model, effort, title, status, archived_at, created_at, updated_at)
-         VALUES (@id, @agentSessionId, @agent, @profile, @cwd, @permissionMode, @model, @effort, @title, @status, @archivedAt, @createdAt, @updatedAt)`,
+        `INSERT INTO sessions (id, agent_session_id, agent, profile, cwd, permission_mode, model, effort, title, status, archived_at, source_cursor, created_at, updated_at)
+         VALUES (@id, @agentSessionId, @agent, @profile, @cwd, @permissionMode, @model, @effort, @title, @status, @archivedAt, @sourceCursor, @createdAt, @updatedAt)`,
       ).run(rec);
     },
     get(id: string): SessionRecord | null {
@@ -65,7 +67,7 @@ export function createStores(db: Database.Database) {
       const cur = sessions.get(id);
       if (!cur) throw new Error(`session not found: ${id}`);
       db.prepare(
-        `UPDATE sessions SET status = ?, agent_session_id = ?, title = ?, model = ?, effort = ?, permission_mode = ?, archived_at = ?, updated_at = ? WHERE id = ?`,
+        `UPDATE sessions SET status = ?, agent_session_id = ?, title = ?, model = ?, effort = ?, permission_mode = ?, archived_at = ?, source_cursor = ?, updated_at = ? WHERE id = ?`,
       ).run(
         patch.status ?? cur.status,
         patch.agentSessionId ?? cur.agentSessionId,
@@ -75,6 +77,7 @@ export function createStores(db: Database.Database) {
         patch.effort !== undefined ? patch.effort : cur.effort,
         patch.permissionMode ?? cur.permissionMode,
         patch.archivedAt !== undefined ? patch.archivedAt : cur.archivedAt,
+        patch.sourceCursor !== undefined ? patch.sourceCursor : cur.sourceCursor,
         new Date().toISOString(),
         id,
       );
@@ -86,6 +89,15 @@ export function createStores(db: Database.Database) {
     },
     fixupRunning(): number {
       return db.prepare(`UPDATE sessions SET status = 'interrupted' WHERE status = 'running'`).run().changes;
+    },
+    byAgentSessionId(agentSessionId: string): SessionRecord | null {
+      const row = db.prepare(`SELECT * FROM sessions WHERE agent_session_id = ? ORDER BY created_at ASC LIMIT 1`)
+        .get(agentSessionId) as SessionRow | undefined;
+      return row ? rowToSession(row) : null;
+    },
+    delete(id: string): boolean {
+      db.prepare(`DELETE FROM events WHERE session_id = ?`).run(id);
+      return db.prepare(`DELETE FROM sessions WHERE id = ?`).run(id).changes > 0;
     },
   };
 
@@ -105,6 +117,10 @@ export function createStores(db: Database.Database) {
         id: r.id, sessionId: r.session_id, type: r.type,
         payload: JSON.parse(r.payload) as Record<string, unknown>, createdAt: r.created_at,
       }));
+    },
+    count(sessionId: string): number {
+      const r = db.prepare(`SELECT COUNT(*) AS n FROM events WHERE session_id = ?`).get(sessionId) as { n: number };
+      return r.n;
     },
   };
 

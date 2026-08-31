@@ -5,7 +5,8 @@ import type { AgentAdapter, TurnImage } from "./adapter.js";
 import type { McpLaunch } from "./mcp-launch.js";
 import type { FileOutbox } from "./outbox.js";
 import { profileDir, profileDriver } from "./profiles.js";
-import type { AgentCapabilities } from "./agents/index.js";
+import { findTranscript, readTranscript, readTranscriptCursor } from "./claude-transcript.js";
+import type { AgentCapabilities, AgentDriver } from "./agents/index.js";
 import type { PendingPermission, PermissionBroker, PermissionDecision } from "./permission-broker.js";
 import type { SessionPatch, Stores } from "./stores.js";
 import type { FileRecord, PermissionModeValue, SessionRecord, SessionStatus } from "./types.js";
@@ -44,6 +45,11 @@ export interface SessionManagerDeps {
   mcpLaunch?: (sessionId: string, token: string) => McpLaunch;
   /** Per-turn session token issuer. Without it, no MCP is attached to the adapter even if mcpLaunch exists (never falls back to the CLI token) */
   sessionTokens?: SessionTokenIssuer;
+  /**
+   * Whether the agent's own CLI still has this session open. null = cannot tell.
+   * Injected so tests do not depend on a real registry. Absent = never blocks.
+   */
+  isCliLive?: (s: SessionRecord) => boolean | null;
 }
 
 interface RunningTurn {
@@ -53,6 +59,13 @@ interface RunningTurn {
 
 export class SessionManager extends EventEmitter {
   private running = new Map<string, RunningTurn>();
+  /**
+   * Last transcript stat per session. Parsing a transcript is expensive (a 139MB one costs ~250ms
+   * and ~800MB of RSS) and the events endpoint asks on every poll, so an unchanged file must cost
+   * one stat. Keyed on the resolved path too: findTranscript can fall back to scanning projects/,
+   * so the file a session resolves to can change under us
+   */
+  private transcriptStats = new Map<string, { path: string; size: number; mtimeMs: number }>();
 
   constructor(private deps: SessionManagerDeps) {
     super();
@@ -67,6 +80,26 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  /**
+   * Shared entry validation for createSession / adoptSession: the profile exists, the requested
+   * choices are among the agent's, and the cwd is a real directory.
+   */
+  private resolveProfile(input: {
+    profile: string;
+    cwd: string;
+    permissionMode?: PermissionModeValue;
+    effort?: string;
+  }): { dir: string; driver: AgentDriver; caps: AgentCapabilities } {
+    const dir = profileDir(this.deps.profilesDir, input.profile); // throws if missing
+    const driver = profileDriver(this.deps.profilesDir, input.profile);
+    const caps = driver.capabilities(dir);
+    assertChoices(caps, input);
+    if (!fs.existsSync(input.cwd) || !fs.statSync(input.cwd).isDirectory()) {
+      throw new NotFoundError(`cwd not found: ${input.cwd}`);
+    }
+    return { dir, driver, caps };
+  }
+
   createSession(input: {
     profile: string;
     cwd: string;
@@ -74,13 +107,7 @@ export class SessionManager extends EventEmitter {
     model?: string;
     effort?: string;
   }): SessionRecord {
-    const dir = profileDir(this.deps.profilesDir, input.profile); // existence check (throws if missing)
-    const driver = profileDriver(this.deps.profilesDir, input.profile);
-    const caps = driver.capabilities(dir);
-    assertChoices(caps, input);
-    if (!fs.existsSync(input.cwd) || !fs.statSync(input.cwd).isDirectory()) {
-      throw new NotFoundError(`cwd not found: ${input.cwd}`);
-    }
+    const { driver, caps } = this.resolveProfile(input);
     const now = new Date().toISOString();
     const rec: SessionRecord = {
       id: crypto.randomUUID(),
@@ -95,11 +122,189 @@ export class SessionManager extends EventEmitter {
       title: null,
       status: "idle",
       archivedAt: null,
+      sourceCursor: null,
       createdAt: now,
       updatedAt: now,
     };
     this.deps.stores.sessions.create(rec);
     return rec;
+  }
+
+  /**
+   * How many human turns a first backfill imports. Counting records instead would fill the import
+   * with tool traffic and almost none of the conversation the person came back for. Five turns is
+   * 50-200 records on real transcripts, which stays clear of readTranscript's 300-record ceiling
+   */
+  private static readonly BACKFILL_TURNS = 5;
+
+  /**
+   * Register a session that was started in the agent's own CLI (`tiny handoff`).
+   * Idempotent: SessionStart hooks fire again on resume / fork / clear.
+   */
+  adoptSession(input: {
+    agent?: string;
+    profile: string;
+    cwd: string;
+    agentSessionId: string;
+    model?: string;
+    effort?: string;
+    permissionMode?: PermissionModeValue;
+  }): { session: SessionRecord; adopted: boolean } {
+    const { driver, caps } = this.resolveProfile(input);
+    const existing = this.deps.stores.sessions.byAgentSessionId(input.agentSessionId);
+    if (existing) {
+      this.importOrSeed(existing.id);
+      return { session: this.getSession(existing.id), adopted: false };
+    }
+    const now = new Date().toISOString();
+    const rec: SessionRecord = {
+      id: crypto.randomUUID(),
+      agentSessionId: input.agentSessionId,
+      agent: driver.id,
+      profile: input.profile,
+      cwd: input.cwd,
+      permissionMode: input.permissionMode ?? caps.permissionModes[0]?.id ?? "default",
+      model: input.model ?? null,
+      effort: input.effort ?? null,
+      title: null,
+      status: "idle",
+      archivedAt: null,
+      sourceCursor: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.deps.stores.sessions.create(rec);
+    this.importOrSeed(rec.id);
+    return { session: this.getSession(rec.id), adopted: true };
+  }
+
+  /**
+   * Import the CLI's transcript into a session — unless it already carries events but has no
+   * cursor. Tiny and the CLI append to the SAME file, so importing there would replay turns tiny
+   * already emitted natively (the phone would show the exchange twice). Seed the cursor instead,
+   * so the import starts at the tail and only what the CLI writes from now on comes in.
+   */
+  private importOrSeed(id: string): void {
+    const s = this.getSession(id);
+    if (s.sourceCursor === null && this.deps.stores.events.count(id) > 0) {
+      this.advanceCursor(s);
+      return;
+    }
+    this.syncTranscript(id);
+  }
+
+  /**
+   * Cursor bookkeeping on every exit path of a turn. Only for a session already tracking the CLI
+   * transcript — a null cursor means nothing has been imported and importOrSeed will seed it later.
+   */
+  private advanceCursorAfterTurn(id: string): void {
+    try {
+      const s = this.deps.stores.sessions.get(id);
+      if (s?.sourceCursor) this.advanceCursor(s);
+    } catch {
+      // bookkeeping must never mask the turn's own outcome (this runs in a finally)
+    }
+  }
+
+  /**
+   * Move the cursor to the transcript's current tail without emitting anything.
+   * Never throws — an unreadable transcript just leaves the cursor where it is.
+   */
+  private advanceCursor(s: SessionRecord): void {
+    try {
+      const file = this.transcriptFile(s);
+      if (!file) return;
+      // Reads the same guard as syncTranscript — an unchanged file already has the cursor at its
+      // tail, so there is nothing to do and no reason to parse it again — but NEVER records a stat.
+      // Recording one here would mark the file consumed after reading nothing but its tail uuid,
+      // and the next real sync would skip it, silently dropping genuine appended conversation.
+      // Only the path that actually imports events may record a stat
+      if (!this.transcriptChange(s.id, file)) return;
+      const cursor = readTranscriptCursor(file);
+      if (cursor && cursor !== s.sourceCursor) this.deps.stores.sessions.patch(s.id, { sourceCursor: cursor });
+    } catch {
+      // same non-throwing contract as syncTranscript: a missing transcript is normal
+    }
+  }
+
+  /**
+   * The transcript's stat when it is worth reading, or null when there is nothing new (path, size
+   * and mtime all match the last read) or it cannot be stat'ed — both mean "do nothing".
+   * Only a caller that goes on to IMPORT records the returned stat; see advanceCursor.
+   */
+  private transcriptChange(id: string, file: string): fs.Stats | null {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      return null;
+    }
+    const seen = this.transcriptStats.get(id);
+    // Any difference means read — a SMALLER file too, which is what a compact rewrite looks like
+    if (seen && seen.path === file && seen.size === stat.size && seen.mtimeMs === stat.mtimeMs) return null;
+    return stat;
+  }
+
+  /** The CLI transcript backing a session, or null when there is none (or the agent keeps no transcripts) */
+  private transcriptFile(s: SessionRecord): string | null {
+    if (!s.agentSessionId || s.agent !== "claude") return null;
+    try {
+      return findTranscript(profileDir(this.deps.profilesDir, s.profile), s.cwd, s.agentSessionId);
+    } catch {
+      return null; // the profile's config dir went away
+    }
+  }
+
+  /**
+   * Import transcript records written by the agent's own CLI since the last import.
+   * Returns how many events were appended. Never throws — a missing transcript is normal.
+   */
+  syncTranscript(id: string): number {
+    const s = this.getSession(id);
+    // Mid-turn, tiny is itself appending to this transcript through the SDK and emitting every one
+    // of those records natively as it goes. Importing them here would duplicate them, and the
+    // cursor advance at completion cannot take back events already in the log. With this guard the
+    // writers of the jsonl (the user's CLI, tiny's SDK child) and the writers of the cursor
+    // (syncTranscript, turn completion) can no longer interleave
+    if (s.status === "running") return 0;
+    const file = this.transcriptFile(s);
+    if (!file) return 0;
+    const stat = this.transcriptChange(id, file);
+    if (!stat) return 0;
+    const read = readTranscript(file, {
+      sinceUuid: s.sourceCursor,
+      ...(s.sourceCursor ? {} : { turns: SessionManager.BACKFILL_TURNS }),
+    });
+    for (const ev of read.events) this.emitEvent(id, ev.type, ev.payload);
+    const patch: SessionPatch = {};
+    if (read.cursor && read.cursor !== s.sourceCursor) patch.sourceCursor = read.cursor;
+    if (read.title && !s.title) patch.title = read.title;
+    if (Object.keys(patch).length > 0) this.deps.stores.sessions.patch(id, patch);
+    // Commit the stat captured BEFORE the read — so an append that lands mid-read is picked up next
+    // time rather than skipped — but only once the read has actually produced a cursor. A read that
+    // yielded none (a rotate caught mid-flight) would otherwise advance the stat while the cursor
+    // stood still, and those records would never be imported. Leave the old entry: the next call retries
+    if (read.cursor) this.transcriptStats.set(id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
+    return read.events.length;
+  }
+
+  /**
+   * SessionEnd path: drop a handoff session that never got a single event.
+   *
+   * Import the transcript before judging. The SessionStart hook adopts a session before the user
+   * has typed anything, so the backfill at adoption time imports nothing; if nothing syncs in
+   * between, a session that ran a whole conversation still looks empty here and would be deleted.
+   * After the import, "empty" means again what it was meant to mean: nothing ever happened.
+   */
+  discardIfEmpty(agentSessionId: string): boolean {
+    const s = this.deps.stores.sessions.byAgentSessionId(agentSessionId);
+    if (!s) return false;
+    // syncTranscript declines to import while a turn is running. Deleting on the strength of a
+    // look we did not take would be the same bug in a new place, so keep the session instead
+    if (s.status === "running") return false;
+    this.syncTranscript(s.id);
+    if (this.deps.stores.events.count(s.id) > 0) return false;
+    return this.deps.stores.sessions.delete(s.id);
   }
 
   /** Mid-session change of model / permission mode / archived. Does not affect a running turn; takes effect from the next turn */
@@ -154,6 +359,9 @@ export class SessionManager extends EventEmitter {
     const s = this.getSession(id);
     if (s.status === "running") throw new ConflictError("turn already running");
     if (s.status === "detached") throw new ConflictError("session is attached from CLI");
+    // Step 1 has no live-join yet: a turn sent while the CLI holds the session would run in a
+    // separate process and the CLI can overwrite the transcript leaf on exit, stranding it
+    if (this.deps.isCliLive?.(s) === true) throw new ConflictError("session is open in the CLI");
     const abort = new AbortController();
     this.deps.stores.sessions.patch(id, { status: "running", title: s.title ?? prompt.slice(0, 60) });
     // Persist the user's message as an event too. Without this, the client's history view
@@ -197,6 +405,7 @@ export class SessionManager extends EventEmitter {
         permissionMode: s.permissionMode,
         model: s.model,
         effort: s.effort,
+        tinySessionId: s.id,
         prompt,
         ...(images && images.length > 0 ? { images } : {}),
         emit: (ev) => this.emitEvent(s.id, ev.type, ev.payload),
@@ -238,6 +447,12 @@ export class SessionManager extends EventEmitter {
       this.emitEvent(s.id, type, { error: message });
       this.deps.stores.sessions.patch(s.id, { status: "idle" });
     } finally {
+      // This turn appended to the same transcript the user's CLI writes, and every one of those
+      // records was already emitted natively above. Skip past them so a later sync cannot replay
+      // them — on the failure and interrupt paths too, where the transcript already holds the
+      // prompt and a partial response. Runs after both status patches, so the running guard in
+      // syncTranscript is lifted by the time anything reads the cursor
+      this.advanceCursorAfterTurn(s.id);
       if (mcpToken) this.deps.sessionTokens!.revokeSessionTokens(s.id);
     }
   }

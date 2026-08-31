@@ -3,7 +3,21 @@ import { EMPTY_CAPABILITIES } from "../src/agents/index.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildAttachCommand, formatDeviceRow, formatProfileRow, normalizeRelayUrl, normalizeServerUrl, resolveDeviceId, resolveSessionId, runProfileRename } from "../src/cli.js";
+import {
+  buildAttachCommand,
+  ensureHandoffProfile,
+  formatDeviceRow,
+  formatProfileRow,
+  normalizeRelayUrl,
+  normalizeServerUrl,
+  resolveDeviceId,
+  isInsideTinyAgent,
+  parseHookSessionId,
+  resolveHandoffInput,
+  resolveSessionId,
+  runProfileRename,
+} from "../src/cli.js";
+import { listProfiles, readProfileConfigDir } from "../src/profiles.js";
 import type { SessionRecord } from "../src/types.js";
 
 function sess(over: Partial<SessionRecord>): SessionRecord {
@@ -17,6 +31,7 @@ function sess(over: Partial<SessionRecord>): SessionRecord {
     title: null,
     status: "idle",
     archivedAt: null,
+    sourceCursor: null,
     createdAt: "",
     updatedAt: "",
     ...over,
@@ -203,5 +218,67 @@ describe("runProfileRename", () => {
     const renameSessions = () => { throw new Error("db boom"); };
     expect(() => runProfileRename(deps({ renameSessions }), "work", "profile-3")).toThrow(/db boom/);
     expect(fs.existsSync(path.join(root, "work"))).toBe(true);
+  });
+});
+
+describe("handoff", () => {
+  it("takes the session id and config dir from the environment", () => {
+    const r = resolveHandoffInput({ CLAUDE_CODE_SESSION_ID: "sid-1", CLAUDE_CONFIG_DIR: "/custom/claude" });
+    expect(r.agentSessionId).toBe("sid-1");
+    expect(r.configDir).toBe("/custom/claude");
+  });
+
+  it("defaults the config dir to ~/.claude", () => {
+    const r = resolveHandoffInput({ CLAUDE_CODE_SESSION_ID: "sid-1" });
+    expect(r.configDir).toBe(path.join(os.homedir(), ".claude"));
+  });
+
+  it("has no session id outside Claude Code", () => {
+    expect(resolveHandoffInput({}).agentSessionId).toBeNull();
+  });
+
+  it("treats an empty CLAUDE_CONFIG_DIR as unset", () => {
+    const r = resolveHandoffInput({ CLAUDE_CODE_SESSION_ID: "sid-1", CLAUDE_CONFIG_DIR: "" });
+    expect(r.configDir).toBe(path.join(os.homedir(), ".claude"));
+  });
+
+  // The Agent SDK reads every settings source, so `tiny live on` makes the SessionStart hook fire
+  // inside the agents tiny itself spawns. TINY_SESSION_ID exists only in that environment
+  it("recognizes an agent tiny spawned itself", () => {
+    expect(isInsideTinyAgent({ TINY_SESSION_ID: "s-1" })).toBe(true);
+    expect(isInsideTinyAgent({ TINY_SESSION_ID: "" })).toBe(false);
+    expect(isInsideTinyAgent({})).toBe(false);
+    expect(isInsideTinyAgent({ CLAUDE_CODE_SESSION_ID: "sid-1" })).toBe(false);
+  });
+
+  // Fallback for the hook contract: Claude Code hands hooks a JSON object on stdin
+  it("reads session_id out of a hook payload, and shrugs off anything else", () => {
+    expect(parseHookSessionId(JSON.stringify({
+      session_id: "sid-9", cwd: "/srv/x", source: "startup", transcript_path: "/srv/x.jsonl",
+    }))).toBe("sid-9");
+    expect(parseHookSessionId("")).toBeNull();
+    expect(parseHookSessionId("not json")).toBeNull();
+    expect(parseHookSessionId("{}")).toBeNull();
+    expect(parseHookSessionId(JSON.stringify({ session_id: "" }))).toBeNull();
+    expect(parseHookSessionId(JSON.stringify({ session_id: 7 }))).toBeNull();
+    expect(parseHookSessionId("[1,2,3]")).toBeNull();
+  });
+
+  it("creates the handoff profile once and reuses it", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-hp-"));
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cd-"));
+    const first = ensureHandoffProfile(root, configDir);
+    expect(first).toBe("local");
+    expect(readProfileConfigDir(path.join(root, "local"))).toBe(configDir);
+    expect(ensureHandoffProfile(root, configDir)).toBe("local");
+    expect(listProfiles(root)).toHaveLength(1);
+  });
+
+  it("makes a second profile for a different config dir", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-hp-"));
+    const a = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cd-"));
+    const b = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cd-"));
+    expect(ensureHandoffProfile(root, a)).toBe("local");
+    expect(ensureHandoffProfile(root, b)).toBe("local-2");
   });
 });

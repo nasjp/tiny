@@ -102,6 +102,13 @@ struct SessionRecord: Codable, Identifiable, Hashable {
     let updatedAt: String
     var archivedAt: String? = nil   // archive time (ISO); nil = shown normally; older servers omit the key
 
+    /// true = the agent's own CLI still has this session open. nil = the server could not tell
+    /// (or is older than this feature). Older servers omit the key.
+    var cliLive: Bool? = nil
+
+    /// Only a definite true locks the composer — "cannot tell" must not take the session away
+    var isHeldByCLI: Bool { cliLive == true }
+
     var displayTitle: String { title ?? (cwd as NSString).lastPathComponent }
 }
 

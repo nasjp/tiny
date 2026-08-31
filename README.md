@@ -76,6 +76,8 @@ tiny agents                              # list supported agents
 tiny ls                                  # list sessions
 tiny new --profile <name> --cwd <dir>    # create a session
 tiny attach <first 8 chars of id>        # hand the session to that agent's CLI (returns to tiny when it exits)
+tiny handoff                             # hand the Claude Code session you're currently in to tiny (reverse of attach)
+tiny live [on|off]                       # toggle automatic handoff of every new Claude Code session (default: manual — off)
 
 tiny profiles ls                         # list profiles
 tiny profiles add <name> --agent <id>    # add one (then: tiny profiles login <name>)
