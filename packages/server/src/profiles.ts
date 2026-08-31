@@ -32,6 +32,36 @@ function profileMetaDir(profilesDir: string, name: string): string {
   return dir;
 }
 
+/** Merge-write one key into tiny-profile.json, keeping whatever else is there */
+function patchProfileMeta(metaDir: string, patch: Record<string, unknown>): void {
+  const file = path.join(metaDir, PROFILE_META);
+  let meta: Record<string, unknown> = {};
+  try {
+    meta = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  } catch {
+    // a profile without metadata is a legacy claude profile; start fresh
+  }
+  fs.writeFileSync(file, JSON.stringify({ ...meta, ...patch }, null, 2) + "\n");
+}
+
+/**
+ * Whether `tiny live` is on for a profile whose agent has no hooks (codex / opencode): tinyd then
+ * scans the agent's own storage and adopts sessions the person starts in the terminal. Claude
+ * profiles keep their hook-based flag in the agent's settings.json (claude-hooks.ts), not here.
+ */
+export function readProfileLive(profilesDir: string, name: string): boolean {
+  try {
+    const raw = fs.readFileSync(path.join(profileMetaDir(profilesDir, name), PROFILE_META), "utf8");
+    return (JSON.parse(raw) as { live?: unknown }).live === true;
+  } catch {
+    return false;
+  }
+}
+
+export function setProfileLive(profilesDir: string, name: string, on: boolean): void {
+  patchProfileMeta(profileMetaDir(profilesDir, name), { live: on });
+}
+
 /** External CLAUDE_CONFIG_DIR of a profile (tiny-profile.json "configDir"). null when the profile owns its directory */
 export function readProfileConfigDir(dir: string): string | null {
   try {

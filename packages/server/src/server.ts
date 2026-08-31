@@ -5,12 +5,14 @@ import { ensureDirs, tinyPaths } from "./config.js";
 import { createApp } from "./api.js";
 import { AuthService } from "./auth.js";
 import { readLiveSessions, type LiveSessionEntry } from "./claude-live.js";
+import { codexThreadHolders } from "./codex-live.js";
+import { opencodeInstancePids } from "./opencode-live.js";
 import { readCliMode, readPeerStatus, readPeerToken, readProcessMode, resolvePeerTarget, sendPeerMessage } from "./claude-peer.js";
 import { findTranscript } from "./claude-transcript.js";
 import { FileOutbox } from "./outbox.js";
 import { openDb } from "./db.js";
 import { PermissionBroker } from "./permission-broker.js";
-import { profileDir } from "./profiles.js";
+import { profileDir, readProfileLive } from "./profiles.js";
 import { PushClient } from "./push-client.js";
 import { SessionManager } from "./session-manager.js";
 import type { PeerBridge } from "./session-manager.js";
@@ -70,7 +72,33 @@ export async function startServer(env: Record<string, string | undefined> = proc
 
   // Whether the agent's own CLI still holds a session. SessionManager uses it to refuse a turn that
   // would race the CLI, the API to report cliLive, so BOTH must get the same function
+  // Process-level evidence per agent, cached like the registry (the list asks per row every poll)
+  const EXTERNAL_TTL_MS = 2000;
+  const externalCache = new Map<string, { at: number; busy: boolean | null }>();
+  const externalBusy = (s: SessionRecord): boolean | null => {
+    if (!s.agentSessionId) return null;
+    const cached = externalCache.get(s.id);
+    if (cached && Date.now() - cached.at < EXTERNAL_TTL_MS) return cached.busy;
+    let busy: boolean | null = null;
+    try {
+      const dir = profileDir(paths.profilesDir, s.profile);
+      if (s.agent === "codex") {
+        // Measured: codex holds the thread's writer lock open for the whole turn
+        busy = codexThreadHolders(dir, s.agentSessionId).length > 0;
+      } else if (s.agent === "opencode") {
+        // The lock is per storage, not per session: a live instance means "cannot tell", none means "nobody"
+        busy = opencodeInstancePids(dir).length > 0 ? null : false;
+      }
+    } catch {
+      busy = null;
+    }
+    externalCache.set(s.id, { at: Date.now(), busy });
+    return busy;
+  };
+
   const isCliLive = (s: SessionRecord): boolean | null => {
+    // codex: whoever holds the thread's writer lock has the session open in a CLI
+    if (s.agent === "codex" && s.agentSessionId) return externalBusy(s) === true;
     const entries = liveEntriesOf(s);
     if (entries === undefined || entries === null) return null;
     return entries.has(s.agentSessionId!);
@@ -122,6 +150,8 @@ export async function startServer(env: Record<string, string | undefined> = proc
     isCliLive,
     cliState,
     peer,
+    externalBusy,
+    liveScanEnabled: (name) => readProfileLive(paths.profilesDir, name),
   });
 
   // Settings are reloaded on every delivery, so `tiny push config` changes take effect without a restart.
@@ -155,6 +185,18 @@ export async function startServer(env: Record<string, string | undefined> = proc
   });
   injectWebSocket(server);
 
+  // Sessions the person starts in codex / opencode have no hook to announce them; watch the
+  // agents' own storage instead (only profiles with `tiny live on`; the scan itself is date- and
+  // table-bounded, see codex-live / opencode-live)
+  const scanTimer = setInterval(() => {
+    try {
+      manager.scanExternalSessions();
+    } catch (err) {
+      console.error("[tinyd] external session scan failed:", err);
+    }
+  }, 5000);
+  scanTimer.unref?.();
+
   return {
     port,
     url: `http://${os.hostname()}:${port}`,
@@ -163,6 +205,7 @@ export async function startServer(env: Record<string, string | undefined> = proc
     push,
     close: () =>
       new Promise<void>((resolve, reject) => {
+        clearInterval(scanTimer);
         db.close();
         server.close((err) => (err ? reject(err) : resolve()));
       }),

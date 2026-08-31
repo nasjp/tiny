@@ -41,10 +41,11 @@ function makeManager(
   fs.mkdirSync(outboxDir, { recursive: true });
   addProfile(profilesDir, "work");
   addProfile(profilesDir, "oc", "opencode");
+  addProfile(profilesDir, "cx", "codex");
   const stores = createStores(openDb(":memory:"));
   const tokens = fakeTokens();
   const manager = new SessionManager({
-    stores, profilesDir, adapters: { claude: adapter, opencode: adapter },
+    stores, profilesDir, adapters: { claude: adapter, opencode: adapter, codex: adapter },
     broker: new PermissionBroker(1000),
     outbox: new FileOutbox(outboxDir, stores.files),
     mcpLaunch: (sessionId, token) => ({
@@ -1677,5 +1678,131 @@ describe("SessionManager Stop on a turn the CLI started", () => {
     });
     const { session } = liveSession(manager, home, "agent-cli-socket");
     await expect(manager.interrupt(session.id)).rejects.toThrow(/ENOENT/);
+  });
+});
+
+/** Rollout fixture in the measured codex 0.149.1 shapes, under today's date dir */
+function writeCodexRollout(profilesDir: string, threadId: string, records: Array<Record<string, unknown>>): string {
+  const now = new Date();
+  const p2 = (n: number) => String(n).padStart(2, "0");
+  const dir = path.join(profilesDir, "cx", "sessions", String(now.getFullYear()), p2(now.getMonth() + 1), p2(now.getDate()));
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `rollout-x-${threadId}.jsonl`);
+  fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  return file;
+}
+
+const cxMeta = (cwd: string) => ({ type: "session_meta", payload: { id: "x", cwd, timestamp: "2026-09-01T00:00:00.000Z" } });
+const cxTaskStart = { type: "event_msg", payload: { type: "task_started", turn_id: "t1", started_at: 1788000000 } };
+const cxUser = (text: string) => ({ type: "event_msg", payload: { type: "user_message", message: text } });
+const cxTokens = (out: number) => ({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { output_tokens: out } } } });
+const cxAnswer = { type: "event_msg", payload: { type: "agent_message", message: "done", phase: "final_answer" } };
+const cxTaskEnd = { type: "event_msg", payload: { type: "task_complete", turn_id: "t1", completed_at: 1788000010 } };
+
+describe("SessionManager external sessions (Step 3 Wave 1)", () => {
+  const TID = "01a04e08-f742-7aa2-b039-b3a952f6ef99";
+
+  it("adopts a codex CLI session from its storage, imports it, and shows the open turn as activity", async () => {
+    const { manager, stores, home } = makeManager(okAdapter, { deps: { liveScanEnabled: () => true } });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const profilesDir = path.join(home, "profiles");
+    const seen: EventRecord[] = [];
+    manager.on("event", (e) => seen.push(e));
+    writeCodexRollout(profilesDir, TID, [cxMeta(cwd), cxTaskStart, cxUser("fix the failing test"), cxTokens(81)]);
+
+    expect(manager.scanExternalSessions()).toBe(1);
+    expect(manager.scanExternalSessions()).toBe(0); // idempotent
+    const s = manager.listSessions().find((x) => x.agentSessionId === TID)!;
+    expect(s.agent).toBe("codex");
+    expect(s.cwd).toBe(cwd);
+    expect(s.title).toBe("fix the failing test");
+    expect(seen.map((e) => e.type)).toEqual(["user_message"]);
+
+    // The open turn shows as running, and a send is refused (no live join for codex yet)
+    expect(manager.activity(manager.getSession(s.id))).toEqual({ since: "2026-08-29T10:40:00.000Z", outputTokens: 81 });
+    expect(() => manager.startTurn(s.id, "hi")).toThrow(ConflictError);
+
+    // Process-level evidence saying "nobody is there" clears it
+    const { manager: m2, home: h2 } = makeManager(okAdapter, { deps: { liveScanEnabled: () => true, externalBusy: () => false } });
+    writeCodexRollout(path.join(h2, "profiles"), TID, [cxMeta(cwd), cxTaskStart, cxUser("x"), cxTokens(1)]);
+    m2.scanExternalSessions();
+    const s2 = m2.listSessions()[0]!;
+    expect(m2.activity(m2.getSession(s2.id))).toBeNull();
+  });
+
+  it("a finished codex turn closes the activity and lets tiny run its own turn without replaying it", async () => {
+    let launched = 0;
+    let rollout = "";
+    // The real app-server appends tiny's own turn to the SAME rollout while it runs
+    const echoId: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        launched++;
+        p.emit({ type: "turn_started", payload: { agentSessionId: p.agentSessionId } });
+        fs.appendFileSync(rollout, [cxTaskStart, cxUser(p.prompt), cxAnswer, cxTaskEnd].map((r) => JSON.stringify(r)).join("\n") + "\n");
+        p.emit({ type: "turn_completed", payload: {} });
+        return { agentSessionId: p.agentSessionId!, costUsd: null, resultText: "ok" };
+      },
+    };
+    const { manager, stores, home } = makeManager(echoId, { deps: { liveScanEnabled: () => true } });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const profilesDir = path.join(home, "profiles");
+    rollout = writeCodexRollout(profilesDir, TID, [cxMeta(cwd), cxTaskStart, cxUser("do it"), cxTokens(5), cxAnswer, cxTaskEnd]);
+    manager.scanExternalSessions();
+    const s = manager.listSessions()[0]!;
+    expect(manager.activity(manager.getSession(s.id))).toBeNull();
+    const before = stores.events.listSince(s.id, 0).length;
+
+    manager.startTurn(s.id, "from the phone");
+    await manager.waitForIdle(s.id);
+    expect(launched).toBe(1);
+    // What tiny's own turn appended to the rollout must not come back as an import…
+    manager.syncTranscript(s.id);
+    const after = stores.events.listSince(s.id, 0).map((e) => e.type);
+    expect(after.filter((t) => t === "user_message").length).toBe(2);
+    expect(after.length).toBe(before + 3); // user_message + turn_started + turn_completed, nothing replayed
+    // …while a turn the person then types into the CLI still comes in
+    fs.appendFileSync(rollout, [cxTaskStart, cxUser("typed in the terminal"), cxAnswer, cxTaskEnd].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    manager.syncTranscript(s.id);
+    const types = stores.events.listSince(s.id, 0).map((e) => e.type);
+    expect(types.filter((t) => t === "user_message").length).toBe(3);
+    expect(types.at(-1)).toBe("assistant_text");
+  });
+
+  it("adopts an opencode CLI session and follows its storage, holding at an unfinished reply", () => {
+    const { manager, home } = makeManager(okAdapter, { deps: { liveScanEnabled: () => true } });
+    const profilesDir = path.join(home, "profiles");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const dataDir = path.join(profilesDir, "oc", "xdg", "data", "opencode");
+    fs.mkdirSync(dataDir, { recursive: true });
+    const db = new (require("better-sqlite3"))(path.join(dataDir, "opencode.db"));
+    db.exec(`CREATE TABLE session (id text PRIMARY KEY, directory text NOT NULL, title text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer);
+             CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
+             CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);`);
+    db.prepare("INSERT INTO session VALUES ('ses_1', ?, 'lint the repo', 1000, 2000, NULL)").run(cwd);
+    db.prepare("INSERT INTO message VALUES ('m_u1','ses_1',1000,1000,?)").run(JSON.stringify({ role: "user", time: { created: 1000 } }));
+    db.prepare("INSERT INTO part VALUES ('p1','m_u1','ses_1',1000,1000,?)").run(JSON.stringify({ type: "text", text: "lint please" }));
+    db.prepare("INSERT INTO message VALUES ('m_a1','ses_1',1500,1500,?)").run(JSON.stringify({ role: "assistant", time: { created: 1500 } }));
+
+    expect(manager.scanExternalSessions()).toBe(1);
+    const s = manager.listSessions()[0]!;
+    expect(s.agent).toBe("opencode");
+    expect(s.title).toBe("lint the repo");
+    expect(manager.activity(manager.getSession(s.id))).toMatchObject({ since: "1970-01-01T00:00:01.000Z" });
+
+    db.prepare("UPDATE message SET data = ? WHERE id='m_a1'").run(
+      JSON.stringify({ role: "assistant", time: { created: 1500, completed: 1900 }, tokens: { output: 7 } }),
+    );
+    db.prepare("INSERT INTO part VALUES ('p2','m_a1','ses_1',1500,1500,?)").run(JSON.stringify({ type: "text", text: "clean" }));
+    manager.syncTranscript(s.id);
+    expect(manager.activity(manager.getSession(s.id))).toBeNull();
+    db.close();
+  });
+
+  it("does not adopt empty sessions or scan profiles without live on", () => {
+    const { manager, home } = makeManager(okAdapter, { deps: { liveScanEnabled: (name) => name === "cx" } });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const profilesDir = path.join(home, "profiles");
+    writeCodexRollout(profilesDir, "01a04e08-f742-7aa2-b039-b3a952f6ef01", [cxMeta(cwd)]); // no user message
+    expect(manager.scanExternalSessions()).toBe(0);
   });
 });

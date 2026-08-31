@@ -304,14 +304,22 @@ describe("handoff", () => {
         .toEqual([{ name: "local (this shell)", on: true }]);
     });
 
-    // SessionStart/SessionEnd hooks are Claude Code's; there is nothing to set for other agents
-    it("leaves out profiles of other agents", () => {
+    // Hooks are Claude Code's; codex / opencode profiles carry a storage-scan flag instead
+    it("lists other agents' profiles as scan targets, with their own flag", () => {
       const targets = alwaysHandoffTargets(
         [prof("oc", "/home/u/.tiny/profiles/oc", "opencode"), prof("profile-1", "/home/u/.tiny/profiles/profile-1")],
         "/home/u/.claude",
         () => false,
+        (name) => name === "oc",
       );
-      expect(targets.map((t) => t.name)).toEqual(["/home/u/.claude (this shell)", "profile-1"]);
+      expect(targets).toEqual([
+        { name: "/home/u/.claude (this shell)", on: false },
+        { name: "profile-1", on: false },
+        { name: "oc (scan)", on: true },
+      ]);
+      // without a scan-flag reader (older callers) the entry still shows, defaulting to off
+      const bare = alwaysHandoffTargets([prof("oc", "/x", "opencode")], "/home/u/.claude", () => false);
+      expect(bare.at(-1)).toEqual({ name: "oc (scan)", on: false });
     });
 
     // A profile whose external config dir is gone must not take the whole report down
