@@ -115,7 +115,7 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
 - **Any code that spawns child processes must strip `ANTHROPIC_API_KEY` from the env**
   (leaving it set bills the API pay-as-you-go instead of the subscription; every
   existing spawn path already strips it)
-- Read test counts, not just pass/fail (currently server 365 / relay 37 / iOS unit 135
+- Read test counts, not just pass/fail (currently server 517 / relay 37 / iOS unit 145
   + 1 demo-UI + 3 live E2E [need a real tinyd — see HANDOFF]). **`xcodebuild test |
   tail` exits 0 even on failure** — always check for the literal
   `** TEST FAILED **` / `** TEST SUCCEEDED **` strings
@@ -136,6 +136,17 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
   serve`). **Editing `src/` does not affect it** → verify via `pnpm build` →
   `pnpm pack` → `npm i -g <tgz>` → `tiny daemon install` (`tiny doctor` detects "plist
   points at a different tiny" and daemon version mismatches)
+- **Claude Code's undocumented interfaces (the `~/.claude/sessions/` registry, the
+  `<pid>.<hash>.key` peer tokens, the `/tmp/cc-socks/<pid>.sock` messaging socket, the
+  `ps` argv heuristic) are touched only in `src/claude-peer.ts`.** Everything else goes
+  through the `PeerBridge` dependency of `SessionManager`, and every function there
+  degrades to null (or throws from send) so the caller falls back to refusing the turn
+  with 409. Do not read those files anywhere else. `src/claude-live.ts` (read-only
+  liveness) is the one pre-existing exception
+- **The rtk hook rewrites `git diff` / `grep` / `awk` pipelines too**, not just `npx` —
+  a review diff generated through it showed modified lines as unchanged context. Run
+  scripts that produce diffs for another reader with `rtk proxy bash <script>`, and
+  read API JSON with a Node `fetch` script rather than `curl`
 - The src/dist launch split lives only in `src/entry.ts` (shared by the plist in
   `daemon.ts` and the `tiny mcp-server` spawn in `mcp-launch.ts`). **Do not add more
   code that locates files relative to `import.meta.url`** (tsup splits chunks)
