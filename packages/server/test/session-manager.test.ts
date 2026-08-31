@@ -311,6 +311,51 @@ describe("SessionManager", () => {
       ]);
   });
 
+  // Interrupting is a normal action with a button in the app. At that moment the transcript already
+  // holds the prompt and a partial response, both of which tiny emitted natively as the turn ran
+  it("advances the cursor even when the turn fails or is interrupted", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    addProfile(profilesDir, "local", "claude", configDir);
+    const stores = createStores(openDb(":memory:"));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-f.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }) + "\n");
+
+    // writes the prompt and a partial answer, then throws — what an interrupt looks like from here
+    const throwing: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        fs.appendFileSync(file, [
+          JSON.stringify({ type: "user", uuid: "t-u", message: { role: "user", content: "from the phone" } }),
+          JSON.stringify({ type: "assistant", uuid: "t-a", message: { content: [{ type: "text", text: "half an" }] } }),
+        ].join("\n") + "\n");
+        p.emit({ type: "assistant_text", payload: { text: "half an" } });
+        throw new Error("interrupted");
+      },
+    };
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: throwing },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+    });
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-f" });
+    expect(session.sourceCursor).toBe("u1");
+
+    manager.startTurn(session.id, "from the phone");
+    await manager.waitForIdle(session.id);
+    expect(manager.getSession(session.id).status).toBe("idle");
+    expect(manager.getSession(session.id).sourceCursor).toBe("t-a");
+
+    const count = stores.events.count(session.id);
+    expect(manager.syncTranscript(session.id)).toBe(0);
+    expect(stores.events.count(session.id)).toBe(count);
+  });
+
   it("syncTranscript does not re-read a transcript whose path, size and mtime are unchanged", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");

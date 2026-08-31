@@ -194,6 +194,19 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Cursor bookkeeping on every exit path of a turn. Only for a session already tracking the CLI
+   * transcript — a null cursor means nothing has been imported and importOrSeed will seed it later.
+   */
+  private advanceCursorAfterTurn(id: string): void {
+    try {
+      const s = this.deps.stores.sessions.get(id);
+      if (s?.sourceCursor) this.advanceCursor(s);
+    } catch {
+      // bookkeeping must never mask the turn's own outcome (this runs in a finally)
+    }
+  }
+
+  /**
    * Move the cursor to the transcript's current tail without emitting anything.
    * Never throws — an unreadable transcript just leaves the cursor where it is.
    */
@@ -201,11 +214,34 @@ export class SessionManager extends EventEmitter {
     try {
       const file = this.transcriptFile(s);
       if (!file) return;
+      // Behind the same guard as syncTranscript: an unchanged file already has the cursor at its
+      // tail, so there is nothing to do and no reason to parse it again
+      const stat = this.transcriptChange(s.id, file);
+      if (!stat) return;
+      this.transcriptStats.set(s.id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
       const cursor = readTranscriptCursor(file);
       if (cursor && cursor !== s.sourceCursor) this.deps.stores.sessions.patch(s.id, { sourceCursor: cursor });
     } catch {
       // same non-throwing contract as syncTranscript: a missing transcript is normal
     }
+  }
+
+  /**
+   * The transcript's stat when it is worth reading, or null when there is nothing new (path, size
+   * and mtime all match the last read) or it cannot be stat'ed — both mean "do nothing".
+   * A caller that goes on to read must record the returned stat.
+   */
+  private transcriptChange(id: string, file: string): fs.Stats | null {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      return null;
+    }
+    const seen = this.transcriptStats.get(id);
+    // Any difference means read — a SMALLER file too, which is what a compact rewrite looks like
+    if (seen && seen.path === file && seen.size === stat.size && seen.mtimeMs === stat.mtimeMs) return null;
+    return stat;
   }
 
   /** The CLI transcript backing a session, or null when there is none (or the agent keeps no transcripts) */
@@ -232,15 +268,8 @@ export class SessionManager extends EventEmitter {
     if (s.status === "running") return 0;
     const file = this.transcriptFile(s);
     if (!file) return 0;
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(file);
-    } catch {
-      return 0;
-    }
-    const seen = this.transcriptStats.get(id);
-    // Any difference means read — a SMALLER file too, which is what a compact rewrite looks like
-    if (seen && seen.path === file && seen.size === stat.size && seen.mtimeMs === stat.mtimeMs) return 0;
+    const stat = this.transcriptChange(id, file);
+    if (!stat) return 0;
     // Record the pre-read stat: if the CLI appends between the stat and the read, the next call
     // reads again rather than skipping records (the cursor keeps that from duplicating anything)
     this.transcriptStats.set(id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
@@ -392,10 +421,6 @@ export class SessionManager extends EventEmitter {
         signal,
       });
       this.deps.stores.sessions.patch(s.id, { status: "idle", agentSessionId: result.agentSessionId });
-      // This turn appended to the same transcript the user's CLI writes, and every one of those
-      // records was already emitted natively above. Skip past them so a later sync cannot replay them
-      const after = this.deps.stores.sessions.get(s.id);
-      if (after?.sourceCursor) this.advanceCursor(after);
     } catch (err) {
       const raw = err instanceof Error ? err.message : String(err);
       // A throw while interrupting means the adapter was still starting up (session/new, load, thread/start, ...).
@@ -408,6 +433,12 @@ export class SessionManager extends EventEmitter {
       this.emitEvent(s.id, type, { error: message });
       this.deps.stores.sessions.patch(s.id, { status: "idle" });
     } finally {
+      // This turn appended to the same transcript the user's CLI writes, and every one of those
+      // records was already emitted natively above. Skip past them so a later sync cannot replay
+      // them — on the failure and interrupt paths too, where the transcript already holds the
+      // prompt and a partial response. Runs after both status patches, so the running guard in
+      // syncTranscript is lifted by the time anything reads the cursor
+      this.advanceCursorAfterTurn(s.id);
       if (mcpToken) this.deps.sessionTokens!.revokeSessionTokens(s.id);
     }
   }
