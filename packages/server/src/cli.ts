@@ -44,6 +44,43 @@ export function buildAttachCommand(session: SessionRecord, profilesDir: string):
   };
 }
 
+export interface HandoffInput {
+  /** Session id of the Claude Code process that invoked us. null when not run inside one */
+  agentSessionId: string | null;
+  /** CLAUDE_CONFIG_DIR the caller is running under */
+  configDir: string;
+}
+
+/**
+ * Where `tiny handoff` gets its inputs. CLAUDE_CODE_SESSION_ID is an official variable:
+ * the changelog documents it as matching the session_id passed to hooks.
+ */
+export function resolveHandoffInput(
+  env: Record<string, string | undefined>,
+  _cwd: string,
+): HandoffInput {
+  const sid = env.CLAUDE_CODE_SESSION_ID;
+  return {
+    agentSessionId: typeof sid === "string" && sid !== "" ? sid : null,
+    configDir: env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
+  };
+}
+
+/** Find (or create) the profile that points at this CLAUDE_CONFIG_DIR. Returns its name */
+export function ensureHandoffProfile(profilesDir: string, configDir: string, name = "local"): string {
+  for (const p of listProfiles(profilesDir)) {
+    if (p.dir === configDir) return p.name;
+  }
+  let candidate = name;
+  let n = 1;
+  while (fs.existsSync(path.join(profilesDir, candidate))) {
+    n += 1;
+    candidate = `${name}-${n}`;
+  }
+  addProfile(profilesDir, candidate, "claude", configDir);
+  return candidate;
+}
+
 export function resolveSessionId(sessions: SessionRecord[], prefix: string): string {
   const hits = sessions.filter((s) => s.id.startsWith(prefix));
   if (hits.length === 0) throw new Error(`session not found: ${prefix}`);
@@ -261,6 +298,50 @@ program
       if (r.error) throw r.error;
     } finally {
       await api(`/v1/sessions/${id}/detach`, { method: "POST", body: JSON.stringify({ detached: false }) });
+    }
+  });
+
+program
+  .command("handoff")
+  .description("hand the Claude Code session you are in over to tiny (the reverse of `tiny attach`)")
+  .option("--auto", "hook mode: never fail the caller (always exits 0)")
+  .option("--ended", "session ended: drop it if it never got a single event")
+  .option("--profile <name>", "profile to adopt into (default: the one pointing at CLAUDE_CONFIG_DIR)")
+  .option("--session <id>", "agent session id (default: $CLAUDE_CODE_SESSION_ID)")
+  .option("--config-dir <dir>", "CLAUDE_CONFIG_DIR to adopt from (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
+  .action(async (opts: {
+    auto?: boolean; ended?: boolean; profile?: string; session?: string; configDir?: string;
+  }) => {
+    const p = tinyPaths();
+    const env = resolveHandoffInput(process.env, process.cwd());
+    const agentSessionId = opts.session ?? env.agentSessionId;
+    const configDir = opts.configDir ?? env.configDir;
+    try {
+      if (!agentSessionId) {
+        throw new Error("no session id (run this inside Claude Code, or pass --session <id>)");
+      }
+      if (opts.ended) {
+        const r = (await api("/v1/sessions/discard-empty", {
+          method: "POST",
+          body: JSON.stringify({ agentSessionId }),
+        })) as { discarded: boolean };
+        if (!opts.auto) console.log(r.discarded ? "Discarded (no activity)" : "Kept");
+        return;
+      }
+      const profile = opts.profile ?? ensureHandoffProfile(p.profilesDir, configDir);
+      const s = (await api("/v1/sessions/adopt", {
+        method: "POST",
+        body: JSON.stringify({ profile, cwd: process.cwd(), agentSessionId }),
+      })) as SessionRecord;
+      if (!opts.auto) console.log(`Handed off: ${s.id} (${s.title ?? s.cwd})`);
+    } catch (err) {
+      // In hook mode a failure must never get in the way of the agent starting up
+      const msg = err instanceof Error ? err.message : String(err);
+      if (opts.auto) {
+        console.error(`[tiny] handoff skipped: ${msg}`);
+        return;
+      }
+      throw err;
     }
   });
 
