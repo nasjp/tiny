@@ -74,13 +74,14 @@ describe("AcpAdapter", () => {
 
       expect(result).toEqual({ agentSessionId: "ses_fake1", costUsd: 0.0228, resultText: "I will run it.\ndone" });
       expect(events.map((e) => e.type)).toEqual([
-        "turn_started", "assistant_text", "tool_started", "tool_finished", "assistant_text", "turn_completed",
+        "turn_started", "assistant_thinking", "assistant_text", "tool_started", "tool_finished", "assistant_text", "turn_completed",
       ]);
       expect(events[0]!.payload).toEqual({ agentSessionId: "ses_fake1" });
-      expect(events[1]!.payload).toEqual({ text: "I will run it." });
-      expect(events[2]!.payload).toMatchObject({ toolUseId: "toolu_1", toolName: "bash", kind: "execute", summary: "bash", input: { cwd: "/tmp/repo" } });
-      expect(events[3]!.payload).toEqual({ toolUseId: "toolu_1", isError: false });
-      expect(events[5]!.payload).toEqual({ costUsd: 0.0228, resultText: "I will run it.\ndone", contextTokens: 16488 });
+      expect(events[1]!.payload).toEqual({ text: "thinking" });
+      expect(events[2]!.payload).toEqual({ text: "I will run it." });
+      expect(events[3]!.payload).toMatchObject({ toolUseId: "toolu_1", toolName: "bash", kind: "execute", summary: "bash", input: { cwd: "/tmp/repo" } });
+      expect(events[4]!.payload).toEqual({ toolUseId: "toolu_1", isError: false });
+      expect(events[6]!.payload).toEqual({ costUsd: 0.0228, resultText: "I will run it.\ndone", contextTokens: 16488 });
       assertTurnEventInvariants(events);
 
       // spawn: the driver's launch, cwd, and agentEnv (drops stripEnv, adds the home env)
@@ -412,5 +413,46 @@ describe("AcpAdapter", () => {
     await expect(run).rejects.toThrow(/interrupted before the turn started/);
     expect(events).toEqual([]);
     expect(fake.killed).toBe(1);
+  });
+});
+
+describe("AcpAdapter thought narration", () => {
+  it("buffers streamed thought chunks into one narration, kept out of resultText", async () => {
+    const fake = fakeAcpAgent({
+      onPrompt: async (ctx) => {
+        upd(ctx, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "The user wants" } });
+        upd(ctx, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: " pong." } });
+        upd(ctx, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "" } });
+        upd(ctx, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "pong" } });
+        return { stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+      },
+    });
+    const { p, events } = baseParams();
+    const result = await new AcpAdapter(driver, { spawn: fake.spawn }).runTurn(p);
+    expect(events.map((e) => e.type)).toEqual(["turn_started", "assistant_thinking", "assistant_text", "turn_completed"]);
+    expect(events[1]!.payload).toEqual({ text: "The user wants pong." });
+    expect(result.resultText).toBe("pong");
+    assertTurnEventInvariants(events);
+  });
+
+  it("keeps interleaved thought and answer chunks in arrival order, and drops empty thought", async () => {
+    const fake = fakeAcpAgent({
+      onPrompt: async (ctx) => {
+        upd(ctx, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "First." } });
+        upd(ctx, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Then a note." } });
+        upd(ctx, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "" } });
+        upd(ctx, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Second." } });
+        upd(ctx, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: " \n " } });
+        return { stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+      },
+    });
+    const { p, events } = baseParams();
+    const result = await new AcpAdapter(driver, { spawn: fake.spawn }).runTurn(p);
+    expect(events.map((e) => e.type)).toEqual([
+      "turn_started", "assistant_text", "assistant_thinking", "assistant_text", "turn_completed",
+    ]);
+    expect(events[2]!.payload).toEqual({ text: "Then a note." });
+    expect(result.resultText).toBe("First.\nSecond.");
+    assertTurnEventInvariants(events);
   });
 });

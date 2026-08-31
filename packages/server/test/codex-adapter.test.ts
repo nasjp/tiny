@@ -850,3 +850,52 @@ describe("CodexAdapter", () => {
     expect(fake.killed).toBe(1);
   });
 });
+
+describe("CodexAdapter narration and progress", () => {
+  it("shows commentary agentMessages and populated reasoning as narration, kept out of resultText", async () => {
+    const fake = fakeCodexServer({
+      onTurn: async (ctx) => {
+        ctx.notify("turn/started", { threadId: ctx.threadId, turn: { id: ctx.turnId } });
+        item(ctx, "item/completed", { type: "reasoning", id: "rsn_0", summary: [], content: [] });
+        item(ctx, "item/completed", { type: "agentMessage", id: "msg_c", text: "Applying the skill first.", phase: "commentary" });
+        item(ctx, "item/completed", { type: "reasoning", id: "rsn_1", summary: [{ type: "summary_text", text: "Weighing the two fixes." }] });
+        item(ctx, "item/completed", { type: "agentMessage", id: "msg_f", text: "204", phase: "final_answer" });
+        return COMPLETED;
+      },
+    });
+    const { p, events } = baseParams();
+    const result = await new CodexAdapter(driver, { spawn: fake.spawn }).runTurn(p);
+    expect(events.map((e) => e.type)).toEqual([
+      "turn_started", "assistant_thinking", "assistant_thinking", "assistant_text", "turn_completed",
+    ]);
+    expect(events[1]!.payload).toEqual({ text: "Applying the skill first." });
+    expect(events[2]!.payload).toEqual({ text: "Weighing the two fixes." });
+    expect(events[3]!.payload).toEqual({ text: "204" });
+    expect(result.resultText).toBe("204");
+    expect(events.at(-1)!.payload.resultText).toBe("204");
+    assertTurnEventInvariants(events);
+  });
+
+  it("reports the turn's cumulative output tokens from tokenUsage.total", async () => {
+    const usage = (total: number, last: number) => ({
+      total: { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: total },
+      last: { totalTokens: 0, inputTokens: 3, cachedInputTokens: 1, outputTokens: last },
+      modelContextWindow: 400000,
+    });
+    const fake = fakeCodexServer({
+      onTurn: async (ctx) => {
+        ctx.notify("turn/started", { threadId: ctx.threadId, turn: { id: ctx.turnId } });
+        ctx.notify("thread/tokenUsage/updated", { threadId: ctx.threadId, tokenUsage: usage(207, 207) });
+        ctx.notify("thread/tokenUsage/updated", { threadId: ctx.threadId, tokenUsage: usage(212, 5) });
+        item(ctx, "item/completed", { type: "agentMessage", id: "msg_1", text: "ok" });
+        return COMPLETED;
+      },
+    });
+    const seen: number[] = [];
+    const { p, events } = baseParams({ progress: (pr) => seen.push(pr.outputTokens) });
+    await new CodexAdapter(driver, { spawn: fake.spawn }).runTurn(p);
+    expect(seen).toEqual([207, 212]);
+    // contextTokens still comes from `last` (3 + 1 + 5)
+    expect(events.at(-1)!.payload.contextTokens).toBe(9);
+  });
+});

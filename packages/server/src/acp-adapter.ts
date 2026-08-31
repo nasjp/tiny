@@ -102,6 +102,7 @@ export class AcpAdapter implements AgentAdapter {
     let sessionId: string | null = null;
     let replaying = false; // discard notifications while session/load replays history
     let textBuf = "";
+    let thoughtBuf = "";
     const texts: string[] = [];
     const started = new Map<string, { toolName: string }>();
     const finished = new Set<string>();
@@ -120,6 +121,16 @@ export class AcpAdapter implements AgentAdapter {
       texts.push(textBuf);
       p.emit({ type: "assistant_text", payload: { text: textBuf } });
       textBuf = "";
+    };
+    // The model's reasoning narration (measured on opencode 1.18: streamed in pieces, with a
+    // trailing empty chunk). Shown like Claude's thinking line; never part of resultText/the push
+    const flushThought = () => {
+      if (thoughtBuf.trim() === "") {
+        thoughtBuf = "";
+        return;
+      }
+      p.emit({ type: "assistant_thinking", payload: { text: thoughtBuf } });
+      thoughtBuf = "";
     };
     const finish = (id: string, isError: boolean) => {
       if (finished.has(id)) return;
@@ -143,13 +154,26 @@ export class AcpAdapter implements AgentAdapter {
       });
     };
 
+    // Each chunk arrival flushes the OTHER buffer, so at most one of textBuf / thoughtBuf is ever
+    // non-empty and interleaved thought → answer → thought sequences come out in arrival order
     const onUpdate = (u: SessionUpdate) => {
       switch (u.sessionUpdate) {
         case "agent_message_chunk":
-          if (u.content?.type === "text" && typeof u.content.text === "string") textBuf += u.content.text;
+          if (u.content?.type === "text" && typeof u.content.text === "string") {
+            flushThought();
+            textBuf += u.content.text;
+          }
+          break;
+        case "agent_thought_chunk":
+          if (u.content?.type === "text" && typeof u.content.text === "string") {
+            flushText();
+            thoughtBuf += u.content.text;
+          }
           break;
         case "tool_call":
         case "tool_call_update": {
+          flushThought(); // a narration that led into this tool goes out before the tool card
+
           const tc = u as AcpToolCall & SessionUpdate;
           if (!started.has(tc.toolCallId)) startTool(tc); // some agents omit tool_call
           if (isTerminal(tc.status)) finish(tc.toolCallId, tc.status === "failed");
@@ -160,7 +184,7 @@ export class AcpAdapter implements AgentAdapter {
           if (typeof u.cost?.amount === "number") costUsd = u.cost.amount;
           break;
         default:
-          break; // thought / plan / available_commands / mode / config are dropped in v1
+          break; // plan / available_commands / mode / config are dropped in v1
       }
     };
     conn.onNotification("session/update", (params) => {
@@ -332,6 +356,7 @@ export class AcpAdapter implements AgentAdapter {
           if (killTimer) clearTimeout(killTimer);
         }
 
+        flushThought();
         flushText();
         const resultText = texts.length > 0 ? texts.join("\n") : null;
         const stop = res?.stopReason ?? "end_turn";
@@ -347,6 +372,7 @@ export class AcpAdapter implements AgentAdapter {
         }
         return { agentSessionId: sessionId, costUsd, resultText };
       } catch (err) {
+        flushThought();
         flushText();
         for (const id of started.keys()) finish(id, true); // synthesize unfinished tools (turn_failed, so isError)
         const resultText = texts.length > 0 ? texts.join("\n") : null;
