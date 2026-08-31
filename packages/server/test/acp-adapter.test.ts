@@ -513,3 +513,36 @@ describe("AcpAdapter choices mirror", () => {
     expect(readAcpChoices(profileDir)).toBeNull();
   });
 });
+
+describe("AcpAdapter output-token progress", () => {
+  it("reports outputTokens when an update or the prompt response carries them, and stays silent otherwise", async () => {
+    const fake = fakeAcpAgent({
+      onPrompt: async (ctx) => {
+        upd(ctx, { sessionUpdate: "usage_update", used: 100, size: 1000, cost: { amount: 0.01, currency: "USD" } });
+        // what the unstable ACP Usage shape would look like folded into usage_update
+        upd(ctx, { sessionUpdate: "usage_update", used: 200, size: 1000, outputTokens: 55 });
+        upd(ctx, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } });
+        return { stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 72, totalTokens: 300 } };
+      },
+    });
+    const seen: number[] = [];
+    const { p, events } = baseParams({ progress: (pr) => seen.push(pr.outputTokens) });
+    await new AcpAdapter(driver, { spawn: fake.spawn }).runTurn(p);
+    expect(seen).toEqual([55, 72]);
+    expect(events.at(-1)!.payload.contextTokens).toBe(200);
+  });
+
+  it("today's opencode wire shape (no token fields anywhere) reports nothing", async () => {
+    const fake = fakeAcpAgent({
+      onPrompt: async (ctx) => {
+        upd(ctx, { sessionUpdate: "usage_update", used: 16203, size: 200000, cost: { amount: 0.02, currency: "USD" } });
+        upd(ctx, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "pong" } });
+        return { stopReason: "end_turn", usage: { inputTokens: 10, totalTokens: 300 } };
+      },
+    });
+    const seen: number[] = [];
+    const { p } = baseParams({ progress: (pr) => seen.push(pr.outputTokens) });
+    await new AcpAdapter(driver, { spawn: fake.spawn }).runTurn(p);
+    expect(seen).toEqual([]);
+  });
+});
