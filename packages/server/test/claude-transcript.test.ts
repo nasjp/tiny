@@ -458,6 +458,70 @@ describe("claude-transcript peer and command records", () => {
     expect(readTranscript(file).events[0]!.payload.text).toBe("see </teammate-message> in the docs");
   });
 
+  // Agent teams inject their notifications as a JSON blob inside the wrapper. The phone showed it
+  // verbatim — braces, quotes and \n escapes across half a screen (device report)
+  it("shows the part of an agent-teams notification that was written for a person", () => {
+    const result = "レビューを完了し、team-lead へ結果（Approved）を送信しました。\n\n要点:\n- 5 ファイルとも反映";
+    writeJsonl(file, [{
+      type: "user", uuid: "u1",
+      message: { role: "user", content:
+        "Another Claude session sent a message:\n<teammate-message teammate_id=\"review-b2\" color=\"blue\">\n"
+        + JSON.stringify({ type: "idle_notification", from: "review-b2", timestamp: "2026-08-31T14:23:47.220Z", idleReason: "available", result })
+        + "\n</teammate-message>" + FOOTER },
+    }]);
+    expect(readTranscript(file).events).toEqual([{
+      type: "peer_message",
+      payload: { from: "review-b2", summary: "Went idle", text: result },
+    }]);
+  });
+
+  it("says what happened when a notification carries nothing written for a person", () => {
+    writeJsonl(file, [{
+      type: "user", uuid: "u1",
+      message: { role: "user", content:
+        "Another Claude session sent a message:\n<teammate-message teammate_id=\"verify-f11\">\n"
+        + JSON.stringify({ type: "idle_notification", from: "verify-f11", idleReason: "available" })
+        + "\n</teammate-message>" + FOOTER },
+    }]);
+    expect(readTranscript(file).events).toEqual([{
+      type: "peer_message",
+      payload: { from: "verify-f11", text: "Went idle (available)" },
+    }]);
+  });
+
+  // An unknown payload must stay complete — just readable instead of one endless line
+  it("lays out a JSON payload it does not recognise instead of printing it on one line", () => {
+    writeJsonl(file, [{
+      type: "user", uuid: "u1",
+      message: { role: "user", content:
+        "<cross-session-message from-name=\"planner\">\n" + JSON.stringify({ type: "handover", tasks: ["a", "b"] })
+        + "\n</cross-session-message>" },
+    }]);
+    const payload = readTranscript(file).events[0]!.payload as { summary?: string; text: string };
+    expect(payload.summary).toBe("handover");
+    expect(payload.text).toBe(JSON.stringify({ type: "handover", tasks: ["a", "b"] }, null, 2));
+  });
+
+  // The sender's own summary attribute is the one written by hand; it wins over ours
+  it("keeps the wrapper's summary when the body is a notification too", () => {
+    writeJsonl(file, [{
+      type: "user", uuid: "u1",
+      message: { role: "user", content:
+        "<teammate-message teammate_id=\"b2\" summary=\"Review approved\">\n"
+        + JSON.stringify({ type: "idle_notification", result: "done" }) + "\n</teammate-message>" },
+    }]);
+    expect(readTranscript(file).events[0]!.payload).toEqual({ from: "b2", summary: "Review approved", text: "done" });
+  });
+
+  it("leaves a body that merely starts with a brace alone", () => {
+    writeJsonl(file, [{
+      type: "user", uuid: "u1",
+      message: { role: "user", content:
+        "<teammate-message teammate_id=\"b2\">\n{not json, just text}\n</teammate-message>" },
+    }]);
+    expect(readTranscript(file).events[0]!.payload.text).toBe("{not json, just text}");
+  });
+
   it("does not mistake a person mentioning a tag for a peer message", () => {
     writeJsonl(file, [{
       type: "user", uuid: "u1",
