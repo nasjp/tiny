@@ -84,6 +84,11 @@ struct EventRow: View {
                 .textCase(.uppercase).kerning(1.5)
                 .frame(maxWidth: .infinity, alignment: .center)
 
+        case .cliAttention(let reason):
+            Label("Waiting in the terminal: \(reason)", systemImage: "terminal")
+                .font(.caption).foregroundStyle(Color.tDetached)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
         case .turnStarted, .permissionRequested, .permissionResolved, .unknown:
             // turnStarted is the progress indicator, permissions are banners, and
             // AskUserQuestion answers are converted by buildChatItems into .qa cards

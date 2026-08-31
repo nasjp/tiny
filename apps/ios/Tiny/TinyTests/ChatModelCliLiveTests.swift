@@ -36,11 +36,11 @@ final class ChatModelCliLiveTests: XCTestCase {
         }
     }
 
-    private func makeSession(cliLive: Bool?) -> SessionRecord {
+    private func makeSession(cliLive: Bool?, cliJoin: Bool? = nil) -> SessionRecord {
         SessionRecord(id: "s1", agentSessionId: nil, agent: "claude", profile: "default",
                       cwd: "/tmp", permissionMode: .default, model: nil, effort: nil,
                       title: nil, status: .idle, createdAt: "2026-08-31T00:00:00Z",
-                      updatedAt: "2026-08-31T00:00:00Z", cliLive: cliLive)
+                      updatedAt: "2026-08-31T00:00:00Z", cliLive: cliLive, cliJoin: cliJoin)
     }
 
     func testInitSourcesFromThePushedSession() {
@@ -73,5 +73,14 @@ final class ChatModelCliLiveTests: XCTestCase {
         backend.sessionsList = []
         await model.refreshCliLive()
         XCTAssertTrue(model.isHeldByCLI, "a failed or empty fetch must not silently unlock the composer")
+    }
+
+    func testRefreshUnlocksOnceTheServerCanJoinTheCLI() async {
+        let backend = MockBackend()
+        let model = ChatModel(backend: backend, session: makeSession(cliLive: true, cliJoin: false))
+        XCTAssertTrue(model.isHeldByCLI)
+        backend.sessionsList = [makeSession(cliLive: true, cliJoin: true)]
+        await model.refreshCliLive()
+        XCTAssertFalse(model.isHeldByCLI, "once tinyd can join, the composer must unlock without reopening the chat")
     }
 }

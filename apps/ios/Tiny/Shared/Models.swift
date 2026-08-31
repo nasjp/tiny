@@ -106,8 +106,13 @@ struct SessionRecord: Codable, Identifiable, Hashable {
     /// (or is older than this feature). Older servers omit the key.
     var cliLive: Bool? = nil
 
-    /// Only a definite true locks the composer — "cannot tell" must not take the session away
-    var isHeldByCLI: Bool { cliLive == true }
+    /// true = a turn sent now runs inside that CLI (live join), so the session behaves like any other
+    /// from here. Older servers omit the key.
+    var cliJoin: Bool? = nil
+
+    /// Only a definite "live and NOT joinable" locks the composer (and shows the CLI badge / note).
+    /// "Cannot tell" must not take the session away, and a joinable session is not the user's concern
+    var isHeldByCLI: Bool { cliLive == true && cliJoin != true }
 
     var displayTitle: String { title ?? (cwd as NSString).lastPathComponent }
 }
@@ -241,6 +246,8 @@ enum TinyEvent: Equatable {
     case permissionResolved(reqId: String, behavior: String, answers: [String: String]?)
     case fileSent(fileId: String, mime: String, caption: String?, name: String)
     case sessionStateChanged(status: String)
+    /// The CLI that owns a live turn is waiting for its user (a permission prompt in the terminal)
+    case cliAttention(reason: String)
     case unknown(type: String)
 
     init(type: String, payload: JSONValue) {
@@ -291,6 +298,8 @@ enum TinyEvent: Equatable {
                              caption: str("caption"), name: str("name") ?? "")
         case "session_state_changed":
             self = .sessionStateChanged(status: str("status") ?? "")
+        case "cli_attention":
+            self = .cliAttention(reason: str("reason") ?? "input")
         default:
             self = .unknown(type: type)
         }

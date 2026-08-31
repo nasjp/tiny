@@ -220,6 +220,33 @@ final class ModelsTests: XCTestCase {
         XCTAssertFalse(s.isHeldByCLI)
     }
 
+    func testCliJoinUnlocksTheComposerWhileTheCLIStaysLive() throws {
+        let json = """
+        {"id":"s1","agentSessionId":"a1","agent":"claude","profile":"local","cwd":"/tmp",
+         "permissionMode":"default","model":null,"effort":null,"title":"t","status":"idle",
+         "createdAt":"2026-08-31T00:00:00Z","updatedAt":"2026-08-31T00:00:00Z","cliLive":true,"cliJoin":true}
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(SessionRecord.self, from: json)
+        XCTAssertEqual(s.cliJoin, true)
+        XCTAssertFalse(s.isHeldByCLI, "a joinable CLI session looks and behaves like any other: no lock, no badge, no note")
+    }
+
+    func testCliJoinFalseKeepsTheStepOneLock() throws {
+        let json = """
+        {"id":"s1","agentSessionId":"a1","agent":"claude","profile":"local","cwd":"/tmp",
+         "permissionMode":"default","model":null,"effort":null,"title":"t","status":"idle",
+         "createdAt":"2026-08-31T00:00:00Z","updatedAt":"2026-08-31T00:00:00Z","cliLive":true,"cliJoin":false}
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(SessionRecord.self, from: json)
+        XCTAssertTrue(s.isHeldByCLI)
+    }
+
+    func testDecodesCliAttention() {
+        let ev = TinyEvent(type: "cli_attention", payload: .object(["reason": .string("permission prompt")]))
+        XCTAssertEqual(ev, .cliAttention(reason: "permission prompt"))
+        XCTAssertEqual(TinyEvent(type: "cli_attention", payload: .object([:])), .cliAttention(reason: "input"))
+    }
+
     func testPushIntentDecodesWithAndWithoutReqId() throws {
         let a = try JSONDecoder().decode(PushIntent.self, from: Data("""
         {"v":1,"type":"permission_requested","sessionId":"s","eventId":42,
