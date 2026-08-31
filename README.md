@@ -5,7 +5,7 @@ iPhone app, and hand the same session back to the agent's own CLI (`claude --res
 etc.) whenever you want.
 
 <p align="center">
-  <img src="docs/images/session.png" width="320" alt="A session in the tiny iPhone app: the agent's progress, a file card it sent, and a pending permission request with Deny / Allow buttons">
+  <img src="docs/images/screenshots.png" alt="tiny on iPhone: approve tool calls from your phone, answer the agent's questions, and get files sent to your phone">
 </p>
 
 ## Supported agents
