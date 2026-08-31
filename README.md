@@ -78,6 +78,7 @@ tiny new --profile <name> --cwd <dir>    # create a session
 tiny attach <first 8 chars of id>        # hand the session to that agent's CLI (returns to tiny when it exits)
 tiny handoff                             # hand the Claude Code session you're currently in to tiny (reverse of attach)
 tiny live [on|off]                       # toggle automatic handoff of every new Claude Code session (default: manual — off)
+tiny live on --profile <name>            #   ... for one tiny profile instead of the config dir you are in
 
 tiny profiles ls                         # list profiles
 tiny profiles add <name> --agent <id>    # add one (then: tiny profiles login <name>)
@@ -113,6 +114,14 @@ tiny live on
 Every new Claude Code session is then handed over on its own, and you never type `handoff`
 again. Turn it off with `tiny live off`; it only adds two hooks to your agent's own
 `settings.json` and removes exactly those when you turn it off.
+
+That acts on the config directory your own shell uses (`$CLAUDE_CONFIG_DIR`, or `~/.claude`).
+Each tiny profile has its own, so name the profile to turn it on there:
+
+```bash
+tiny live on --profile work    # or --config-dir <dir> for a directory tiny does not know about
+tiny live --profile work       # show what it is set to
+```
 
 ### Sending to a session the CLI still has open
 

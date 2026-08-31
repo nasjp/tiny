@@ -46,12 +46,12 @@ pnpm build       # bundles the server with tsup into dist/cli.js (the distribute
 pnpm tiny serve                       # run tinyd in the foreground
 pnpm tiny daemon install              # run it under launchd
 pnpm tiny setup                       # one path: prerequisites → profile → login → URL → daemon → QR
-pnpm tiny doctor                      # environment diagnosis (setup / doctor both take [--agent <id>] [--profile <name>])
+pnpm tiny doctor                      # environment diagnosis (no options; `setup` takes [--agent <id>] [--profile <name>])
 pnpm tiny ls | new | attach <id>      # list / create / hand a session to the CLI
 pnpm tiny handoff [--auto] [--ended] [--profile <name>] [--session <id>] [--config-dir <dir>]  # hand the current session to tiny (reverse of attach)
 #   ^ run it from inside the Claude Code session you want to hand over, typed as `!tiny handoff`.
 #     Asking the agent in prose misfires: `handoff` collides with a skill name and the skill runs instead.
-pnpm tiny live [on|off]               # toggle automatic handoff of every new session (default: manual — off)
+pnpm tiny live [on|off] [--profile <name> | --config-dir <dir>]  # toggle automatic handoff of every new session (default: manual — off; without a target it acts on the caller's own CLAUDE_CONFIG_DIR)
 pnpm tiny profiles ls | add <name> | rename <old> <new> | login <name>
 pnpm tiny pair                        # show the pairing QR
 pnpm tiny devices                     # list paired devices
