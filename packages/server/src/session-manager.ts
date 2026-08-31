@@ -5,6 +5,7 @@ import type { AgentAdapter, TurnImage } from "./adapter.js";
 import type { McpLaunch } from "./mcp-launch.js";
 import type { FileOutbox } from "./outbox.js";
 import { profileDir, profileDriver } from "./profiles.js";
+import { findTranscript, readTranscript } from "./claude-transcript.js";
 import type { AgentCapabilities } from "./agents/index.js";
 import type { PendingPermission, PermissionBroker, PermissionDecision } from "./permission-broker.js";
 import type { SessionPatch, Stores } from "./stores.js";
@@ -101,6 +102,90 @@ export class SessionManager extends EventEmitter {
     };
     this.deps.stores.sessions.create(rec);
     return rec;
+  }
+
+  /** How many transcript messages a first backfill imports (a 12MB transcript exists in the wild) */
+  private static readonly BACKFILL_LIMIT = 50;
+
+  /**
+   * Register a session that was started in the agent's own CLI (`tiny handoff`).
+   * Idempotent: SessionStart hooks fire again on resume / fork / clear.
+   */
+  adoptSession(input: {
+    agent?: string;
+    profile: string;
+    cwd: string;
+    agentSessionId: string;
+    model?: string;
+    effort?: string;
+    permissionMode?: PermissionModeValue;
+  }): { session: SessionRecord; adopted: boolean } {
+    const dir = profileDir(this.deps.profilesDir, input.profile); // throws if missing
+    const driver = profileDriver(this.deps.profilesDir, input.profile);
+    const caps = driver.capabilities(dir);
+    assertChoices(caps, input);
+    if (!fs.existsSync(input.cwd) || !fs.statSync(input.cwd).isDirectory()) {
+      throw new NotFoundError(`cwd not found: ${input.cwd}`);
+    }
+    const existing = this.deps.stores.sessions.byAgentSessionId(input.agentSessionId);
+    if (existing) {
+      this.syncTranscript(existing.id);
+      return { session: this.getSession(existing.id), adopted: false };
+    }
+    const now = new Date().toISOString();
+    const rec: SessionRecord = {
+      id: crypto.randomUUID(),
+      agentSessionId: input.agentSessionId,
+      agent: driver.id,
+      profile: input.profile,
+      cwd: input.cwd,
+      permissionMode: input.permissionMode ?? caps.permissionModes[0]?.id ?? "default",
+      model: input.model ?? null,
+      effort: input.effort ?? null,
+      title: null,
+      status: "idle",
+      archivedAt: null,
+      sourceCursor: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.deps.stores.sessions.create(rec);
+    this.syncTranscript(rec.id);
+    return { session: this.getSession(rec.id), adopted: true };
+  }
+
+  /**
+   * Import transcript records written by the agent's own CLI since the last import.
+   * Returns how many events were appended. Never throws — a missing transcript is normal.
+   */
+  syncTranscript(id: string): number {
+    const s = this.getSession(id);
+    if (!s.agentSessionId || s.agent !== "claude") return 0;
+    let file: string | null = null;
+    try {
+      file = findTranscript(profileDir(this.deps.profilesDir, s.profile), s.cwd, s.agentSessionId);
+    } catch {
+      return 0;
+    }
+    if (!file) return 0;
+    const read = readTranscript(file, {
+      sinceUuid: s.sourceCursor,
+      ...(s.sourceCursor ? {} : { limit: SessionManager.BACKFILL_LIMIT }),
+    });
+    for (const ev of read.events) this.emitEvent(id, ev.type, ev.payload);
+    const patch: SessionPatch = {};
+    if (read.cursor && read.cursor !== s.sourceCursor) patch.sourceCursor = read.cursor;
+    if (read.title && !s.title) patch.title = read.title;
+    if (Object.keys(patch).length > 0) this.deps.stores.sessions.patch(id, patch);
+    return read.events.length;
+  }
+
+  /** SessionEnd path: drop a handoff session that never got a single event */
+  discardIfEmpty(agentSessionId: string): boolean {
+    const s = this.deps.stores.sessions.byAgentSessionId(agentSessionId);
+    if (!s) return false;
+    if (this.deps.stores.events.count(s.id) > 0) return false;
+    return this.deps.stores.sessions.delete(s.id);
   }
 
   /** Mid-session change of model / permission mode / archived. Does not affect a running turn; takes effect from the next turn */

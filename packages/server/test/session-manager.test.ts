@@ -97,6 +97,89 @@ describe("SessionManager", () => {
     expect(() => manager.getSession("missing")).toThrow(NotFoundError);
   });
 
+  it("adopts a CLI session idempotently and backfills the transcript", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-9.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: "ai-title", aiTitle: "From CLI" }),
+      JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "hello" } }),
+      JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "hi" }] } }),
+    ].join("\n") + "\n");
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+
+    const first = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-9" });
+    expect(first.adopted).toBe(true);
+    expect(first.session.agentSessionId).toBe("agent-9");
+    expect(first.session.title).toBe("From CLI");
+    expect(first.session.sourceCursor).toBe("a1");
+    expect(stores.events.listSince(first.session.id, 0).map((e) => e.type))
+      .toEqual(["user_message", "assistant_text"]);
+
+    // SessionStart fires again on resume: must not create a second row
+    const second = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-9" });
+    expect(second.adopted).toBe(false);
+    expect(second.session.id).toBe(first.session.id);
+    expect(stores.sessions.list().filter((s) => s.agentSessionId === "agent-9")).toHaveLength(1);
+    // and must not duplicate the events
+    expect(stores.events.listSince(first.session.id, 0)).toHaveLength(2);
+  });
+
+  it("adopts a session with no transcript yet", () => {
+    const { manager, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const r = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-x" });
+    expect(r.adopted).toBe(true);
+    expect(r.session.title).toBeNull();
+    expect(r.session.sourceCursor).toBeNull();
+  });
+
+  it("rejects adopting into a cwd that does not exist", () => {
+    const { manager, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    expect(() => manager.adoptSession({ profile: "local", cwd: "/no/such/dir", agentSessionId: "a" }))
+      .toThrow(NotFoundError);
+  });
+
+  it("syncTranscript appends only new records", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-7.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "one" } }) + "\n");
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-7" });
+    expect(stores.events.count(session.id)).toBe(1);
+
+    fs.appendFileSync(file, JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "two" }] } }) + "\n");
+    expect(manager.syncTranscript(session.id)).toBe(1);
+    expect(stores.events.count(session.id)).toBe(2);
+    // a second sync with no new records adds nothing
+    expect(manager.syncTranscript(session.id)).toBe(0);
+  });
+
+  it("discardIfEmpty removes a session with no events and keeps one with events", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-empty" });
+    expect(stores.events.count(session.id)).toBe(0);
+    expect(manager.discardIfEmpty("agent-empty")).toBe(true);
+    expect(stores.sessions.get(session.id)).toBeNull();
+    // unknown id is a no-op
+    expect(manager.discardIfEmpty("agent-empty")).toBe(false);
+  });
+
   it("on startTurn completion: agentSessionId, title, back to idle, and events persisted", async () => {
     const { manager, stores } = makeManager(okAdapter);
     const s = manager.createSession({ profile: "work", cwd });
