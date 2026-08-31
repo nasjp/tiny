@@ -59,4 +59,6 @@ export interface FileRecord {
 export interface SessionResponse extends SessionRecord {
   /** true = the agent's own CLI still has this session open. null = could not tell */
   cliLive: boolean | null;
+  /** true = a turn sent now runs inside that CLI (live join) instead of being refused with 409 */
+  cliJoin: boolean;
 }

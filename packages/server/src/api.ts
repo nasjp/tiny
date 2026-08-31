@@ -96,7 +96,11 @@ type HonoContext = Context<AppEnv>;
 export function createApp(deps: ApiDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
-  const withLive = (s: SessionRecord): SessionResponse => ({ ...s, cliLive: deps.isCliLive(s) });
+  const withLive = (s: SessionRecord): SessionResponse => ({
+    ...s,
+    cliLive: deps.isCliLive(s),
+    cliJoin: deps.manager.canJoin(s),
+  });
 
   app.onError((err, c) => {
     if (err instanceof NotFoundError) return c.json({ error: err.message }, 404);
@@ -213,7 +217,7 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
 
   app.post("/v1/sessions/:id/interrupt", (c) => {
     deps.manager.interrupt(c.req.param("id"));
-    return c.json({ ok: true });
+    return c.json({ ok: true }, 202);
   });
 
   app.post("/v1/sessions/:id/detach", async (c) => {

@@ -13,6 +13,8 @@ import { createApp } from "../src/api.js";
 import type { AgentAdapter } from "../src/adapter.js";
 import { PushClient } from "../src/push-client.js";
 import { UsageService } from "../src/usage.js";
+import type { PeerBridge } from "../src/session-manager.js";
+import type { PeerFrame, PeerTarget } from "../src/claude-peer.js";
 
 // Condensed rate_limits from the SDK's usage response (the limits array is what /usage actually shows)
 const usageFixture = {
@@ -42,9 +44,13 @@ describe("REST API", () => {
   let auth: AuthService;
   let profilesDir: string;
   let cliLive: boolean | null = null;
+  let peerTarget: PeerTarget | null = null;
+  let peerSent: PeerFrame[] = [];
 
   beforeEach(() => {
     cliLive = null;
+    peerTarget = null;
+    peerSent = [];
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-api-"));
     profilesDir = path.join(home, "profiles");
     addProfile(profilesDir, "work");
@@ -53,9 +59,15 @@ describe("REST API", () => {
     outbox = new FileOutbox(fs.mkdtempSync(path.join(os.tmpdir(), "tiny-api-ob-")), stores.files);
     // Same resolver for the manager and for createApp, exactly as startServer() wires it
     const isCliLive = () => cliLive;
+    const peer: PeerBridge = {
+      resolve: () => peerTarget,
+      status: () => ({ status: "idle", waitingFor: null }),
+      mode: () => "prompting",
+      send: async (_s, _t, frame) => { peerSent.push(frame); },
+    };
     manager = new SessionManager({
       stores, profilesDir, adapters: { claude: okAdapter }, broker: new PermissionBroker(1000), outbox,
-      isCliLive,
+      isCliLive, peer, liveTiming: { pollMs: 10, deliveryTimeoutMs: 50, maxTurnMs: 500 },
     });
     auth = new AuthService(stores, path.join(home, "secret"));
     token = auth.cliToken();
@@ -591,6 +603,42 @@ describe("REST API", () => {
     });
     expect(ok.status).toBe(202);
     await manager.waitForIdle(id);
+  });
+
+  it("reports cliJoin and runs the turn in the CLI when it can be joined; Stop goes to the CLI too", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(profilesDir, "local4", "claude", configDir);
+    const res = await app.request("/v1/sessions/adopt", {
+      method: "POST", headers: H(),
+      body: JSON.stringify({ profile: "local4", cwd, agentSessionId: "agent-join" }),
+    });
+    const { id } = (await res.json()) as { id: string };
+
+    cliLive = true;
+    const listRes0 = (await app.request("/v1/sessions", { headers: H() })).json();
+    const list0 = (await listRes0) as { sessions: Array<{ id: string; cliLive: boolean | null; cliJoin: boolean }> };
+    expect(list0.sessions.find((s) => s.id === id)).toMatchObject({ cliLive: true, cliJoin: false });
+
+    peerTarget = { pid: 4242, sockPath: "/srv/cc-socks/4242.sock" };
+    const listRes1 = (await app.request("/v1/sessions", { headers: H() })).json();
+    const list1 = (await listRes1) as typeof list0;
+    expect(list1.sessions.find((s) => s.id === id)).toMatchObject({ cliLive: true, cliJoin: true });
+    const one = (await (await app.request(`/v1/sessions/${id}`, { headers: H() })).json()) as { cliJoin: boolean };
+    expect(one.cliJoin).toBe(true);
+
+    const sent = await app.request(`/v1/sessions/${id}/turns`, {
+      method: "POST", headers: H(), body: JSON.stringify({ prompt: "from the phone" }),
+    });
+    expect(sent.status).toBe(202);
+    expect(peerSent).toHaveLength(1);
+    expect(peerSent[0]!.agentSessionId).toBe("agent-join");
+
+    const stop = await app.request(`/v1/sessions/${id}/interrupt`, { method: "POST", headers: H() });
+    expect(stop.status).toBe(202);
+    expect(peerSent).toHaveLength(2);
+    expect(peerSent[1]!.priority).toBe("now");
+    await manager.waitForIdle(id); // the fake CLI never records anything: ends as turn_failed (dropped)
+    cliLive = null;
   });
 
   // The CLI writes to the transcript whether or not it still holds the session, so gating the
