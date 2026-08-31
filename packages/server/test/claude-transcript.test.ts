@@ -122,6 +122,48 @@ describe("claude-transcript", () => {
     expect(said).toEqual(["ask 2", "ask 3"]);
   });
 
+  // Every real transcript carries 1-9 isMeta records; counting them as turns would cut the import
+  // short of what the person actually said
+  it("does not count isMeta user records as human turns", () => {
+    const records: Array<Record<string, unknown>> = [];
+    records.push({ type: "user", uuid: "u0", message: { role: "user", content: "the real question" } });
+    for (let k = 0; k < 3; k++) {
+      records.push({ type: "user", uuid: `m${k}`, isMeta: true, message: { role: "user", content: `<meta ${k}>` } });
+    }
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, records);
+    const r = readTranscript(file, { turns: 2 });
+    expect(r.events.map((e) => e.payload.text)).toEqual([
+      "the real question", "<meta 0>", "<meta 1>", "<meta 2>",
+    ]);
+  });
+
+  // The Nth turn is included, not cut away: starting after it strands a tool_finished whose
+  // tool_started was never imported
+  it("includes the record that starts the oldest kept turn", () => {
+    const records: Array<Record<string, unknown>> = [];
+    for (let turn = 0; turn < 3; turn++) {
+      records.push({ type: "user", uuid: `u${turn}`, message: { role: "user", content: `ask ${turn}` } });
+      records.push({
+        type: "assistant", uuid: `a${turn}`,
+        message: { content: [{ type: "tool_use", id: `t${turn}`, name: "Read", input: { file_path: "/srv/x" } }] },
+      });
+      records.push({
+        type: "user", uuid: `r${turn}`,
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: `t${turn}`, is_error: false }] },
+      });
+    }
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, records);
+    const r = readTranscript(file, { turns: 2 });
+    // starts at "ask 1" — and every tool_finished it contains has its tool_started ahead of it
+    expect(r.events.map((e) => e.type)).toEqual([
+      "user_message", "tool_started", "tool_finished",
+      "user_message", "tool_started", "tool_finished",
+    ]);
+    expect(r.events[0]!.payload.text).toBe("ask 1");
+  });
+
   it("caps a first read at maxRecords, keeping the newest", () => {
     const records: Array<Record<string, unknown>> = [];
     records.push({ type: "user", uuid: "u0", message: { role: "user", content: "ask" } });

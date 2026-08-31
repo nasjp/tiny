@@ -97,15 +97,20 @@ export function readTranscriptCursor(file: string): string | null {
   return records === null ? null : cursorOf(messagesOf(records));
 }
 
-/** A user record that carries something the person actually typed (not just tool_result blocks) */
+/**
+ * A user record that carries something the person actually typed. Excludes records holding only
+ * tool_result blocks, and isMeta records (Claude Code writes 1-9 of those into every transcript).
+ */
 function startsHumanTurn(r: Record<string, unknown>): boolean {
-  return r.type === "user" && textOf((r.message as Record<string, unknown> | undefined)?.content) !== null;
+  if (r.type !== "user" || r.isMeta === true) return false;
+  return textOf((r.message as Record<string, unknown> | undefined)?.content) !== null;
 }
 
 /**
- * The newest `turns` human turns, capped at `maxRecords` (newest kept).
- * Slicing by record count instead would fill a first import with nothing but tool traffic:
- * a single turn routinely spans dozens of tool_use / tool_result records.
+ * The newest `turns` human turns, capped at `maxRecords` (newest kept). The record that starts the
+ * oldest kept turn is included: cutting after it would strand a tool_finished whose tool_started
+ * never made it in. Slicing by record count instead would fill a first import with nothing but tool
+ * traffic — a real turn runs 10-35 records, most of them tool_use / tool_result.
  */
 export function sliceRecentTurns(
   messages: Array<Record<string, unknown>>,
