@@ -56,10 +56,7 @@ export interface HandoffInput {
  * Where `tiny handoff` gets its inputs. CLAUDE_CODE_SESSION_ID is an official variable:
  * the changelog documents it as matching the session_id passed to hooks.
  */
-export function resolveHandoffInput(
-  env: Record<string, string | undefined>,
-  _cwd: string,
-): HandoffInput {
+export function resolveHandoffInput(env: Record<string, string | undefined>): HandoffInput {
   const sid = env.CLAUDE_CODE_SESSION_ID;
   const dir = env.CLAUDE_CONFIG_DIR;
   return {
@@ -67,6 +64,57 @@ export function resolveHandoffInput(
     // An empty env var means "not set" here, same as for the session id above
     configDir: typeof dir === "string" && dir !== "" ? dir : path.join(os.homedir(), ".claude"),
   };
+}
+
+/**
+ * Whether we are running inside an agent tiny itself spawned. TINY_SESSION_ID is only ever set in
+ * the environment tiny gives those agents, and there is nothing there to hand off: the session is
+ * already tiny's. The Agent SDK reads every settings source, so with `tiny live on` the
+ * SessionStart hook does fire in there, once per turn.
+ */
+export function isInsideTinyAgent(env: Record<string, string | undefined>): boolean {
+  const id = env.TINY_SESSION_ID;
+  return typeof id === "string" && id !== "";
+}
+
+/**
+ * Pull session_id out of the JSON object Claude Code writes to a hook's stdin.
+ * A fallback for CLAUDE_CODE_SESSION_ID: the whole always-on mode rests on that one variable.
+ */
+export function parseHookSessionId(raw: string): string | null {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return null; // not a hook invocation, or a truncated payload
+  }
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  const id = (payload as { session_id?: unknown }).session_id;
+  return typeof id === "string" && id !== "" ? id : null;
+}
+
+/**
+ * Read stdin, giving up after `timeoutMs`. A hook payload arrives immediately; a human running
+ * `tiny handoff` in a terminal must never be left waiting on input they do not know to give.
+ */
+async function readStdinBriefly(timeoutMs = 300): Promise<string> {
+  if (process.stdin.isTTY) return "";
+  return await new Promise<string>((resolve) => {
+    let buf = "";
+    const finish = (): void => {
+      clearTimeout(timer);
+      process.stdin.off("data", onData);
+      process.stdin.off("end", finish);
+      process.stdin.off("error", finish);
+      process.stdin.pause();
+      resolve(buf);
+    };
+    const onData = (chunk: Buffer): void => {
+      buf += chunk.toString("utf8");
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    process.stdin.on("data", onData).on("end", finish).on("error", finish);
+  });
 }
 
 /** Find (or create) the profile that points at this CLAUDE_CONFIG_DIR. Returns its name */
@@ -315,11 +363,19 @@ program
   .action(async (opts: {
     auto?: boolean; ended?: boolean; profile?: string; session?: string; configDir?: string;
   }) => {
+    // `tiny live on` installs the hook for a config dir the SDK also reads, so this runs inside
+    // tiny's own agents too — where the session is already tiny's and adopting it would add a ghost row
+    if (isInsideTinyAgent(process.env)) {
+      if (!opts.auto) console.log("Already inside a tiny session (TINY_SESSION_ID is set) — nothing to hand off.");
+      return;
+    }
     try {
-      const p = tinyPaths();
-      const env = resolveHandoffInput(process.env, process.cwd());
-      const agentSessionId = opts.session ?? env.agentSessionId;
+      const env = resolveHandoffInput(process.env);
       const configDir = opts.configDir ?? env.configDir;
+      // In hook mode the payload on stdin carries session_id too, so a Claude Code that stops
+      // exporting CLAUDE_CODE_SESSION_ID does not take always-on mode down with it
+      const agentSessionId = opts.session ?? env.agentSessionId
+        ?? (opts.auto ? parseHookSessionId(await readStdinBriefly()) : null);
       if (!agentSessionId) {
         throw new Error("no session id (run this inside Claude Code, or pass --session <id>)");
       }
@@ -331,7 +387,7 @@ program
         if (!opts.auto) console.log(r.discarded ? "Discarded (no activity)" : "Kept");
         return;
       }
-      const profile = opts.profile ?? ensureHandoffProfile(p.profilesDir, configDir);
+      const profile = opts.profile ?? ensureHandoffProfile(tinyPaths().profilesDir, configDir);
       const s = (await api("/v1/sessions/adopt", {
         method: "POST",
         body: JSON.stringify({ profile, cwd: process.cwd(), agentSessionId }),

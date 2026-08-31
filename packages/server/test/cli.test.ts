@@ -11,6 +11,8 @@ import {
   normalizeRelayUrl,
   normalizeServerUrl,
   resolveDeviceId,
+  isInsideTinyAgent,
+  parseHookSessionId,
   resolveHandoffInput,
   resolveSessionId,
   runProfileRename,
@@ -221,26 +223,45 @@ describe("runProfileRename", () => {
 
 describe("handoff", () => {
   it("takes the session id and config dir from the environment", () => {
-    const r = resolveHandoffInput(
-      { CLAUDE_CODE_SESSION_ID: "sid-1", CLAUDE_CONFIG_DIR: "/custom/claude" },
-      "/work",
-    );
+    const r = resolveHandoffInput({ CLAUDE_CODE_SESSION_ID: "sid-1", CLAUDE_CONFIG_DIR: "/custom/claude" });
     expect(r.agentSessionId).toBe("sid-1");
     expect(r.configDir).toBe("/custom/claude");
   });
 
   it("defaults the config dir to ~/.claude", () => {
-    const r = resolveHandoffInput({ CLAUDE_CODE_SESSION_ID: "sid-1" }, "/work");
+    const r = resolveHandoffInput({ CLAUDE_CODE_SESSION_ID: "sid-1" });
     expect(r.configDir).toBe(path.join(os.homedir(), ".claude"));
   });
 
   it("has no session id outside Claude Code", () => {
-    expect(resolveHandoffInput({}, "/work").agentSessionId).toBeNull();
+    expect(resolveHandoffInput({}).agentSessionId).toBeNull();
   });
 
   it("treats an empty CLAUDE_CONFIG_DIR as unset", () => {
-    const r = resolveHandoffInput({ CLAUDE_CODE_SESSION_ID: "sid-1", CLAUDE_CONFIG_DIR: "" }, "/work");
+    const r = resolveHandoffInput({ CLAUDE_CODE_SESSION_ID: "sid-1", CLAUDE_CONFIG_DIR: "" });
     expect(r.configDir).toBe(path.join(os.homedir(), ".claude"));
+  });
+
+  // The Agent SDK reads every settings source, so `tiny live on` makes the SessionStart hook fire
+  // inside the agents tiny itself spawns. TINY_SESSION_ID exists only in that environment
+  it("recognizes an agent tiny spawned itself", () => {
+    expect(isInsideTinyAgent({ TINY_SESSION_ID: "s-1" })).toBe(true);
+    expect(isInsideTinyAgent({ TINY_SESSION_ID: "" })).toBe(false);
+    expect(isInsideTinyAgent({})).toBe(false);
+    expect(isInsideTinyAgent({ CLAUDE_CODE_SESSION_ID: "sid-1" })).toBe(false);
+  });
+
+  // Fallback for the hook contract: Claude Code hands hooks a JSON object on stdin
+  it("reads session_id out of a hook payload, and shrugs off anything else", () => {
+    expect(parseHookSessionId(JSON.stringify({
+      session_id: "sid-9", cwd: "/srv/x", source: "startup", transcript_path: "/srv/x.jsonl",
+    }))).toBe("sid-9");
+    expect(parseHookSessionId("")).toBeNull();
+    expect(parseHookSessionId("not json")).toBeNull();
+    expect(parseHookSessionId("{}")).toBeNull();
+    expect(parseHookSessionId(JSON.stringify({ session_id: "" }))).toBeNull();
+    expect(parseHookSessionId(JSON.stringify({ session_id: 7 }))).toBeNull();
+    expect(parseHookSessionId("[1,2,3]")).toBeNull();
   });
 
   it("creates the handoff profile once and reuses it", () => {
