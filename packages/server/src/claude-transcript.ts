@@ -13,6 +13,12 @@ export interface TranscriptRead {
   title: string | null;
   /** uuid of the last record read. Pass it back as sinceUuid next time */
   cursor: string | null;
+  /**
+   * msg_ids of messages other processes injected through the CLI's messaging socket (records with
+   * origin.kind "peer"). They are isMeta and never become events; a live turn matches its own id here
+   * to learn the CLI accepted the message
+   */
+  peerMsgIds: string[];
 }
 
 /** Claude Code encodes the cwd by replacing "/" and "." with "-" */
@@ -164,7 +170,7 @@ export function readTranscript(
   opts: { sinceUuid?: string | null; turns?: number; maxRecords?: number } = {},
 ): TranscriptRead {
   const records = parseRecords(file);
-  if (records === null) return { events: [], title: null, cursor: null };
+  if (records === null) return { events: [], title: null, cursor: null, peerMsgIds: [] };
 
   let title: string | null = null;
   for (const r of records) {
@@ -184,6 +190,7 @@ export function readTranscript(
   }
 
   const events: TranscriptEvent[] = [];
+  const peerMsgIds: string[] = [];
   // Pairs a <bash-input> record's uuid with its <bash-stdout> record by position: the stdout record
   // follows its input record. A stdout with nothing pending (e.g. a backfill window cutting between
   // the two) is dropped rather than emitted as an orphan tool_finished
@@ -193,6 +200,10 @@ export function readTranscript(
     // while running local commands" preamble and its kin). Nobody typed them, and showing them as
     // a user message reads on the phone as something the person said. Skipped like any other
     // bookkeeping record — but left in `messages`, so a cursor pointing at one still resolves
+    if (r.type === "user") {
+      const origin = r.origin as { kind?: unknown; msg_id?: unknown } | undefined;
+      if (origin?.kind === "peer" && typeof origin.msg_id === "string") peerMsgIds.push(origin.msg_id);
+    }
     if (r.isMeta === true) continue;
     const message = (r.message ?? {}) as Record<string, unknown>;
     if (r.type === "user") {
@@ -261,5 +272,5 @@ export function readTranscript(
     title = t ? t.slice(0, 60) : null;
   }
 
-  return { events, title, cursor: cursorOf(messages) };
+  return { events, title, cursor: cursorOf(messages), peerMsgIds };
 }

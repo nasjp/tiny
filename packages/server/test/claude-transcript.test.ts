@@ -389,4 +389,25 @@ describe("claude-transcript", () => {
       ]);
     });
   });
+
+  it("reports peer msg_ids without turning the peer record into a user_message", () => {
+    const file = path.join(root, "projects", "-srv-app", `${SID}.jsonl`);
+    writeJsonl(file, [
+      { type: "user", uuid: "u1", message: { role: "user", content: "typed in the terminal" } },
+      {
+        type: "user", uuid: "p1", isMeta: true, promptSource: "system",
+        origin: { kind: "peer", from: "unknown", msg_id: "6a1b0e2b-2081-475b-92be-93f4f0eee471", name: "tiny" },
+        message: { role: "user", content: "Another Claude session sent a message:\n<cross-session-message from-name=\"tiny\">\nhello\n</cross-session-message>" },
+      },
+      { type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "hi phone" }] } },
+    ]);
+    const read = readTranscript(file);
+    expect(read.peerMsgIds).toEqual(["6a1b0e2b-2081-475b-92be-93f4f0eee471"]);
+    expect(read.events.map((e) => e.type)).toEqual(["user_message", "assistant_text"]);
+    expect(read.events[0]!.payload.text).toBe("typed in the terminal");
+  });
+
+  it("peerMsgIds is empty when nothing was read", () => {
+    expect(readTranscript(path.join(root, "missing.jsonl")).peerMsgIds).toEqual([]);
+  });
 });
