@@ -271,9 +271,6 @@ export class SessionManager extends EventEmitter {
     if (!file) return 0;
     const stat = this.transcriptChange(id, file);
     if (!stat) return 0;
-    // Record the pre-read stat: if the CLI appends between the stat and the read, the next call
-    // reads again rather than skipping records (the cursor keeps that from duplicating anything)
-    this.transcriptStats.set(id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
     const read = readTranscript(file, {
       sinceUuid: s.sourceCursor,
       ...(s.sourceCursor ? {} : { turns: SessionManager.BACKFILL_TURNS }),
@@ -283,6 +280,11 @@ export class SessionManager extends EventEmitter {
     if (read.cursor && read.cursor !== s.sourceCursor) patch.sourceCursor = read.cursor;
     if (read.title && !s.title) patch.title = read.title;
     if (Object.keys(patch).length > 0) this.deps.stores.sessions.patch(id, patch);
+    // Commit the stat captured BEFORE the read — so an append that lands mid-read is picked up next
+    // time rather than skipped — but only once the read has actually produced a cursor. A read that
+    // yielded none (a rotate caught mid-flight) would otherwise advance the stat while the cursor
+    // stood still, and those records would never be imported. Leave the old entry: the next call retries
+    if (read.cursor) this.transcriptStats.set(id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
     return read.events.length;
   }
 

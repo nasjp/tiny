@@ -359,6 +359,41 @@ describe("SessionManager", () => {
   // Only the path that actually imports events may record a stat. If advanceCursor recorded one it
   // would mark the file "consumed" after reading nothing but the tail uuid, and the next real sync
   // would skip it — silently dropping genuine appended conversation
+  // The stat is captured before the read on purpose, so an append landing mid-read is picked up
+  // next time. But committing it when the read produced no cursor advances the stat while the
+  // cursor stands still, and those records are then never imported
+  it("a read that yields no cursor does not poison the stat cache", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-n.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+
+    // a conversation record, and a bookkeeping line padded to its exact byte length. The first
+    // state carries no message records at all, so the read comes back with no cursor
+    const real = JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } });
+    let filler = "";
+    for (let pad = 0; filler.length !== real.length; pad++) {
+      filler = JSON.stringify({ type: "mode", pad: "x".repeat(pad) });
+      if (filler.length > real.length) throw new Error("cannot pad to the same length");
+    }
+    const t = new Date(1_700_000_000_000);
+    fs.writeFileSync(file, filler + "\n");
+    fs.utimesSync(file, t, t);
+
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-n" });
+    expect(stores.events.count(session.id)).toBe(0);
+    expect(session.sourceCursor).toBeNull();
+
+    // the real record lands in a file of identical size and mtime: only a stat committed by that
+    // cursorless read could make this one skip
+    fs.writeFileSync(file, real + "\n");
+    fs.utimesSync(file, t, t);
+    expect(manager.syncTranscript(session.id)).toBe(1);
+    expect(manager.getSession(session.id).sourceCursor).toBe("u1");
+  });
+
   it("advanceCursor does not mark the transcript as read", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
     const profilesDir = path.join(home, "profiles");
