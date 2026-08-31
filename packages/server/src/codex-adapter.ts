@@ -76,6 +76,11 @@ interface CodexItem {
   cwd?: string;
   changes?: Array<{ path?: string }>;
   server?: string;
+  /** agentMessage: "commentary" = progress note between tool work, "final_answer" = the reply (measured 0.149.x) */
+  phase?: unknown;
+  /** reasoning: entries are strings or { text } objects; measured turns often carry none */
+  summary?: unknown;
+  content?: unknown;
   tool?: string;
   arguments?: unknown;
   query?: string;
@@ -129,6 +134,21 @@ interface CodexQuestion {
   question?: string;
   options?: Array<{ label?: string; description?: string }> | null;
   isOther?: boolean;
+}
+
+/** The text a reasoning item carries. Entries are strings or { text } objects; measured turns often carry none */
+function reasoningText(item: CodexItem): string {
+  const parts: string[] = [];
+  for (const list of [item.summary, item.content]) {
+    if (!Array.isArray(list)) continue;
+    for (const e of list) {
+      if (typeof e === "string") parts.push(e);
+      else if (e && typeof e === "object" && typeof (e as { text?: unknown }).text === "string") {
+        parts.push((e as { text: string }).text);
+      }
+    }
+  }
+  return parts.join("\n").trim();
 }
 
 export class CodexAdapter implements AgentAdapter {
@@ -287,9 +307,23 @@ export class CodexAdapter implements AgentAdapter {
       if (!item?.id) return;
       if (item.type === "agentMessage") {
         if (typeof item.text === "string" && item.text !== "") {
-          texts.push(item.text);
-          p.emit({ type: "assistant_text", payload: { text: item.text } });
+          // "commentary" is the model narrating its progress before/between tool work (measured:
+          // "I'm applying the required skill, then…"). Shown like Claude's thinking line and kept
+          // out of resultText — the push and the Done line only carry the actual reply
+          if (item.phase === "commentary") {
+            p.emit({ type: "assistant_thinking", payload: { text: item.text } });
+          } else {
+            texts.push(item.text);
+            p.emit({ type: "assistant_text", payload: { text: item.text } });
+          }
         }
+        return;
+      }
+      if (item.type === "reasoning") {
+        // Measured empty (summary: [], content: []) on current defaults, but a populated summary
+        // is the same narration; show whatever text it carries
+        const text = reasoningText(item);
+        if (text !== "") p.emit({ type: "assistant_thinking", payload: { text } });
         return;
       }
       const info = describeCodexItem(item);
@@ -298,10 +332,15 @@ export class CodexAdapter implements AgentAdapter {
       finish(item.id, item.status === "failed" || item.status === "declined" || !!item.error);
     });
     conn.onNotification("thread/tokenUsage/updated", (params) => {
-      const last = (params as { tokenUsage?: { last?: Record<string, unknown> } })?.tokenUsage?.last;
-      if (!last) return;
-      const n = (k: string) => (typeof last[k] === "number" ? (last[k] as number) : 0);
-      contextTokens = n("inputTokens") + n("cachedInputTokens") + n("outputTokens");
+      const usage = (params as { tokenUsage?: { last?: Record<string, unknown>; total?: Record<string, unknown> } })?.tokenUsage;
+      const last = usage?.last;
+      if (last) {
+        const n = (k: string) => (typeof last[k] === "number" ? (last[k] as number) : 0);
+        contextTokens = n("inputTokens") + n("cachedInputTokens") + n("outputTokens");
+      }
+      // total is cumulative across the turn (measured 207 → 212); exactly what the Running row shows
+      const out = usage?.total?.outputTokens;
+      if (typeof out === "number" && Number.isFinite(out)) p.progress?.({ outputTokens: out });
     });
     conn.onNotification("turn/completed", (params) => {
       const n = params as { threadId?: string; turn?: Record<string, unknown> };
