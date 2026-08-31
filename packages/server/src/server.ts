@@ -5,12 +5,15 @@ import { ensureDirs, tinyPaths } from "./config.js";
 import { createApp } from "./api.js";
 import { AuthService } from "./auth.js";
 import { readLiveSessionIds } from "./claude-live.js";
+import { readCliMode, readPeerStatus, readPeerToken, resolvePeerTarget, sendPeerMessage } from "./claude-peer.js";
+import { findTranscript } from "./claude-transcript.js";
 import { FileOutbox } from "./outbox.js";
 import { openDb } from "./db.js";
 import { PermissionBroker } from "./permission-broker.js";
 import { profileDir } from "./profiles.js";
 import { PushClient } from "./push-client.js";
 import { SessionManager } from "./session-manager.js";
+import type { PeerBridge } from "./session-manager.js";
 import { loadSettings } from "./settings.js";
 import { makeMcpLaunch } from "./mcp-launch.js";
 import { createStores } from "./stores.js";
@@ -69,6 +72,35 @@ export async function startServer(env: Record<string, string | undefined> = proc
     return ids === null ? null : ids.has(s.agentSessionId);
   };
 
+  // Live join (Step 2): everything the manager needs to hand a turn to the CLI process itself.
+  // claude-peer.ts is the only module that knows how; here it is just wired to the profile's configDir
+  const configDirOf = (s: SessionRecord): string | null => {
+    try {
+      return profileDir(paths.profilesDir, s.profile);
+    } catch {
+      return null;
+    }
+  };
+  const peer: PeerBridge = {
+    resolve: (s) => {
+      const dir = configDirOf(s);
+      return dir && s.agentSessionId ? resolvePeerTarget(dir, s.agentSessionId) : null;
+    },
+    status: (s, target) => {
+      const dir = configDirOf(s);
+      return dir ? readPeerStatus(dir, target) : null;
+    },
+    mode: (s) => {
+      const dir = configDirOf(s);
+      const file = dir && s.agentSessionId ? findTranscript(dir, s.cwd, s.agentSessionId) : null;
+      return file ? readCliMode(file) : null;
+    },
+    send: (s, target, frame) => {
+      const dir = configDirOf(s);
+      return sendPeerMessage(target, frame, dir ? readPeerToken(dir, target) : null);
+    },
+  };
+
   let port = paths.port;
   const manager = new SessionManager({
     stores,
@@ -80,6 +112,7 @@ export async function startServer(env: Record<string, string | undefined> = proc
     mcpLaunch: makeMcpLaunch({ serverUrl: () => `http://127.0.0.1:${port}` }),
     sessionTokens: auth,
     isCliLive,
+    peer,
   });
 
   // Settings are reloaded on every delivery, so `tiny push config` changes take effect without a restart.

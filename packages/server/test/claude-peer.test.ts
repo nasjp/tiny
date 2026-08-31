@@ -12,6 +12,7 @@ import {
   readPeerToken,
   resolvePeerTarget,
   sendPeerMessage,
+  summarizePeerInboxes,
   wrapForPeer,
 } from "../src/claude-peer.js";
 
@@ -230,5 +231,23 @@ describe("claude-peer: sendPeerMessage", () => {
   it("refuses a frame over the CLI's 1MB line cap before connecting", () => {
     expect(() => encodePeerFrames({ agentSessionId: SID, msgId: "m-4", content: "x".repeat(1_048_576), priority: "next" }, null))
       .toThrow(/too large/);
+  });
+});
+
+describe("claude-peer: summarizePeerInboxes", () => {
+  it("counts open sessions, sockets, and stale sockets whose process is gone", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-peer-"));
+    const socks = path.join(root, "cc-socks");
+    fs.mkdirSync(socks);
+    writeEntry(root, 1, entry(1));
+    writeEntry(root, 2, entry(2, { sessionId: "other" }));
+    writeEntry(root, 3, entry(3)); // dead
+    for (const n of ["1.sock", "2.sock", "3.sock", "99.sock", "junk.txt"]) fs.writeFileSync(path.join(socks, n), "");
+    expect(summarizePeerInboxes(root, socks, (pid) => pid === 1 || pid === 2)).toEqual({ open: 2, sockets: 4, stale: 2 });
+  });
+
+  it("is zeros when neither directory exists", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-peer-"));
+    expect(summarizePeerInboxes(root, path.join(root, "none"), () => true)).toEqual({ open: 0, sockets: 0, stale: 0 });
   });
 });

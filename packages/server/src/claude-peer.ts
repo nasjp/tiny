@@ -272,3 +272,36 @@ export function sendPeerMessage(
     });
   });
 }
+
+/** Where Claude Code puts its sockets by default on macOS (XDG_RUNTIME_DIR overrides it per session) */
+export const DEFAULT_SOCKETS_DIR = "/tmp/cc-socks";
+
+/** For `tiny doctor`: how many Claude Code sessions are open, and how many socket files are left behind by dead ones */
+export function summarizePeerInboxes(
+  configDir: string,
+  socketsDir: string = DEFAULT_SOCKETS_DIR,
+  alive: (pid: number) => boolean = processAlive,
+): { open: number; sockets: number; stale: number } {
+  let open = 0;
+  try {
+    for (const name of fs.readdirSync(path.join(configDir, "sessions")).filter((n) => /^\d+\.json$/.test(n))) {
+      const e = readEntry(path.join(configDir, "sessions", name));
+      if (e && typeof e.pid === "number" && alive(e.pid)) open++;
+    }
+  } catch {
+    // no registry: zero open sessions
+  }
+  let sockets = 0;
+  let stale = 0;
+  try {
+    for (const name of fs.readdirSync(socketsDir)) {
+      const m = /^(\d+)\.sock$/.exec(name);
+      if (!m) continue;
+      sockets++;
+      if (!alive(Number(m[1]))) stale++;
+    }
+  } catch {
+    // no sockets directory
+  }
+  return { open, sockets, stale };
+}

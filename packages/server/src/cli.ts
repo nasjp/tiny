@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import qrcode from "qrcode-terminal";
 import { tinyPaths } from "./config.js";
+import { summarizePeerInboxes } from "./claude-peer.js";
 import { installDaemon, readInstalledDaemon, uninstallDaemon } from "./daemon.js";
 import { collectDoctor, formatDoctorReport } from "./doctor.js";
 import { openDb } from "./db.js";
@@ -453,6 +454,7 @@ program
       fileExists: (f) => fs.existsSync(f),
       sameFile,
       alwaysHandoff: readLiveMode(process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir()),
+      peerInboxes: summarizePeerInboxes(process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir()),
     });
     console.log(formatDoctorReport(report));
     if (!report.ok) process.exitCode = 1;

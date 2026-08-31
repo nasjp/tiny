@@ -41,6 +41,8 @@ export interface DoctorDeps {
   sameFile: (a: string, b: string) => boolean;
   /** Whether `tiny live` is on (the SessionStart/SessionEnd hooks are installed in the agent's settings.json) */
   alwaysHandoff: boolean;
+  /** Claude Code sessions reachable for live join (claude-peer.summarizePeerInboxes). Undefined = not collected */
+  peerInboxes?: { open: number; sockets: number; stale: number } | null;
 }
 
 export const MIN_NODE_MAJOR = 22;
@@ -100,6 +102,16 @@ function checkAlwaysHandoff(d: DoctorDeps): DoctorCheck {
     : { status: "ok", name, detail: "off (manual `tiny handoff` only; enable with tiny live on)" };
 }
 
+function checkPeerInboxes(d: DoctorDeps): DoctorCheck | null {
+  if (!d.peerInboxes) return null;
+  const { open, sockets, stale } = d.peerInboxes;
+  return {
+    status: "ok",
+    name: "CLI live join",
+    detail: `${open} open Claude Code session(s), ${sockets} socket(s), ${stale} stale`,
+  };
+}
+
 function checkAgent(d: DoctorDeps, driver: AgentDriver): DoctorCheck {
   const name = `agent ${driver.label}`;
   const bin = d.findOnPath(driver.bin);
@@ -132,6 +144,8 @@ export async function collectDoctor(d: DoctorDeps): Promise<DoctorReport> {
   checks.push(checkServerUrl(d));
   checks.push(checkPush(d));
   checks.push(checkAlwaysHandoff(d));
+  const peers = checkPeerInboxes(d);
+  if (peers) checks.push(peers);
   const agentChecks = d.drivers.map((drv) => checkAgent(d, drv));
   const installedCount = d.drivers.filter((drv) => d.findOnPath(drv.bin) !== null).length;
   checks.push(

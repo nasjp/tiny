@@ -125,6 +125,18 @@ describe("collectDoctor", () => {
     expect(byName(on, "always handoff").status).toBe("ok");
     expect(byName(on, "always handoff").detail).toContain("on");
   });
+
+  it("shows the CLI live-join picture: open sessions and stale sockets", async () => {
+    const r = await collectDoctor(deps({ peerInboxes: { open: 2, sockets: 3, stale: 1 } }));
+    const c = r.checks.find((x) => x.name === "CLI live join")!;
+    expect(c.status).toBe("ok");
+    expect(c.detail).toBe("2 open Claude Code session(s), 3 socket(s), 1 stale");
+  });
+
+  it("omits the CLI live-join line when nothing was collected", async () => {
+    const r = await collectDoctor(deps({}));
+    expect(r.checks.some((x) => x.name === "CLI live join")).toBe(false);
+  });
 });
 
 describe("formatDoctorReport", () => {
