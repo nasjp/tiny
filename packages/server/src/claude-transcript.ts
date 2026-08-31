@@ -112,6 +112,39 @@ export interface PeerMessage {
   text: string;
 }
 
+/**
+ * Agent teams inject their notifications as a JSON blob inside the wrapper — the phone showed
+ * `{"type":"idle_notification","from":...,"result":"…\n\n要点:…"}` verbatim, escapes and all
+ * (device report). Pull out the part written for a person and name the notification kind; keep
+ * anything unrecognised complete, just laid out instead of printed on one line.
+ */
+function humanizePeerBody(body: string): { from?: string; summary?: string; text: string } | null {
+  if (!body.startsWith("{")) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null; // a body that merely starts with a brace is a body
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const o = parsed as Record<string, unknown>;
+  const str = (k: string): string | null => {
+    const v = o[k];
+    return typeof v === "string" && v.trim() !== "" ? v.trim() : null;
+  };
+  const from = str("from") ?? undefined;
+  const kind = str("type");
+  const summary = kind === "idle_notification" ? "Went idle" : (kind?.replace(/_/g, " ") ?? undefined);
+  const human = str("result") ?? str("message") ?? str("text") ?? str("body");
+  if (human) return { ...(from ? { from } : {}), ...(summary ? { summary } : {}), text: human };
+  // Nothing was written for a person. Say what happened rather than showing the wire
+  if (kind === "idle_notification") {
+    const reason = str("idleReason");
+    return { ...(from ? { from } : {}), text: reason ? `Went idle (${reason})` : "Went idle" };
+  }
+  return { ...(from ? { from } : {}), ...(summary ? { summary } : {}), text: JSON.stringify(o, null, 2) };
+}
+
 function parsePeerMessage(text: string): PeerMessage | null {
   let t = text.trimStart();
   const header = t.match(PEER_HEADER_RE);
@@ -122,10 +155,13 @@ function parsePeerMessage(text: string): PeerMessage | null {
   if (!m || (!header && !PEER_TAGS.has(m[1]!))) return null;
   const attrs: Record<string, string> = {};
   for (const a of m[2]!.matchAll(/([\w-]+)="([^"]*)"/g)) attrs[a[1]!] = a[2]!;
-  const from = attrs.teammate_id ?? attrs["from-name"] ?? attrs.from ?? "another session";
   // Claude Code escapes a closing tag inside the body as `<\/tag` so the wrapper stays unambiguous
   const body = m[3]!.replace(/<\\\//g, "</").trim();
-  return { from, ...(attrs.summary ? { summary: attrs.summary } : {}), text: body };
+  const humanized = humanizePeerBody(body);
+  const from = attrs.teammate_id ?? attrs["from-name"] ?? attrs.from ?? humanized?.from ?? "another session";
+  // The sender's own summary attribute was written by hand; it wins over the kind we name
+  const summary = attrs.summary ?? humanized?.summary;
+  return { from, ...(summary ? { summary } : {}), text: humanized?.text ?? body };
 }
 
 /**
