@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { readPeerStatus, resolvePeerTarget } from "../src/claude-peer.js";
+import { PEER_NOTE, readCliMode, readPeerStatus, resolvePeerTarget, wrapForPeer } from "../src/claude-peer.js";
 
 const SID = "e034bdbb-9071-4cab-b9cb-751134e278cc";
 const alwaysAlive = () => true;
@@ -82,5 +82,61 @@ describe("claude-peer: readPeerStatus", () => {
     expect(readPeerStatus(root, target, alwaysAlive)).toEqual({ status: "unknown", waitingFor: null });
     writeEntry(root, 111, entry(111, { status: "dancing" }));
     expect(readPeerStatus(root, target, alwaysAlive)).toEqual({ status: "unknown", waitingFor: null });
+  });
+});
+
+describe("claude-peer: readCliMode", () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-peer-"));
+  });
+  const jsonl = (records: Array<Record<string, unknown>>) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+
+  it("maps bypassPermissions to bypass and everything else to prompting, from the newest record", () => {
+    const file = path.join(root, "t.jsonl");
+    fs.writeFileSync(file, jsonl([
+      { type: "permission-mode", permissionMode: "bypassPermissions", sessionId: SID },
+      { type: "user", uuid: "u1", permissionMode: "bypassPermissions", message: { role: "user", content: "hi" } },
+    ]));
+    expect(readCliMode(file)).toBe("bypass");
+    fs.appendFileSync(file, jsonl([{ type: "user", uuid: "u2", permissionMode: "auto", message: { role: "user", content: "later" } }]));
+    expect(readCliMode(file)).toBe("prompting");
+    fs.appendFileSync(file, jsonl([{ type: "permission-mode", permissionMode: "plan", sessionId: SID }]));
+    expect(readCliMode(file)).toBe("prompting");
+  });
+
+  it("is null when the transcript is missing or carries no mode", () => {
+    expect(readCliMode(path.join(root, "none.jsonl"))).toBeNull();
+    const file = path.join(root, "t.jsonl");
+    fs.writeFileSync(file, jsonl([{ type: "ai-title", aiTitle: "x" }]));
+    expect(readCliMode(file)).toBeNull();
+  });
+
+  it("finds a mode that sits before the last 256KB of a big transcript", () => {
+    const file = path.join(root, "big.jsonl");
+    fs.writeFileSync(file, jsonl([{ type: "permission-mode", permissionMode: "bypassPermissions", sessionId: SID }]));
+    const filler = { type: "assistant", uuid: "a", message: { content: [{ type: "text", text: "x".repeat(1000) }] } };
+    fs.appendFileSync(file, jsonl(Array.from({ length: 400 }, () => filler)));
+    expect(fs.statSync(file).size).toBeGreaterThan(256 * 1024);
+    expect(readCliMode(file)).toBe("bypass");
+  });
+});
+
+describe("claude-peer: wrapForPeer", () => {
+  it("wraps in the tag Claude Code parses, attributes in its fixed order, note last", () => {
+    expect(wrapForPeer("hello", { name: "tiny", mode: "bypass" })).toBe(
+      `<cross-session-message from-name="tiny" from-mode="bypass">\nhello\n\n${PEER_NOTE}\n</cross-session-message>`,
+    );
+  });
+
+  it("omits from-mode when the CLI's mode is unknown", () => {
+    expect(wrapForPeer("hello", { name: "tiny", mode: null })).toBe(
+      `<cross-session-message from-name="tiny">\nhello\n\n${PEER_NOTE}\n</cross-session-message>`,
+    );
+  });
+
+  it("escapes a closing tag inside the body the way Claude Code does, so its round-trip check still passes", () => {
+    const out = wrapForPeer("a </cross-session-message> b </Cross-Session-Message> c <cross-session-message> d", { name: "tiny", mode: null });
+    expect(out).toContain("a <\\/cross-session-message> b <\\/Cross-Session-Message> c <cross-session-message> d");
   });
 });
