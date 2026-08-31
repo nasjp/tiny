@@ -63,4 +63,29 @@ describe("claude-live", () => {
     fs.writeFileSync(path.join(root, "sessions", "1.json"), "{broken");
     expect(isSessionLive(root, SID, alwaysAlive)).toBeNull();
   });
+
+  it("is null when the only matching entry is half-written (no pid yet)", () => {
+    // Claude Code writes these live; an entry without a pid is a normal transient state
+    writeEntry(root, 111, { sessionId: SID, peerProtocol: 1 });
+    expect(isSessionLive(root, SID, alwaysAlive)).toBeNull();
+  });
+
+  it("is null when the only entry has a non-string sessionId", () => {
+    writeEntry(root, 111, { pid: 111, sessionId: 42, peerProtocol: 1 });
+    expect(isSessionLive(root, SID, alwaysAlive)).toBeNull();
+  });
+
+  it("is null when peerProtocol is a string rather than a number", () => {
+    writeEntry(root, 111, { pid: 111, sessionId: SID, peerProtocol: "1" });
+    expect(isSessionLive(root, SID, alwaysAlive)).toBeNull();
+  });
+
+  it("does not let a throwing liveness probe escape or become a false", () => {
+    writeEntry(root, 111, { pid: 111, sessionId: SID, peerProtocol: 1 });
+    const throwing = () => {
+      throw new Error("no such process");
+    };
+    expect(() => isSessionLive(root, SID, throwing)).not.toThrow();
+    expect(isSessionLive(root, SID, throwing)).toBeNull();
+  });
 });

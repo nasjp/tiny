@@ -45,10 +45,18 @@ export function readLiveSessionIds(
       continue; // a half-written entry is normal
     }
     if (typeof entry.peerProtocol !== "number" || !KNOWN_PEER_PROTOCOLS.has(entry.peerProtocol)) continue;
-    understood++;
-    if (typeof entry.sessionId === "string" && typeof entry.pid === "number" && alive(entry.pid)) {
-      ids.add(entry.sessionId);
+    // Claude Code writes these entries while running, so a half-written one is normal. Treat it
+    // like a parse failure: counting it as understood would turn "we could not read this session's
+    // entry" into a confident "that session is not open", which is the one wrong answer we cannot give
+    if (typeof entry.sessionId !== "string" || typeof entry.pid !== "number") continue;
+    let running: boolean;
+    try {
+      running = alive(entry.pid);
+    } catch {
+      continue; // cannot tell for this entry, so it must not count as understood either
     }
+    understood++;
+    if (running) ids.add(entry.sessionId);
   }
   // Understood nothing = we cannot tell. Understood something = absence means "not open"
   return understood > 0 ? ids : null;
