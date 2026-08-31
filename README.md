@@ -4,6 +4,10 @@ Drive the coding agents on your Mac (Claude Code / Codex / OpenCode / Cursor) fr
 iPhone app, and hand the same session back to the agent's own CLI (`claude --resume`
 etc.) whenever you want.
 
+<p align="center">
+  <img src="docs/images/session.png" width="320" alt="A session in the tiny iPhone app: the agent's progress, a file card it sent, and a pending permission request with Deny / Allow buttons">
+</p>
+
 ## Supported agents
 
 | Agent | CLI | Transport | Login | Images | Hand back to CLI |
