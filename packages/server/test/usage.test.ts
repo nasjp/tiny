@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  classifyUsageError,
   createCodexUsageFetcher,
   createSdkUsageFetcher,
   normalizeUsage,
+  UsageError,
   UsageService,
-  UsageUnavailableError,
 } from "../src/usage.js";
-import { NotFoundError } from "../src/session-manager.js";
 import { fakeCodexServer } from "./fake-codex-server.js";
 
 // Condensed SDK usage response (rate_limits). limits[] is the server's raw array behind the /usage display
@@ -68,9 +68,11 @@ describe("createSdkUsageFetcher", () => {
     expect(seen).toEqual([]);
   });
 
-  it("not a subscription / missing scope (rate_limits_available=false) is UsageUnavailableError, and the process closes", async () => {
+  it("not a subscription / missing scope (rate_limits_available=false) is an \"unavailable\" UsageError, and the process closes", async () => {
     const fq = fakeQuery({ rate_limits_available: false, rate_limits: null });
-    await expect(createSdkUsageFetcher({ queryFn: fq.queryFn })("/p")).rejects.toBeInstanceOf(UsageUnavailableError);
+    const err = await createSdkUsageFetcher({ queryFn: fq.queryFn })("/p").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UsageError);
+    expect((err as UsageError).problem).toBe("unavailable");
     expect(fq.calls[0]!.closed).toBe(true);
   });
 
@@ -122,11 +124,13 @@ describe("UsageService", () => {
   const profilesDir = "/does-not-matter";
   const resolveDir = (name: string) => `${profilesDir}/${name}`;
 
-  it("a logged-out profile never starts Claude Code and maps to a 404", async () => {
+  it("a logged-out profile never starts Claude Code and says how to log in", async () => {
     const fetcher = vi.fn(async () => RATE_LIMITS);
     const usage = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn: () => false });
-    await expect(usage.get("work")).rejects.toBeInstanceOf(NotFoundError);
-    await expect(usage.get("work")).rejects.toThrow(/not logged in: work/);
+    const err = await usage.get("work").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UsageError);
+    expect((err as UsageError).problem).toBe("signed_out");
+    expect((err as UsageError).hint).toBe("tiny profiles login work");
     expect(fetcher).not.toHaveBeenCalled();
   });
 
@@ -162,7 +166,8 @@ describe("UsageService", () => {
       .mockRejectedValueOnce(new Error("claude crashed"))
       .mockResolvedValueOnce(RATE_LIMITS);
     const usage = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn: () => true });
-    await expect(usage.get("work")).rejects.toThrow(/claude crashed/);
+    const err = await usage.get("work").catch((e: unknown) => e);
+    expect((err as UsageError).detail).toBe("claude crashed");
     await expect(usage.get("work")).resolves.toMatchObject({ profile: "work" });
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
@@ -264,9 +269,57 @@ describe("UsageService (per-agent fetchers)", () => {
     expect(u.limits).toEqual([{ kind: "weekly_all", label: "Weekly (all models)", percent: 12, resetsAt: null }]);
   });
 
-  it("an agent without a fetcher (opencode) is UsageUnavailableError", async () => {
+  it("an agent without a fetcher (opencode) is \"unsupported\"", async () => {
     const usage = new UsageService("/profiles", { resolveAgent: () => "opencode", resolveDir, isLoggedIn: () => true });
-    await expect(usage.get("oc")).rejects.toBeInstanceOf(UsageUnavailableError);
+    const err = await usage.get("oc").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UsageError);
+    expect((err as UsageError).problem).toBe("unsupported");
+  });
+
+  // The phone shows what went wrong, not the wire (a 401 body used to land in the app as a wall of JSON)
+  it("a fetcher failing with 401 becomes signed_out, with the raw body kept as detail", async () => {
+    const raw = 'failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: '
+      + '401 Unauthorized; body={"error":{"code":"token_invalidated"}}';
+    const usage = new UsageService("/profiles", {
+      fetchers: { codex: async () => { throw new Error(raw); } },
+      resolveAgent: () => "codex", resolveDir, isLoggedIn: () => true,
+    });
+    const err = await usage.get("cx").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UsageError);
+    expect((err as UsageError).problem).toBe("signed_out");
+    expect((err as UsageError).message).toBe("Codex is signed out on your Mac");
+    expect((err as UsageError).hint).toBe("tiny profiles login cx");
+    expect((err as UsageError).detail).toBe(raw);
+  });
+
+  it("any other fetcher failure is \"failed\" and keeps the raw text", async () => {
+    const usage = new UsageService("/profiles", {
+      fetchers: { claude: async () => { throw new Error("spawn claude ENOENT"); } },
+      resolveAgent: () => "claude", resolveDir, isLoggedIn: () => true,
+    });
+    const err = await usage.get("work").catch((e: unknown) => e);
+    expect((err as UsageError).problem).toBe("failed");
+    expect((err as UsageError).detail).toBe("spawn claude ENOENT");
+    expect((err as UsageError).hint).toBeUndefined();
+  });
+
+  describe("classifyUsageError", () => {
+    const cases: [string, string][] = [
+      ["401 Unauthorized", "signed_out"],
+      ['{"code":"token_invalidated"}', "signed_out"],
+      ["Your authentication token has been invalidated. Please try signing in again.", "signed_out"],
+      ["Not logged in. Run `codex login`", "signed_out"],
+      ["usage request timed out after 20000ms", "failed"],
+      ["ECONNREFUSED 127.0.0.1:1455", "failed"],
+    ];
+    it.each(cases)("%s → %s", (raw, problem) => {
+      expect(classifyUsageError(new Error(raw), "codex", "cx").problem).toBe(problem);
+    });
+
+    it("passes an already-classified error through untouched", () => {
+      const original = new UsageError("unavailable", "Usage is not available for this login");
+      expect(classifyUsageError(original, "claude", "work")).toBe(original);
+    });
   });
 
   it("the singular fetcher works as an alias for the claude fetcher", async () => {

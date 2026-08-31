@@ -42,6 +42,7 @@ describe("REST API", () => {
   let outbox: FileOutbox;
   let cwd: string;
   let usage: UsageService;
+  let push: PushClient;
   let auth: AuthService;
   let profilesDir: string;
   let cliLive: boolean | null = null;
@@ -74,7 +75,7 @@ describe("REST API", () => {
     });
     auth = new AuthService(stores, path.join(home, "secret"));
     token = auth.cliToken();
-    const push = new PushClient({
+    push = new PushClient({
       stores,
       settings: () => ({ relayUrl: "https://relay.test", pushEnabled: true, serverUrl: "" }),
       fetchImpl: (async () =>
@@ -201,6 +202,31 @@ describe("REST API", () => {
     ]);
     // nonexistent profile is 500 (existing behavior: profileDir throws a plain Error)
     expect((await app.request("/v1/profiles/nope/usage", { headers: H() })).status).toBe(500);
+  });
+
+  // The phone renders `problem` (not the wording), shows `hint` as the fix, and keeps `detail`
+  // behind a disclosure — a 401 body used to land on screen as a wall of JSON
+  it("GET /v1/profiles/:name/usage answers a failed lookup in one line plus the raw detail", async () => {
+    const raw = '401 Unauthorized; body={"error":{"code":"token_invalidated"}}';
+    const failing = new UsageService(profilesDir, {
+      fetchers: { codex: async () => { throw new Error(raw); } },
+      resolveAgent: () => "codex",
+      resolveDir: () => `${profilesDir}/cx`,
+      isLoggedIn: () => true,
+    });
+    const one = createApp({
+      manager, auth, outbox, profilesDir, stores,
+      serverUrl: () => "http://mac:7777", push, usage: failing,
+      isCliLive: () => cliLive,
+    });
+    const res = await one.request("/v1/profiles/cx/usage", { headers: H() });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: "Codex is signed out on your Mac",
+      problem: "signed_out",
+      hint: "tiny profiles login cx",
+      detail: raw,
+    });
   });
 
   it("permissions: unknown reqId is 404", async () => {

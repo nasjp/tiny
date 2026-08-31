@@ -12,7 +12,7 @@ import { ConflictError, NotFoundError, SessionManager, ValidationError } from ".
 import { TINY_VERSION } from "./version.js";
 import type { Stores } from "./stores.js";
 import type { SessionRecord, SessionResponse, SessionStatus } from "./types.js";
-import type { UsageService } from "./usage.js";
+import { UsageError, type UsageService } from "./usage.js";
 import { isOnPath } from "./which.js";
 
 export interface ApiDeps {
@@ -106,6 +106,11 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
   app.onError((err, c) => {
     if (err instanceof NotFoundError) return c.json({ error: err.message }, 404);
     if (err instanceof ConflictError) return c.json({ error: err.message }, 409);
+    // Usage has no numbers to show: say what is wrong in one line, how to fix it, and keep the raw
+    // upstream text in `detail` for the app's Details disclosure
+    if (err instanceof UsageError) {
+      return c.json({ error: err.message, problem: err.problem, hint: err.hint, detail: err.detail }, err.status);
+    }
     if (err instanceof ZodError || err instanceof SyntaxError) return c.json({ error: err.message }, 400);
     if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
     return c.json({ error: err.message }, 500);

@@ -3,6 +3,13 @@ import Foundation
 struct APIError: Error, LocalizedError {
     let status: Int
     let message: String
+    /// Why a usage lookup produced nothing: signed_out / unavailable / unsupported / failed
+    /// (usage.ts). nil for every other endpoint, and for a tinyd older than this field
+    var problem: String? = nil
+    /// The command that fixes it, ready to be typed on the Mac
+    var hint: String? = nil
+    /// Raw upstream text (a 401 body, a spawn error). Shown only when the reader asks for it
+    var detail: String? = nil
     var errorDescription: String? { message }
 }
 
@@ -20,13 +27,21 @@ final class APIClient {
 
     // MARK: - Low level
 
-    private struct ErrorBody: Codable { let error: String }
+    private struct ErrorBody: Codable {
+        let error: String
+        var problem: String? = nil
+        var hint: String? = nil
+        var detail: String? = nil
+    }
 
     private static func check(_ data: Data, _ response: URLResponse) throws {
         guard let http = response as? HTTPURLResponse else { throw APIError(status: 0, message: "no response") }
         guard (200..<300).contains(http.statusCode) else {
-            let msg = (try? JSONDecoder().decode(ErrorBody.self, from: data))?.error ?? "HTTP \(http.statusCode)"
-            throw APIError(status: http.statusCode, message: msg)
+            guard let body = try? JSONDecoder().decode(ErrorBody.self, from: data) else {
+                throw APIError(status: http.statusCode, message: "HTTP \(http.statusCode)")
+            }
+            throw APIError(status: http.statusCode, message: body.error,
+                           problem: body.problem, hint: body.hint, detail: body.detail)
         }
     }
 
