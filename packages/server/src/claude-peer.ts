@@ -1,4 +1,6 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 
 /**
@@ -189,4 +191,84 @@ export function wrapForPeer(text: string, opts: { name: string; mode: CliMode | 
   const attrs = [`from-name="${opts.name}"`, ...(opts.mode ? [`from-mode="${opts.mode}"`] : [])].join(" ");
   const body = text.replace(CLOSE_TAG_RE, "<\\");
   return `<${PEER_TAG} ${attrs}>\n${body}\n\n${PEER_NOTE}\n</${PEER_TAG}>`;
+}
+
+export interface PeerFrame {
+  /** The receiver drops a frame whose session_id is not its own — protects against a recycled pid */
+  agentSessionId: string;
+  /** Comes back verbatim as origin.msg_id on the transcript record: the only delivery receipt we get */
+  msgId: string;
+  /** Already wrapped (wrapForPeer) */
+  content: string;
+  /** next = after whatever the CLI is doing (its default); now = interrupt it (used for Stop) */
+  priority: "next" | "now";
+}
+
+/** The receiver closes the connection on a longer line (auth line included) */
+const MAX_LINE_CHARS = 1_048_576;
+const CONNECT_TIMEOUT_MS = 5000;
+/** Claude Code's own sender waits this long before half-closing on macOS; copy it */
+const END_DELAY_MS = 150;
+
+/** The peer token published for this socket, or null when there is none (the inbox then accepts unauthenticated frames on macOS) */
+export function readPeerToken(configDir: string, target: PeerTarget): string | null {
+  const hash = crypto.createHash("sha256").update(target.sockPath).digest("hex");
+  const file = path.join(configDir, "sessions", `${target.pid}.${hash}.key`);
+  try {
+    const token = (JSON.parse(fs.readFileSync(file, "utf8")) as { peerToken?: unknown }).peerToken;
+    return typeof token === "string" && /^[0-9a-f]{32}$/.test(token) ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+const PEER_AUTH_TYPE = "auth";
+
+/** The bytes written to the socket: an optional auth line, then the user frame, newline-terminated */
+export function encodePeerFrames(frame: PeerFrame, token: string | null): string {
+  const user = JSON.stringify({
+    msgV: 1,
+    msg_id: frame.msgId,
+    session_id: frame.agentSessionId,
+    type: "user",
+    message: { role: "user", content: frame.content },
+    priority: frame.priority,
+  });
+  if (user.length + 1 > MAX_LINE_CHARS) {
+    throw new Error(`message too large for the CLI inbox (${user.length} chars, limit ${MAX_LINE_CHARS})`);
+  }
+  return (token ? JSON.stringify({ type: PEER_AUTH_TYPE, token }) + "\n" : "") + user + "\n";
+}
+
+/** Deliver one frame. Resolves when the connection has closed; rejects on connect failure or timeout */
+export function sendPeerMessage(
+  target: PeerTarget,
+  frame: PeerFrame,
+  token: string | null,
+  timing: { connectTimeoutMs: number; endDelayMs: number } = { connectTimeoutMs: CONNECT_TIMEOUT_MS, endDelayMs: END_DELAY_MS },
+): Promise<void> {
+  const payload = encodePeerFrames(frame, token);
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ path: target.sockPath });
+    let settled = false;
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      reject(err);
+    };
+    sock.setTimeout(timing.connectTimeoutMs, () => fail(new Error(`timed out sending to ${target.sockPath}`)));
+    sock.on("error", fail);
+    sock.on("connect", () => {
+      sock.write(payload);
+      setTimeout(() => {
+        if (!sock.destroyed) sock.end();
+      }, timing.endDelayMs);
+    });
+    sock.on("close", () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    });
+  });
 }

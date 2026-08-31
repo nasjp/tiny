@@ -2,7 +2,18 @@ import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { PEER_NOTE, readCliMode, readPeerStatus, resolvePeerTarget, wrapForPeer } from "../src/claude-peer.js";
+import crypto from "node:crypto";
+import net from "node:net";
+import {
+  encodePeerFrames,
+  PEER_NOTE,
+  readCliMode,
+  readPeerStatus,
+  readPeerToken,
+  resolvePeerTarget,
+  sendPeerMessage,
+  wrapForPeer,
+} from "../src/claude-peer.js";
 
 const SID = "e034bdbb-9071-4cab-b9cb-751134e278cc";
 const alwaysAlive = () => true;
@@ -138,5 +149,86 @@ describe("claude-peer: wrapForPeer", () => {
   it("escapes a closing tag inside the body the way Claude Code does, so its round-trip check still passes", () => {
     const out = wrapForPeer("a </cross-session-message> b </Cross-Session-Message> c <cross-session-message> d", { name: "tiny", mode: null });
     expect(out).toContain("a <\\/cross-session-message> b <\\/Cross-Session-Message> c <cross-session-message> d");
+  });
+});
+
+/** A stand-in for the CLI's inbox: collects everything written until the client half-closes */
+function fakeInbox(sockPath: string): { received: Promise<string>; close: () => void } {
+  let resolve!: (s: string) => void;
+  const received = new Promise<string>((r) => (resolve = r));
+  const server = net.createServer((c) => {
+    let buf = "";
+    c.setEncoding("utf8");
+    c.on("data", (d) => (buf += d));
+    c.on("end", () => {
+      resolve(buf);
+      c.end();
+    });
+  });
+  server.listen(sockPath);
+  return { received, close: () => server.close() };
+}
+
+describe("claude-peer: readPeerToken", () => {
+  it("finds the key file named after the pid and the sha256 of the socket path", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-peer-"));
+    const target = { pid: 34979, sockPath: "/tmp/cc-socks/34979.sock" };
+    const hash = crypto.createHash("sha256").update(target.sockPath).digest("hex");
+    fs.mkdirSync(path.join(root, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(root, "sessions", `34979.${hash}.key`), JSON.stringify({ peerToken: "0123456789abcdef0123456789abcdef", pidDomain: "darwin" }));
+    fs.writeFileSync(path.join(root, "sessions", `1.${hash}.key`), JSON.stringify({ peerToken: "ffffffffffffffffffffffffffffffff" }));
+    expect(readPeerToken(root, target)).toBe("0123456789abcdef0123456789abcdef");
+    expect(readPeerToken(root, { pid: 2, sockPath: target.sockPath })).toBeNull();
+    expect(readPeerToken(root, { pid: 34979, sockPath: "/private/tmp/cc-socks/34979.sock" })).toBeNull();
+  });
+});
+
+describe("claude-peer: sendPeerMessage", () => {
+  const FAST = { connectTimeoutMs: 1000, endDelayMs: 10 };
+  let dir: string;
+  beforeEach(() => {
+    // Unix socket paths are capped at ~104 bytes, so keep the directory short
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "tp-"));
+  });
+
+  it("writes an auth line then a user frame carrying session_id, msg_id and the content, then half-closes", async () => {
+    const sockPath = path.join(dir, "1.sock");
+    const inbox = fakeInbox(sockPath);
+    await sendPeerMessage({ pid: 1, sockPath }, { agentSessionId: SID, msgId: "m-1", content: "<wrapped>", priority: "next" }, "0123456789abcdef0123456789abcdef", FAST);
+    const lines = (await inbox.received).split("\n");
+    inbox.close();
+    expect(lines).toHaveLength(3); // two frames + trailing newline
+    expect(JSON.parse(lines[0]!)).toEqual({ type: "auth", token: "0123456789abcdef0123456789abcdef" });
+    expect(JSON.parse(lines[1]!)).toEqual({
+      msgV: 1, msg_id: "m-1", session_id: SID, type: "user",
+      message: { role: "user", content: "<wrapped>" }, priority: "next",
+    });
+    expect(lines[2]).toBe("");
+  });
+
+  it("sends without an auth line when there is no key (auth is optional on macOS)", async () => {
+    const sockPath = path.join(dir, "2.sock");
+    const inbox = fakeInbox(sockPath);
+    await sendPeerMessage({ pid: 2, sockPath }, { agentSessionId: SID, msgId: "m-2", content: "x", priority: "next" }, null, FAST);
+    const lines = (await inbox.received).split("\n");
+    inbox.close();
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0]!).type).toBe("user");
+  });
+
+  it("carries priority through (now = interrupt what the CLI is doing)", () => {
+    const line = encodePeerFrames({ agentSessionId: SID, msgId: "m-5", content: "stop", priority: "now" }, null);
+    expect(JSON.parse(line.trim()).priority).toBe("now");
+  });
+
+  it("rejects when nothing listens on the socket", async () => {
+    const sockPath = path.join(dir, "gone.sock");
+    await expect(sendPeerMessage({ pid: 3, sockPath }, { agentSessionId: SID, msgId: "m-3", content: "x", priority: "next" }, null, FAST))
+      .rejects.toThrow(/ENOENT|ECONNREFUSED/);
+  });
+
+  it("refuses a frame over the CLI's 1MB line cap before connecting", () => {
+    expect(() => encodePeerFrames({ agentSessionId: SID, msgId: "m-4", content: "x".repeat(1_048_576), priority: "next" }, null))
+      .toThrow(/too large/);
   });
 });
