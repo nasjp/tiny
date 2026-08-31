@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { addProfile, listProfiles, profileDir, renameProfile } from "../src/profiles.js";
+import { addProfile, listProfiles, profileDir, profileDriver, renameProfile } from "../src/profiles.js";
 import { EMPTY_CAPABILITIES, registerDriver } from "../src/agents/index.js";
 
 describe("profiles", () => {
@@ -120,6 +120,24 @@ describe("profiles", () => {
     addProfile(root, "local", "claude", external);
     fs.rmSync(external, { recursive: true, force: true });
     expect(() => profileDir(root, "local")).toThrow(/config dir not found/);
+  });
+
+  it("renameProfile moves only the metadata dir, never the external configDir", () => {
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    fs.writeFileSync(path.join(external, "marker"), "keep me");
+    addProfile(root, "local", "claude", external);
+    renameProfile(root, "local", "local2");
+    // the user's real config dir must stay exactly where it was, with its contents
+    expect(fs.existsSync(path.join(external, "marker"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "local"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "local2", "tiny-profile.json"))).toBe(true);
+    expect(profileDir(root, "local2")).toBe(external);
+  });
+
+  it("profileDriver reads the agent from the metadata dir, not the external configDir", () => {
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(root, "oc-local", "opencode", external);
+    expect(profileDriver(root, "oc-local").id).toBe("opencode");
   });
 });
 

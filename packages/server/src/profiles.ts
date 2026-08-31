@@ -24,6 +24,14 @@ export interface ProfileInfo {
 const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 const PROFILE_META = "tiny-profile.json";
 
+/** Metadata directory of a profile: always under profilesDir, even when configDir points elsewhere */
+function profileMetaDir(profilesDir: string, name: string): string {
+  if (!NAME_RE.test(name)) throw new Error(`invalid profile name: ${name}`);
+  const dir = path.join(profilesDir, name);
+  if (!fs.existsSync(dir)) throw new Error(`profile not found: ${name}`);
+  return dir;
+}
+
 /** External CLAUDE_CONFIG_DIR of a profile (tiny-profile.json "configDir"). null when the profile owns its directory */
 export function readProfileConfigDir(dir: string): string | null {
   try {
@@ -46,9 +54,9 @@ export function readProfileAgent(dir: string): string {
   }
 }
 
-/** Driver for a profile (throws for an unregistered agent) */
+/** Driver for a profile (throws for an unregistered agent). tiny-profile.json lives in the metadata dir */
 export function profileDriver(profilesDir: string, name: string): AgentDriver {
-  return getDriver(readProfileAgent(profileDir(profilesDir, name)));
+  return getDriver(readProfileAgent(profileMetaDir(profilesDir, name)));
 }
 
 // What "default (follow the CLI's settings)" actually means = model/effort in the profile's
@@ -118,9 +126,10 @@ export function addProfile(profilesDir: string, name: string, agent = "claude", 
 /**
  * Renames the profile directory. The Keychain item (macOS token) and the DB's
  * sessions.profile must be moved separately — the CLI's `profiles rename` ties them together.
+ * Only the metadata directory moves: a configDir profile points at a directory tiny does not own.
  */
 export function renameProfile(profilesDir: string, from: string, to: string): ProfileInfo {
-  const src = profileDir(profilesDir, from); // doubles as name validation and existence check
+  const src = profileMetaDir(profilesDir, from); // metadata only — never the external configDir
   if (!NAME_RE.test(to)) throw new Error(`invalid profile name: ${to}`);
   if (from === to) throw new Error(`profile is already named ${to}`);
   const dst = path.join(profilesDir, to);
