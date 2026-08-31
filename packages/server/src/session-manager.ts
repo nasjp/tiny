@@ -362,6 +362,7 @@ export class SessionManager extends EventEmitter {
         permissionMode: s.permissionMode,
         model: s.model,
         effort: s.effort,
+        tinySessionId: s.id,
         prompt,
         ...(images && images.length > 0 ? { images } : {}),
         emit: (ev) => this.emitEvent(s.id, ev.type, ev.payload),

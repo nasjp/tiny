@@ -30,6 +30,7 @@ function baseParams(over: Partial<RunTurnParams> = {}): { p: RunTurnParams; even
     profileDir: "/tmp/profiles/work",
     cwd: "/tmp/repo",
     permissionMode: "default", model: null, effort: null,
+    tinySessionId: "tiny-session-1",
     prompt: "hello",
     emit: (ev) => events.push(ev),
     requestPermission: async () => ({ behavior: "allow" }),
@@ -89,6 +90,9 @@ describe("ClaudeAdapter", () => {
       await adapter.runTurn(p);
       expect(capture.options.env.CLAUDE_CONFIG_DIR).toBe("/tmp/profiles/work");
       expect(capture.options.env.ANTHROPIC_API_KEY).toBeUndefined();
+      // Hooks in the user's own settings.json run inside this agent and inherit its env.
+      // `tiny handoff` reads this to recognize it is inside an agent tiny started
+      expect(capture.options.env.TINY_SESSION_ID).toBe("tiny-session-1");
       expect(capture.options.resume).toBe("prev-sess");
       expect(capture.options.cwd).toBe("/tmp/repo");
       expect(capture.options.permissionMode).toBe("default");

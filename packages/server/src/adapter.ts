@@ -23,6 +23,8 @@ export interface RunTurnParams {
   model: string | null;
   /** Reasoning effort (low/medium/high/xhigh/max). null means default */
   effort: string | null;
+  /** Tiny's own session id. Adapters put it in the agent's env so hooks can tell they are inside tiny */
+  tinySessionId: string;
   prompt: string;
   images?: TurnImage[];
   emit: (ev: TurnEventInput) => void;

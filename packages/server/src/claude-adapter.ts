@@ -81,8 +81,16 @@ export class ClaudeAdapter implements AgentAdapter {
         prompt: promptInput,
         options: {
           cwd: p.cwd,
-          // Always drop ANTHROPIC_API_KEY: leaving it switches billing from the subscription to metered API usage
-          env: { ...process.env, ANTHROPIC_API_KEY: undefined, CLAUDE_CONFIG_DIR: p.profileDir },
+          // Always drop ANTHROPIC_API_KEY: leaving it switches billing from the subscription to metered API usage.
+          // TINY_SESSION_ID: hooks in the user's own settings.json run inside this agent and inherit its
+          // env, and `tiny handoff` reads it to recognize that it is inside an agent tiny started and do
+          // nothing — otherwise an always-on SessionStart hook adopts tiny's own session as a new one
+          env: {
+            ...process.env,
+            ANTHROPIC_API_KEY: undefined,
+            CLAUDE_CONFIG_DIR: p.profileDir,
+            TINY_SESSION_ID: p.tinySessionId,
+          },
           ...(p.agentSessionId ? { resume: p.agentSessionId } : {}),
           permissionMode: toSdkPermissionMode(p.permissionMode),
           ...(p.model ? { model: p.model } : {}),
