@@ -233,6 +233,84 @@ describe("SessionManager", () => {
 
   // A 139MB transcript costs ~250ms and ~800MB of RSS to parse, and the events endpoint asks on
   // every poll, so an unchanged file must cost a single stat
+  // The regression guard for C2 as a whole: nothing else in this suite crosses the
+  // adopt -> turn -> adopt boundary, which is exactly where the double import lived.
+  // Two sessions, because the three halves fire in different states: seeding needs a null cursor,
+  // the completion advance needs a non-null one, and the running guard covers the hook that fires
+  // WHILE the turn is still writing
+  it("a session that was adopted, then ran one turn, gains no duplicate events when adopted again", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-sm-"));
+    const profilesDir = path.join(home, "profiles");
+    const outboxDir = path.join(home, "outbox");
+    fs.mkdirSync(outboxDir, { recursive: true });
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    addProfile(profilesDir, "local", "claude", configDir);
+    const stores = createStores(openDb(":memory:"));
+
+    // stands in for the SDK: appends to the same transcript the CLI writes, and — because the SDK
+    // reads every settings source — trips the SessionStart hook while the turn is still running
+    let file = "";
+    let agentId = "";
+    let hook: (() => void) | null = null;
+    const sdkLike: AgentAdapter = {
+      async runTurn(p: RunTurnParams) {
+        fs.appendFileSync(file, JSON.stringify({ type: "user", uuid: "t-u", message: { role: "user", content: "from the phone" } }) + "\n");
+        hook?.();
+        p.emit({ type: "assistant_text", payload: { text: "done" } });
+        fs.appendFileSync(file, JSON.stringify({ type: "assistant", uuid: "t-a", message: { content: [{ type: "text", text: "done" }] } }) + "\n");
+        hook?.();
+        return { agentSessionId: agentId, costUsd: null, resultText: "ok" };
+      },
+    };
+    const manager = new SessionManager({
+      stores, profilesDir, adapters: { claude: sdkLike },
+      broker: new PermissionBroker(1000),
+      outbox: new FileOutbox(outboxDir, stores.files),
+    });
+
+    // (1) adopted from a CLI session that already had a conversation: cursor is non-null
+    const cwdA = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    agentId = "agent-x";
+    file = path.join(configDir, "projects", cwdA.replace(/[/.]/g, "-"), "agent-x.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "from the CLI" } }) + "\n");
+    const a = manager.adoptSession({ profile: "local", cwd: cwdA, agentSessionId: "agent-x" }).session;
+    expect(a.sourceCursor).toBe("u1");
+    hook = () => manager.adoptSession({ profile: "local", cwd: cwdA, agentSessionId: "agent-x" });
+    manager.startTurn(a.id, "from the phone");
+    await manager.waitForIdle(a.id);
+    manager.adoptSession({ profile: "local", cwd: cwdA, agentSessionId: "agent-x" });
+    // the CLI's line, then the turn — each exactly once. Counting only across the final adopt would
+    // miss the hook that fired mid-turn, whose duplicates are already in the log by then
+    expect(stores.events.listSince(a.id, 0).map((e) => [e.type, (e.payload as { text?: string }).text]))
+      .toEqual([
+        ["user_message", "from the CLI"],
+        ["user_message", "from the phone"],
+        ["assistant_text", "done"],
+      ]);
+
+    // (2) the same round trip for a session tiny created itself: no transcript at adopt time,
+    // so the cursor is still null when the turn ends
+    const cwdB = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    agentId = "agent-y";
+    file = path.join(configDir, "projects", cwdB.replace(/[/.]/g, "-"), "agent-y.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "");
+    const b = manager.createSession({ profile: "local", cwd: cwdB });
+    stores.sessions.patch(b.id, { agentSessionId: "agent-y" });
+    expect(manager.getSession(b.id).sourceCursor).toBeNull();
+    hook = () => manager.adoptSession({ profile: "local", cwd: cwdB, agentSessionId: "agent-y" });
+    manager.startTurn(b.id, "from the phone");
+    await manager.waitForIdle(b.id);
+    manager.adoptSession({ profile: "local", cwd: cwdB, agentSessionId: "agent-y" });
+    expect(stores.events.listSince(b.id, 0).map((e) => [e.type, (e.payload as { text?: string }).text]))
+      .toEqual([
+        ["user_message", "from the phone"],
+        ["assistant_text", "done"],
+      ]);
+  });
+
   it("syncTranscript does not re-read a transcript whose path, size and mtime are unchanged", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");

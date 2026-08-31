@@ -131,10 +131,11 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
-   * How many human turns a first backfill imports. Counting records instead would fill the
-   * import with tool traffic and almost none of the conversation the person came back for
+   * How many human turns a first backfill imports. Counting records instead would fill the import
+   * with tool traffic and almost none of the conversation the person came back for. Five turns is
+   * 50-200 records on real transcripts, which stays clear of readTranscript's 300-record ceiling
    */
-  private static readonly BACKFILL_TURNS = 10;
+  private static readonly BACKFILL_TURNS = 5;
 
   /**
    * Register a session that was started in the agent's own CLI (`tiny handoff`).
@@ -223,6 +224,12 @@ export class SessionManager extends EventEmitter {
    */
   syncTranscript(id: string): number {
     const s = this.getSession(id);
+    // Mid-turn, tiny is itself appending to this transcript through the SDK and emitting every one
+    // of those records natively as it goes. Importing them here would duplicate them, and the
+    // cursor advance at completion cannot take back events already in the log. With this guard the
+    // writers of the jsonl (the user's CLI, tiny's SDK child) and the writers of the cursor
+    // (syncTranscript, turn completion) can no longer interleave
+    if (s.status === "running") return 0;
     const file = this.transcriptFile(s);
     if (!file) return 0;
     let stat: fs.Stats;
