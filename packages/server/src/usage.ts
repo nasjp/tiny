@@ -1,6 +1,8 @@
 import os from "node:os";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { agentEnv, findDriver } from "./agents/index.js";
+import { claudeConfigDirEnv, readClaudeCachedUsage } from "./agents/claude.js";
+import { definedEnv } from "./claude-adapter.js";
 import { codexDriver } from "./agents/codex.js";
 import { spawnCodexProcess, type CodexSpawn } from "./codex-adapter.js";
 import { readProfileAgent, profileDir } from "./profiles.js";
@@ -89,6 +91,8 @@ export interface SdkUsageOptions {
   cwd?: string;
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
+  /** Claude Code's own cached numbers for a config dir. Seam for tests */
+  readCached?: (configDir: string) => { raw: unknown; fetchedAt: string } | null;
 }
 
 /**
@@ -99,6 +103,7 @@ export function createSdkUsageFetcher(opts: SdkUsageOptions = {}): UsageFetcher 
   const queryFn = opts.queryFn ?? sdkQuery;
   const cwd = opts.cwd ?? os.tmpdir();
   const timeoutMs = opts.timeoutMs ?? 20_000;
+  const readCached = opts.readCached ?? readClaudeCachedUsage;
   return async (configDir) => {
     let release: () => void = () => {};
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -110,8 +115,18 @@ export function createSdkUsageFetcher(opts: SdkUsageOptions = {}): UsageFetcher 
       prompt: silent(),
       options: {
         cwd,
-        // Always drop ANTHROPIC_API_KEY: leaving it bills API pay-as-you-go instead of the subscription
-        env: { ...(opts.env ?? process.env), ANTHROPIC_API_KEY: undefined, CLAUDE_CONFIG_DIR: configDir },
+        // definedEnv, because the SDK replaces the child env wholesale: "remove this variable"
+        // has to be removal. Two variables must really be gone —
+        //  ANTHROPIC_API_KEY: leaving it bills API pay-as-you-go instead of the subscription
+        //  CLAUDE_CONFIG_DIR when the profile IS Claude Code's default directory: naming it moves
+        //    the config lookup to ~/.claude/.claude.json, which does not exist, and the process
+        //    starts up logged out (`claude auth status` there answers "loggedIn": false) — usage
+        //    then reports no subscription at all, which is what the `local` profile used to show
+        env: definedEnv({
+          ...(opts.env ?? process.env),
+          ANTHROPIC_API_KEY: undefined,
+          ...claudeConfigDirEnv(configDir),
+        }),
         abortController: abort,
       },
     });
@@ -127,6 +142,12 @@ export function createSdkUsageFetcher(opts: SdkUsageOptions = {}): UsageFetcher 
       // If an SDK bump renames it, typecheck fails — keep it confined to this one call site
       const res = await Promise.race([q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(), timeout]);
       if (!res.rate_limits_available || res.rate_limits == null) {
+        // A freshly started process can report the limits as available and still hand over
+        // nothing (measured: the default profile of a Mac whose sessions run through claude.ai).
+        // Claude Code writes what it last fetched into its own config file, so show that —
+        // stamped with when it was written — rather than telling the person there is no usage
+        const cached = readCached(configDir);
+        if (cached) return { ...(cached.raw as Record<string, unknown>), fetched_at: cached.fetchedAt };
         throw new UsageError(
           "unavailable",
           "Usage is not available for this login (an API-key or console login, or a plan that does not report usage)",
@@ -271,7 +292,9 @@ export function normalizeUsage(profile: string, raw: unknown): ProfileUsage {
         };
       })
     : fromTypedWindows(r);
-  return { profile, limits, fetchedAt: new Date().toISOString() };
+  // A cached fallback carries the moment Claude Code fetched the numbers; a live read is now
+  const fetchedAt = typeof r.fetched_at === "string" ? r.fetched_at : new Date().toISOString();
+  return { profile, limits, fetchedAt };
 }
 
 type Window = { utilization?: unknown; resets_at?: unknown; display_name?: unknown } | null | undefined;

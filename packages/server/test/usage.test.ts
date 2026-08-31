@@ -1,3 +1,5 @@
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   classifyUsageError,
@@ -54,8 +56,53 @@ describe("createSdkUsageFetcher", () => {
     expect(args.options.cwd).toBe("/tmp/neutral");
     expect(args.options.env.CLAUDE_CONFIG_DIR).toBe("/home/u/.tiny/profiles/work");
     expect(args.options.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect("ANTHROPIC_API_KEY" in args.options.env).toBe(false); // the SDK copies options.env wholesale
     expect(args.options.env.PATH).toBe("/usr/bin");
     expect(fq.calls[0]!.closed).toBe(true);
+  });
+
+  // Claude Code looks its config file up asymmetrically: unset it reads ~/.claude.json, set to
+  // $X it reads $X/.claude.json — which ~/.claude does not have. Naming the default directory
+  // therefore hands the process an empty config, and `claude auth status` there answers
+  // "loggedIn: false" — measured on device, and the reason the `local` profile never had usage
+  it("never names Claude Code's own default directory (that logs the process out)", async () => {
+    const fq = fakeQuery({ rate_limits_available: true, rate_limits: RATE_LIMITS });
+    const home = path.join(os.homedir(), ".claude");
+    await createSdkUsageFetcher({ queryFn: fq.queryFn, env: { PATH: "/usr/bin" } })(home);
+    const args = fq.calls[0]!.args as { options: { env: Record<string, string> } };
+    expect("CLAUDE_CONFIG_DIR" in args.options.env).toBe(false);
+  });
+
+  // Measured on this Mac's default profile: a fresh process answers "limits are available" and
+  // then hands over nothing, while Claude Code's own cache in .claude.json holds the numbers the
+  // person sees in /usage. Showing those, stamped with when they were written, beats showing nothing
+  it("falls back to Claude Code's own cached numbers when the process hands over none", async () => {
+    const fq = fakeQuery({ rate_limits_available: true, rate_limits: null });
+    const cached = {
+      raw: { limits: [{ kind: "session", percent: 43, resets_at: "2026-08-31T13:10:00Z", scope: null }] },
+      fetchedAt: "2026-08-31T12:36:21.277Z",
+    };
+    const raw = await createSdkUsageFetcher({ queryFn: fq.queryFn, readCached: () => cached })("/p");
+    const usage = normalizeUsage("local", raw);
+    expect(usage.limits).toEqual([
+      { kind: "session", label: "Session (5h)", percent: 43, resetsAt: "2026-08-31T13:10:00Z" },
+    ]);
+    expect(usage.fetchedAt).toBe("2026-08-31T12:36:21.277Z");
+  });
+
+  it("still says unavailable when there is no cache to fall back on", async () => {
+    const fq = fakeQuery({ rate_limits_available: false, rate_limits: null });
+    const err = await createSdkUsageFetcher({ queryFn: fq.queryFn, readCached: () => null })("/p")
+      .catch((e: unknown) => e);
+    expect((err as UsageError).problem).toBe("unavailable");
+  });
+
+  it("prefers what the process reports over the cache", async () => {
+    const fq = fakeQuery({ rate_limits_available: true, rate_limits: RATE_LIMITS });
+    const readCached = vi.fn(() => ({ raw: { limits: [] }, fetchedAt: "2020-01-01T00:00:00Z" }));
+    const usage = normalizeUsage("work", await createSdkUsageFetcher({ queryFn: fq.queryFn, readCached })("/p"));
+    expect(readCached).not.toHaveBeenCalled();
+    expect(usage.limits).toHaveLength(3);
   });
 
   it("the prompt streams nothing (never runs a turn)", async () => {

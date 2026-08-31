@@ -27,6 +27,13 @@ struct UsageView: View {
                             ForEach(usage.limits) { limit in
                                 limitRow(limit)
                             }
+                            // Numbers can come from what Claude Code last wrote down for this
+                            // profile rather than from a live read, so say how old they are
+                            if let age = Self.freshnessText(usage.fetchedAt) {
+                                Text(age)
+                                    .font(.tinyCaption2).fontDesign(.monospaced)
+                                    .foregroundStyle(Color.tInkSub)
+                            }
                         } else if let failure = failures[profile.name] {
                             failureRow(profile.name, failure)
                         } else {
@@ -136,6 +143,19 @@ struct UsageView: View {
         case ..<80: .tDetached
         default: .tRuby
         }
+    }
+
+    /// "As of 21:36 (1h ago)" for numbers that are no longer current. nil while they are fresh —
+    /// a timestamp on a live reading is noise
+    static func freshnessText(_ iso: String, now: Date = Date(), staleAfter: TimeInterval = 300) -> String? {
+        guard let date = EventRow.parseISO(iso), now.timeIntervalSince(date) > staleAfter else { return nil }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = Calendar.current.isDate(date, inSameDayAs: now) ? "HH:mm" : "M/d HH:mm"
+        let rel = RelativeDateTimeFormatter()
+        rel.locale = Locale(identifier: "en_US")
+        rel.unitsStyle = .abbreviated
+        return "As of \(f.string(from: date)) (\(rel.localizedString(for: date, relativeTo: now)))"
     }
 
     /// Renders reset times like "Today 18:00" or "9/3 11:00 (in 3 days)"

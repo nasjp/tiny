@@ -33,7 +33,7 @@ function toSdkPermissionMode(mode: string): SdkPermissionMode {
  * The SDK replaces the child env wholesale with options.env (`env = options.env ? {...options.env}
  * : {...process.env}`), so a key that is absent here is absent from the agent process
  */
-function definedEnv(env: Record<string, string | undefined>): Record<string, string> {
+export function definedEnv(env: Record<string, string | undefined>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
   return out;

@@ -62,3 +62,26 @@ final class UsageFailureTests: XCTestCase {
         XCTAssertEqual(f.tone, .alert)
     }
 }
+
+/// Usage numbers can come from Claude Code's own cache rather than a live read, so the card says
+/// how old they are — but only when that is worth saying
+final class UsageFreshnessTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_788_181_000)   // 2026-08-31 13:36:40Z
+
+    func testFreshNumbersCarryNoTimestamp() {
+        let iso = ISO8601DateFormatter().string(from: now.addingTimeInterval(-60))
+        XCTAssertNil(UsageView.freshnessText(iso, now: now))
+    }
+
+    func testStaleNumbersSayWhenTheyWereTaken() {
+        let iso = ISO8601DateFormatter().string(from: now.addingTimeInterval(-3600))
+        let text = UsageView.freshnessText(iso, now: now)
+        XCTAssertNotNil(text)
+        XCTAssertTrue(text!.hasPrefix("As of "), text ?? "")
+        XCTAssertTrue(text!.contains("ago"), text ?? "")
+    }
+
+    func testAnUnparseableTimestampIsLeftOut() {
+        XCTAssertNil(UsageView.freshnessText("not a date", now: now))
+    }
+}

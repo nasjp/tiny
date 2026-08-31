@@ -57,6 +57,31 @@ export function readClaudeOauthAccount(dir: string): { emailAddress?: unknown } 
   }
 }
 
+/**
+ * The usage numbers Claude Code last fetched for this config dir, from `cachedUsageUtilization`
+ * in its own config file. Same shape as the SDK's live `rate_limits` (it even carries the
+ * `limits[]` array), plus when they were written. null when there is nothing cached.
+ * Config data only — this never goes near a credential.
+ */
+export function readClaudeCachedUsage(dir: string): { raw: unknown; fetchedAt: string } | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(claudeConfigFile(dir), "utf8")) as {
+      cachedUsageUtilization?: { utilization?: unknown; fetchedAtMs?: unknown } | null;
+    };
+    const cached = parsed.cachedUsageUtilization;
+    if (!cached || typeof cached.utilization !== "object" || cached.utilization === null) return null;
+    const at = typeof cached.fetchedAtMs === "number" && Number.isFinite(cached.fetchedAtMs)
+      ? new Date(cached.fetchedAtMs).toISOString()
+      : null;
+    // Without a timestamp there is no way to say how old the numbers are, and unlabelled stale
+    // percentages are worse than none
+    if (at === null) return null;
+    return { raw: cached.utilization, fetchedAt: at };
+  } catch {
+    return null;
+  }
+}
+
 /** Whether logged in (never inspects token contents; never touches the Keychain) */
 export function claudeLoggedIn(dir: string): boolean {
   return fs.existsSync(path.join(dir, ".credentials.json")) || readClaudeOauthAccount(dir) != null;
