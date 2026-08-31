@@ -133,6 +133,17 @@ describe("claude-peer: readCliMode", () => {
     expect(fs.statSync(file).size).toBeGreaterThan(256 * 1024);
     expect(readCliMode(file)).toBe("bypass");
   });
+
+  it("gives up rather than read a huge transcript whole when the mode sits behind megabytes of records", () => {
+    // Real transcripts on this Mac reach 139MB; reading one whole on the send path costs ~250ms
+    // and ~800MB of RSS. Past the bounded second look the process argv decides instead
+    const file = path.join(root, "huge.jsonl");
+    const filler = jsonl([{ type: "assistant", uuid: "a", message: { content: [{ type: "text", text: "x".repeat(1000) }] } }]);
+    const head = jsonl([{ type: "permission-mode", permissionMode: "bypassPermissions", sessionId: SID }]);
+    fs.writeFileSync(file, head + filler.repeat(Math.ceil((8.5 * 1024 * 1024) / filler.length)));
+    expect(fs.statSync(file).size).toBeGreaterThan(8.5 * 1024 * 1024);
+    expect(readCliMode(file)).toBeNull();
+  });
 });
 
 describe("claude-peer: wrapForPeer", () => {

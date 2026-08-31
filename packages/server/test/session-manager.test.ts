@@ -990,6 +990,8 @@ describe("SessionManager", () => {
 
       expect(seen.map((e) => e.type)).toEqual(["user_message", "turn_started", "assistant_text", "turn_completed"]);
       expect(seen[0]!.payload.text).toBe("hello from the phone");
+      // the reply has to ride along in the terminal event: it is what the push notification shows
+      expect(seen.at(-1)!.payload).toEqual({ costUsd: null, resultText: "hi phone" });
       expect(stores.sessions.get(session.id)!.status).toBe("idle");
       // the CLI's own record of our message must not come back as a second user bubble
       expect(seen.filter((e) => e.type === "user_message")).toHaveLength(1);
@@ -1242,6 +1244,89 @@ describe("SessionManager", () => {
       setStatus({ status: "idle", waitingFor: null });
       await manager.waitForIdle(session.id);
       expect(seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "interrupted" } });
+    });
+
+    it("reports the same wait once even when the registry entry is caught mid-write in between", async () => {
+      // status "unknown" means "could not read the entry this tick", not "the CLI changed state".
+      // Letting it land in lastStatus would make the next readable tick look like a fresh wait
+      const { peer, sent, setStatus } = fakePeer();
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-unknown-attention");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "run the tests");
+      await until(() => sent.length === 1);
+      setStatus({ status: "busy", waitingFor: null });
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId)]));
+      await new Promise((r) => setTimeout(r, FAST_LIVE.pollMs * 5)); // let the watcher import the delivery
+      setStatus({ status: "waiting", waitingFor: "permission prompt" });
+      await until(() => seen.some((e) => e.type === "cli_attention"));
+      setStatus({ status: "unknown", waitingFor: null });
+      await new Promise((r) => setTimeout(r, FAST_LIVE.pollMs * 5));
+      setStatus({ status: "waiting", waitingFor: "permission prompt" }); // the same wait, still unanswered
+      await new Promise((r) => setTimeout(r, FAST_LIVE.pollMs * 5));
+      expect(seen.filter((e) => e.type === "cli_attention")).toHaveLength(1);
+      setStatus({ status: "busy", waitingFor: null });
+      fs.appendFileSync(file, jsonl([assistantRecord("tests pass")]));
+      setStatus({ status: "idle", waitingFor: null });
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)!.type).toBe("turn_completed");
+    });
+
+    it("does not let a registry entry caught mid-write postpone the delivery timeout", async () => {
+      // Every other tick is unreadable. Counting those as "not idle" would restart the clock
+      // forever and hide a message the CLI never took behind the 30-minute backstop
+      let ticks = 0;
+      const { peer } = fakePeer({
+        status: () => (++ticks % 2 === 0 ? { status: "unknown", waitingFor: null } : { status: "idle", waitingFor: null }),
+      });
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session } = liveSession(manager, home, "agent-unknown-timeout");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)!.payload.error).toMatch(/dropped/);
+    });
+
+    it("gives up after the maximum turn time when the CLI took the message but never answered", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      setStatus({ status: "busy", waitingFor: null }); // busy forever: no other rule ends this turn
+      const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-backstop");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId)])); // taken, but never answered
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)).toMatchObject({ type: "turn_failed" });
+      expect(seen.at(-1)!.payload.error).toMatch(/no response from the CLI/);
+      expect(stores.sessions.get(session.id)!.status).toBe("idle");
+    });
+
+    it("fails the turn when the Stop message cannot be delivered, instead of leaving it running silently", async () => {
+      // The socket is gone by the time Stop is tapped. Without a terminal event the phone would
+      // keep showing a running turn until the 30-minute backstop
+      const frames: PeerFrame[] = [];
+      const { peer, setStatus } = fakePeer({
+        send: async (_s, _t, frame) => {
+          frames.push(frame);
+          if (frame.priority === "now") throw new Error("connect ENOENT /srv/cc-socks/4242.sock");
+        },
+      });
+      setStatus({ status: "busy", waitingFor: null }); // the CLI is working: nothing else would end the turn
+      const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session } = liveSession(manager, home, "agent-stop-unreachable");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "count to a million");
+      await until(() => frames.length === 1);
+      manager.interrupt(session.id);
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)!.type).toBe("turn_failed");
+      expect(seen.at(-1)!.payload.error).toMatch(/could not stop the CLI/);
+      expect(stores.sessions.get(session.id)!.status).toBe("idle");
     });
 
     it("still refuses with 409 when the CLI is live but cannot be joined", () => {

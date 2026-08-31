@@ -102,6 +102,10 @@ interface LiveTurn {
   stopMsgId: string | null;
   /** When the CLI's transcript first showed the Stop message's own msg_id */
   stopDeliveredAt: number | null;
+  /** Why the Stop message could not be handed over. Set here, turned into the terminal event by the watcher */
+  stopFailure: string | null;
+  /** Newest assistant text imported during this turn; goes out as turn_completed's resultText (what the push shows) */
+  lastAssistantText: string | null;
 }
 
 export class SessionManager extends EventEmitter {
@@ -358,6 +362,11 @@ export class SessionManager extends EventEmitter {
       // backfill of an earlier turn, or the CLI's own concurrent turn, would latch a response that
       // was never ours
       if (live.deliveredAt !== null && responded) live.sawResponse = true;
+      // Keep the newest reply text: turn_completed carries it to the phone, and the push notification
+      // has nothing else to show (the SDK's own result text does not exist on this path)
+      for (const ev of read.events) {
+        if (ev.type === "assistant_text" && typeof ev.payload.text === "string") live.lastAssistantText = ev.payload.text;
+      }
     }
     return { imported: read.events.length, peerMsgIds: read.peerMsgIds, responded };
   }
@@ -581,6 +590,7 @@ export class SessionManager extends EventEmitter {
     const live: LiveTurn = {
       msgId: crypto.randomUUID(), target, startedAt: Date.now(), deliveredAt: null,
       sawResponse: false, idleUndeliveredSince: null, lastStatus: null, stopMsgId: null, stopDeliveredAt: null,
+      stopFailure: null, lastAssistantText: null,
     };
     this.liveTurns.set(s.id, live);
     try {
@@ -643,9 +653,23 @@ export class SessionManager extends EventEmitter {
     // syncTranscript caller cannot steal it) — this call only advances the cursor and, if this tick
     // is the one that catches it, updates that evidence. Read `live.*` below, not the return value
     this.importTranscript(s.id);
+    const outOfTime = (): { type: "turn_failed"; payload: Record<string, unknown> } => ({
+      type: "turn_failed",
+      payload: { error: `no response from the CLI in ${Math.round(timing.maxTurnMs / 60_000)} minutes` },
+    });
 
     const st = this.deps.peer!.status(s, live.target);
     if (st === null) return { type: "turn_failed", payload: { error: "the CLI closed" } };
+    // Stop was tapped but never reached the CLI. The turn is still running over there, yet the
+    // person is owed an answer now rather than at the 30-minute backstop
+    if (live.stopFailure !== null) {
+      return { type: "turn_failed", payload: { error: `could not stop the CLI: ${live.stopFailure}` } };
+    }
+    // "unknown" means the registry entry was caught mid-write, not that the CLI changed state. It
+    // carries no information, so the tick must leave every clock and every latch exactly as it was:
+    // recording it in lastStatus would make the next readable tick look like a fresh wait, and
+    // treating it as "not idle" would restart the delivery clock on every second tick
+    if (st.status === "unknown") return now - live.startedAt > timing.maxTurnMs ? outOfTime() : null;
     if (st.status === "waiting" && live.lastStatus !== "waiting") {
       this.emitEvent(s.id, "cli_attention", { reason: st.waitingFor ?? "input" });
     }
@@ -658,7 +682,7 @@ export class SessionManager extends EventEmitter {
       return { type: "turn_failed", payload: { error: "interrupted" } };
     }
     if (live.deliveredAt !== null && live.sawResponse && st.status === "idle") {
-      return { type: "turn_completed", payload: { costUsd: null, resultText: null } };
+      return { type: "turn_completed", payload: { costUsd: null, resultText: live.lastAssistantText ?? null } };
     }
     // Idle or waiting time counts against delivery: while the CLI is busy with its own turn our
     // message sits in its queue, and that can legitimately take minutes. "waiting" must count too —
@@ -670,15 +694,13 @@ export class SessionManager extends EventEmitter {
       if (now - live.idleUndeliveredSince > timing.deliveryTimeoutMs) {
         return {
           type: "turn_failed",
-          payload: { error: "the CLI did not take the message (it may be held for review in the terminal, dropped as a repeat of the previous message, or rate-limited)" },
+          payload: { error: "the CLI did not take the message (most likely held for review in the terminal; a repeat of the previous message within 30s is also dropped, and bursts are rate-limited)" },
         };
       }
     } else {
       live.idleUndeliveredSince = null;
     }
-    if (now - live.startedAt > timing.maxTurnMs) {
-      return { type: "turn_failed", payload: { error: `no response from the CLI in ${Math.round(timing.maxTurnMs / 60_000)} minutes` } };
-    }
+    if (now - live.startedAt > timing.maxTurnMs) return outOfTime();
     return null;
   }
 
@@ -710,8 +732,11 @@ export class SessionManager extends EventEmitter {
     this.deps.peer!
       .send(s, live.target, { agentSessionId: s.agentSessionId!, msgId: live.stopMsgId, content, priority: "now" })
       .catch((err) => {
-        live.stopMsgId = null; // let a later tap try again
         const reason = err instanceof Error ? err.message : String(err);
+        live.stopMsgId = null; // let a later tap try again
+        // The watcher turns this into the turn's terminal event. Emitting from here instead would
+        // give the turn a second terminal path, racing the one in pollLiveTurn
+        live.stopFailure = reason;
         console.error(`[tinyd] could not send stop to the CLI: ${reason}`);
       });
   }

@@ -105,6 +105,9 @@ export type CliMode = "bypass" | "prompting";
 /** Only read this much of the tail first; every user record carries the mode, so it is almost always enough */
 const MODE_TAIL_BYTES = 256 * 1024;
 
+/** Second look when the 256KB tail had no mode. Beyond this we give up and let the process argv decide */
+const MODE_FALLBACK_BYTES = 8 * 1024 * 1024;
+
 function readTail(file: string, bytes: number): { text: string; whole: boolean } | null {
   let fd: number;
   try {
@@ -116,8 +119,9 @@ function readTail(file: string, bytes: number): { text: string; whole: boolean }
     const size = fs.fstatSync(fd).size;
     const start = Math.max(0, size - bytes);
     const buf = Buffer.alloc(size - start);
-    fs.readSync(fd, buf, 0, buf.length, start);
-    return { text: buf.toString("utf8"), whole: start === 0 };
+    // A short read is legal; the untouched zero bytes at the end would otherwise corrupt the last line
+    const read = fs.readSync(fd, buf, 0, buf.length, start);
+    return { text: buf.subarray(0, read).toString("utf8"), whole: start === 0 };
   } catch {
     return null;
   } finally {
@@ -151,11 +155,8 @@ export function readCliMode(transcriptFile: string): CliMode | null {
   if (tail === null) return null;
   let mode = lastPermissionMode(tail.text);
   if (mode === null && !tail.whole) {
-    try {
-      mode = lastPermissionMode(fs.readFileSync(transcriptFile, "utf8"));
-    } catch {
-      return null;
-    }
+    const more = readTail(transcriptFile, MODE_FALLBACK_BYTES);
+    if (more !== null) mode = lastPermissionMode(more.text);
   }
   if (mode === null) return null;
   return mode === "bypassPermissions" ? "bypass" : "prompting";

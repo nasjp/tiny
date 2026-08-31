@@ -129,6 +129,12 @@ back to tinyd for the next message.
 Claude Code only. Requires Claude Code ≥ 2.1.251 on the Mac; tinyd falls back to refusing the
 send ("open in the CLI") when it cannot reach the process.
 
+tinyd tells Claude Code that the message comes from a session in the same permission mode as the
+terminal, so a `--dangerously-skip-permissions` session takes it right away instead of parking it
+behind its "held message" review prompt — the phone is treated as the same person sitting at that
+terminal. Only sessions handed to tiny are reachable this way; keep `tiny live` off if you want to
+hand sessions over one at a time.
+
 For development (pnpm, tsx, tests, smoke scripts, iOS builds) see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
