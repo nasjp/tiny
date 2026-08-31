@@ -141,4 +141,52 @@ describe("claude-transcript", () => {
     // the cursor still advances so the next sync resumes correctly
     expect(r.cursor).toBe("u2");
   });
+
+  it("emits one tool_finished per tool_result in a user record", () => {
+    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      {
+        type: "user", uuid: "u1",
+        message: {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "t1", is_error: false },
+            { type: "tool_result", tool_use_id: "t2", is_error: true },
+          ],
+        },
+      },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events.map((e) => e.type)).toEqual(["tool_finished", "tool_finished"]);
+    expect(r.events[0]!.payload.toolUseId).toBe("t1");
+    expect(r.events[0]!.payload.isError).toBe(false);
+    expect(r.events[1]!.payload.toolUseId).toBe("t2");
+    expect(r.events[1]!.payload.isError).toBe(true);
+  });
+
+  it("skips empty assistant text blocks", () => {
+    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      {
+        type: "assistant", uuid: "a1",
+        message: { content: [{ type: "text", text: "" }, { type: "text", text: "real" }] },
+      },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0]!.payload.text).toBe("real");
+  });
+
+  it("returns nothing for a transcript of only bookkeeping records", () => {
+    const file = path.join(root, "projects", "-Users-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      { type: "mode", mode: "normal", sessionId: SID },
+      { type: "permission-mode", permissionMode: "default", sessionId: SID },
+      { type: "file-history-snapshot", sessionId: SID },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events).toEqual([]);
+    expect(r.title).toBeNull();
+    expect(r.cursor).toBeNull();
+  });
 });
