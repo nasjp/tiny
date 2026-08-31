@@ -21,6 +21,10 @@ final class ChatModel: ObservableObject {
     /// Messages already sent but whose WS user_message has not arrived yet
     @Published private(set) var pendingSends: [OptimisticSend] = []
     @Published private(set) var isDetached = false
+    /// Whether the agent's own CLI still has this session open (mirrors SessionRecord.isHeldByCLI).
+    /// Sourced fresh here instead of read from the SessionRecord ChatView was pushed with, because that
+    /// snapshot never changes while the chat stays open — see cliLiveTask below.
+    @Published private(set) var isHeldByCLI: Bool
     /// Context consumption of the latest turn (input+cache+output tokens). nil = unknown so far
     @Published private(set) var contextTokens: Int?
     /// History is being (re)fetched. events is kept, not cleared, so the UI can show
@@ -42,12 +46,14 @@ final class ChatModel: ObservableObject {
     private let backend: TinyBackend
     private let sessionId: String
     private var streamTask: Task<Void, Never>?
+    private var cliLiveTask: Task<Void, Never>?
 
     init(backend: TinyBackend, session: SessionRecord) {
         self.backend = backend
         self.sessionId = session.id
         self.isRunning = session.status == .running
         self.isDetached = session.status == .detached
+        self.isHeldByCLI = session.isHeldByCLI
     }
 
     /// Two-stage setup: history via REST, live via WS (avoids the drop window
@@ -56,6 +62,7 @@ final class ChatModel: ObservableObject {
     func start() {
         streamTask?.cancel()
         isSyncing = true
+        startCliLivePolling()
         streamTask = Task {
             defer { isSyncing = false }
             do {
@@ -82,7 +89,29 @@ final class ChatModel: ObservableObject {
         }
     }
 
-    func stop() { streamTask?.cancel(); streamTask = nil }
+    func stop() {
+        streamTask?.cancel(); streamTask = nil
+        cliLiveTask?.cancel(); cliLiveTask = nil
+    }
+
+    /// No WS push exists for cliLive (unlike sessionStateChanged for isDetached), so poll it at the
+    /// same 4s cadence SessionListView already uses for the session list. Keeps the composer's
+    /// lock in sync with the Mac's CLI in both directions while the chat stays open
+    private func startCliLivePolling() {
+        cliLiveTask?.cancel()
+        cliLiveTask = Task {
+            while !Task.isCancelled {
+                await refreshCliLive()
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+            }
+        }
+    }
+
+    func refreshCliLive() async {
+        guard let list = try? await backend.sessions(),
+              let match = list.first(where: { $0.id == sessionId }) else { return }
+        isHeldByCLI = match.isHeldByCLI
+    }
 
     /// Apply one event arriving over WS (also directly callable from tests)
     func handle(_ ev: EventRecord) {
