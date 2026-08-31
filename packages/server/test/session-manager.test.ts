@@ -231,6 +231,44 @@ describe("SessionManager", () => {
     expect(stores.events.count(session.id)).toBe(count);
   });
 
+  // A 139MB transcript costs ~250ms and ~800MB of RSS to parse, and the events endpoint asks on
+  // every poll, so an unchanged file must cost a single stat
+  it("syncTranscript does not re-read a transcript whose path, size and mtime are unchanged", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-8.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+
+    const first = JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "one" } });
+    // an assistant record the second write smuggles in, and a bookkeeping record padded to its exact
+    // byte length: only a re-read of the file could tell the two versions apart
+    const later = JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "two" }] } });
+    let filler = "";
+    for (let pad = 0; filler.length !== later.length; pad++) {
+      filler = JSON.stringify({ type: "mode", pad: "x".repeat(pad) });
+      if (filler.length > later.length) throw new Error("cannot pad to the same length");
+    }
+    // one fixed timestamp for both writes, so the two stats agree to the nanosecond
+    const t = new Date(1_700_000_000_000);
+    fs.writeFileSync(file, `${first}\n${filler}\n`);
+    fs.utimesSync(file, t, t);
+
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-8" });
+    expect(stores.events.count(session.id)).toBe(1);
+    expect(manager.getSession(session.id).sourceCursor).toBe("u1");
+
+    fs.writeFileSync(file, `${first}\n${later}\n`);
+    fs.utimesSync(file, t, t);
+    expect(manager.syncTranscript(session.id)).toBe(0);
+    expect(stores.events.count(session.id)).toBe(1);
+
+    // a real append changes the size, so it is read — and brings the smuggled record along
+    fs.appendFileSync(file, JSON.stringify({ type: "user", uuid: "u2", message: { role: "user", content: "three" } }) + "\n");
+    expect(manager.syncTranscript(session.id)).toBe(2);
+  });
+
   it("syncTranscript is a no-op for a non-claude agent", () => {
     const { manager, stores } = makeManager(okAdapter);
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));

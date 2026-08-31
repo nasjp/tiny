@@ -593,6 +593,30 @@ describe("REST API", () => {
     await manager.waitForIdle(id);
   });
 
+  // The CLI writes to the transcript whether or not it still holds the session, so gating the
+  // catch-up on liveness froze the phone's history at adopt time
+  it("imports what the CLI wrote even after the CLI is gone", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(profilesDir, "local3", "claude", configDir);
+    const res = await app.request("/v1/sessions/adopt", {
+      method: "POST", headers: H(),
+      body: JSON.stringify({ profile: "local3", cwd, agentSessionId: "agent-late" }),
+    });
+    const { id } = (await res.json()) as { id: string };
+
+    // the CLI kept going after the adopt, then exited: cliLive is false
+    const file = path.join(configDir, "projects", cwd.replace(/[/.]/g, "-"), "agent-late.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "typed in the terminal" } }) + "\n");
+    cliLive = false;
+
+    const evs = await app.request(`/v1/sessions/${id}/events`, { headers: H() });
+    const { events } = (await evs.json()) as { events: Array<{ type: string; payload: { text?: string } }> };
+    expect(events.map((e) => e.type)).toEqual(["user_message"]);
+    expect(events[0]!.payload.text).toBe("typed in the terminal");
+    cliLive = null;
+  });
+
   it("reports cliLive on the list and on a single session", async () => {
     await app.request("/v1/sessions", { method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }) });
     const res0 = await app.request("/v1/sessions", { headers: H() });

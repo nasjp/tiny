@@ -59,6 +59,13 @@ interface RunningTurn {
 
 export class SessionManager extends EventEmitter {
   private running = new Map<string, RunningTurn>();
+  /**
+   * Last transcript stat per session. Parsing a transcript is expensive (a 139MB one costs ~250ms
+   * and ~800MB of RSS) and the events endpoint asks on every poll, so an unchanged file must cost
+   * one stat. Keyed on the resolved path too: findTranscript can fall back to scanning projects/,
+   * so the file a session resolves to can change under us
+   */
+  private transcriptStats = new Map<string, { path: string; size: number; mtimeMs: number }>();
 
   constructor(private deps: SessionManagerDeps) {
     super();
@@ -218,6 +225,18 @@ export class SessionManager extends EventEmitter {
     const s = this.getSession(id);
     const file = this.transcriptFile(s);
     if (!file) return 0;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      return 0;
+    }
+    const seen = this.transcriptStats.get(id);
+    // Any difference means read — a SMALLER file too, which is what a compact rewrite looks like
+    if (seen && seen.path === file && seen.size === stat.size && seen.mtimeMs === stat.mtimeMs) return 0;
+    // Record the pre-read stat: if the CLI appends between the stat and the read, the next call
+    // reads again rather than skipping records (the cursor keeps that from duplicating anything)
+    this.transcriptStats.set(id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
     const read = readTranscript(file, {
       sinceUuid: s.sourceCursor,
       ...(s.sourceCursor ? {} : { turns: SessionManager.BACKFILL_TURNS }),

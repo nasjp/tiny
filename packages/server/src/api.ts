@@ -193,10 +193,10 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
   app.get("/v1/sessions/:id/events", (c) => {
     const id = c.req.param("id");
     const since = Number(c.req.query("since") ?? 0);
-    // Catch up with what the agent's own CLI wrote. Only while the CLI holds the session, and
-    // never from the list endpoint (that polls every 4s across every session)
-    const s = deps.manager.getSession(id);
-    if (deps.isCliLive(s) === true) deps.manager.syncTranscript(id);
+    // Catch up with what the agent's own CLI wrote. Unconditional: the CLI writes to the transcript
+    // whether or not it still holds the session, and a stat guard inside syncTranscript makes the
+    // unchanged case a single stat. Never from the list endpoint (that polls every 4s across every row)
+    deps.manager.syncTranscript(id);
     return c.json({ events: deps.stores.events.listSince(id, Number.isFinite(since) ? since : 0) });
   });
 
