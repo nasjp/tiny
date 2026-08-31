@@ -6,8 +6,6 @@ import path from "node:path";
  * single source of truth and `tiny doctor` can read it back.
  */
 
-/** Any command containing this is one of ours, whatever path tiny was installed at */
-export const TINY_HOOK_MARKER = "handoff --auto";
 
 /**
  * Build the hook command line from a launch spec (`tinyLaunch()` gives {command, args}).
@@ -39,8 +37,16 @@ function load(configDir: string): Settings {
   }
 }
 
+/**
+ * A hook is ours when its command *ends* with tiny's handoff invocation. Matching a bare
+ * substring would also claim an unrelated hook that merely mentions it, and `tiny live off`
+ * deletes whatever it claims. The leading path varies by install shape (dist vs source via
+ * tsx), so only the tail can be relied on.
+ */
+const OURS = /(^|\s)handoff\s+--auto(\s+--ended)?$/;
+
 function isOurs(cmd: HookCommand): boolean {
-  return typeof cmd.command === "string" && cmd.command.includes(TINY_HOOK_MARKER);
+  return typeof cmd.command === "string" && OURS.test(cmd.command);
 }
 
 /** Whether the always-on handoff hook is installed */

@@ -77,6 +77,29 @@ describe("claude-hooks", () => {
       .toBe("/usr/bin/node '/Users/a/My Apps/cli.js' handoff --auto");
   });
 
+  it("claims both the SessionStart and SessionEnd commands it generates", () => {
+    setLiveMode(dir, true, CMD);
+    // both hooks must be recognized as ours, or `off` would leave one behind
+    setLiveMode(dir, false, CMD);
+    const s = read();
+    expect(s.hooks).toBeUndefined();
+  });
+
+  it("does not claim an unrelated hook that merely mentions the command", () => {
+    fs.writeFileSync(settings(), JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { matcher: "", hooks: [{ type: "command", command: 'echo "remember to run handoff --auto later"' }] },
+        ],
+      },
+    }));
+    setLiveMode(dir, true, CMD);
+    setLiveMode(dir, false, CMD);
+    const cmds = read().hooks.SessionStart.flatMap((e: any) => e.hooks.map((h: any) => h.command));
+    // the user's own hook must survive a full round trip
+    expect(cmds).toEqual(['echo "remember to run handoff --auto later"']);
+  });
+
   it("refuses to clobber a broken settings.json", () => {
     fs.writeFileSync(settings(), "{not json");
     expect(() => setLiveMode(dir, true, CMD)).toThrow(/could not be parsed/);
