@@ -1,0 +1,25 @@
+name: Agent support request
+description: You want to use a coding agent that tiny does not support yet
+labels: [agent]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: Agent name and its CLI command
+      placeholder: e.g. Goose (`goose acp`)
+    validations:
+      required: true
+  - type: dropdown
+    id: acp
+    attributes:
+      label: Does it support ACP (Agent Client Protocol)?
+      description: If it does, it can be added with a single driver-definition file (see CONTRIBUTING.md)
+      options:
+        - Yes (launch command given above)
+        - No / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes (how login works, home-directory env vars, links to official docs, ...)

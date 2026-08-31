@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face {
+    font-family: "Inter";
+    src: url("Inter.ttf") format("truetype");
+    font-weight: 100 900;
+  }
+  html, body { margin: 0; padding: 0; }
+  #stage {
+    width: 1024px;
+    height: 1024px;
+    background: #C3E2F7;
+    position: relative;
+    overflow: hidden;
+  }
+  #word {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 1024px;
+    height: 1024px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: "Inter", sans-serif;
+    font-weight: 600;
+    font-size: 300px;
+    letter-spacing: -0.02em;
+    color: #2F2BBD;
+    line-height: 1;
+  }
+  #dot {
+    position: absolute;
+    border-radius: 50%;
+    background: #E0114B;
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <div id="word">tiny</div>
+    <div id="dot" style="display:none"></div>
+  </div>
+  <script>
+    const p = new URLSearchParams(location.search);
+    const word = document.getElementById("word");
+    const stage = document.getElementById("stage");
+    if (p.has("text")) word.textContent = p.get("text");
+    if (p.has("fontsize")) word.style.fontSize = p.get("fontsize") + "px";
+    if (p.has("dy")) word.style.transform = "translateY(" + p.get("dy") + "px)";
+    if (p.has("transparent")) stage.style.background = "transparent";
+    document.title = "ready";
+  </script>
+</body>
+</html>

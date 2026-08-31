@@ -1,0 +1,16 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      @font-face {
+        font-family: "Inter";
+        src: url("Inter.ttf") format("truetype");
+        font-weight: 100 900;
+      }
+    </style>
+  </defs>
+  <rect width="1024" height="1024" fill="#C3E2F7"/>
+  <text x="512" y="477" text-anchor="middle" dominant-baseline="central"
+        font-family="Inter" font-weight="600" font-size="300" letter-spacing="-6"
+        fill="#2F2BBD">tıny</text>
+  <circle cx="406" cy="387" r="22" fill="#E0114B"/>
+</svg>

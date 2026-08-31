@@ -1,0 +1,16 @@
+node_modules/
+dist/
+HANDOFF.md
+docs/superpowers/
+docs/*.html
+*.log
+.DS_Store
+.secrets/
+apps/ios/**/build/
+apps/ios/**/xcuserdata/
+apps/ios/**/DerivedData/
+acp-probe-*.json
+acp-probe-*.log
+codex-probe-*.json
+codex-probe-*.log
+codex-probe-*.txt

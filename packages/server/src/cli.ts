@@ -1,0 +1,504 @@
+#!/usr/bin/env node
+import { Command } from "commander";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import qrcode from "qrcode-terminal";
+import { tinyPaths } from "./config.js";
+import { installDaemon, readInstalledDaemon, uninstallDaemon } from "./daemon.js";
+import { collectDoctor, formatDoctorReport } from "./doctor.js";
+import { openDb } from "./db.js";
+import { tinyEntry } from "./entry.js";
+import { detectTailscaleIp } from "./tailscale.js";
+import { findOnPath } from "./which.js";
+import { migrateClaudeCredential, type KeychainMigration } from "./keychain.js";
+import { addProfile, listProfiles, profileDir, profileDriver, renameProfile, type ProfileInfo } from "./profiles.js";
+import { agentEnv, getDriver, listDrivers } from "./agents/index.js";
+import { runSetup } from "./setup.js";
+import { TINY_VERSION } from "./version.js";
+import { createStores } from "./stores.js";
+import { loadSettings, saveSettings } from "./settings.js";
+import type { SessionRecord } from "./types.js";
+
+export interface AttachCommand {
+  bin: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string | undefined>;
+}
+
+export function buildAttachCommand(session: SessionRecord, profilesDir: string): AttachCommand {
+  if (!session.agentSessionId) {
+    throw new Error("This session has no turns yet, so there is nothing to resume (run one turn from the app or CLI first)");
+  }
+  // Build the CLI handoff command and env from the driver of the agent recorded on the session
+  const driver = getDriver(session.agent);
+  const cmd = driver.attach({ agentSessionId: session.agentSessionId });
+  return {
+    bin: cmd.bin,
+    args: cmd.args,
+    cwd: session.cwd,
+    env: agentEnv(driver, path.join(profilesDir, session.profile)),
+  };
+}
+
+export function resolveSessionId(sessions: SessionRecord[], prefix: string): string {
+  const hits = sessions.filter((s) => s.id.startsWith(prefix));
+  if (hits.length === 0) throw new Error(`session not found: ${prefix}`);
+  if (hits.length > 1) throw new Error(`ambiguous id (${hits.length} matches): ${prefix}`);
+  return hits[0]!.id;
+}
+
+export function formatProfileRow(prof: ProfileInfo): string {
+  const status = prof.loggedIn ? "logged in" : "not logged in";
+  return `${prof.name.padEnd(12)} ${status.padEnd(14)} ${prof.email ?? "-"}`;
+}
+
+export interface RenameProfileDeps {
+  profilesDir: string;
+  /** Names of profiles that have a running turn. Watchdog so we never move a profile out from under a running turn */
+  runningProfiles: () => string[];
+  renameSessions: (from: string, to: string) => number;
+  migrateCredential: (fromDir: string, toDir: string) => KeychainMigration;
+}
+
+export interface RenameProfileResult {
+  dir: string;
+  sessionsUpdated: number;
+  keychain: KeychainMigration;
+}
+
+/**
+ * Rename the directory, the Keychain token, and sessions.profile in the DB together.
+ * Missing any one of them breaks the profile (it shows as logged out / attach fails),
+ * so on a mid-way failure the directory is moved back as if nothing happened.
+ */
+export function runProfileRename(deps: RenameProfileDeps, from: string, to: string): RenameProfileResult {
+  const running = deps.runningProfiles();
+  if (running.includes(from)) {
+    throw new Error(`profile ${from} has a running turn; wait for it to finish or interrupt it first`);
+  }
+  const fromDir = path.join(deps.profilesDir, from);
+  const prof = renameProfile(deps.profilesDir, from, to);
+  try {
+    const keychain = deps.migrateCredential(fromDir, prof.dir);
+    return { dir: prof.dir, sessionsUpdated: deps.renameSessions(from, to), keychain };
+  } catch (e) {
+    renameProfile(deps.profilesDir, to, from); // roll back
+    throw e;
+  }
+}
+
+export interface DeviceSummary {
+  id: string;
+  name: string;
+  hasApnsToken: boolean;
+  apnsEnv: string;
+  createdAt: string;
+}
+
+export function resolveDeviceId(devices: DeviceSummary[], prefix: string): string {
+  const hits = devices.filter((d) => d.id.startsWith(prefix));
+  if (hits.length === 0) throw new Error(`device not found: ${prefix}`);
+  if (hits.length > 1) throw new Error(`ambiguous id (${hits.length} matches): ${prefix}`);
+  return hits[0]!.id;
+}
+
+export function formatDeviceRow(d: DeviceSummary): string {
+  const token = d.hasApnsToken ? `APNs:${d.apnsEnv}` : "APNs:none";
+  return `${d.id.slice(0, 8)}  ${d.name.padEnd(16)} ${token.padEnd(16)} ${d.createdAt}`;
+}
+
+/** Validate an http/https URL and strip trailing slashes. Empty string means "not set", so let it through. */
+function normalizeHttpUrl(raw: string, label: string): string {
+  if (raw === "") return "";
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`invalid ${label} (must start with http:// or https://): ${raw}`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`invalid ${label} (only http/https is supported): ${raw}`);
+  }
+  return raw.replace(/\/+$/, "");
+}
+
+/** Validate and normalize the relay URL. Empty string means push is disabled, so let it through. */
+export function normalizeRelayUrl(raw: string): string {
+  return normalizeHttpUrl(raw, "relay URL");
+}
+
+/** Server URL embedded in pairing QR codes. Empty string means "fall back to hostname", so let it through. */
+export function normalizeServerUrl(raw: string): string {
+  return normalizeHttpUrl(raw, "server URL");
+}
+
+// ---- HTTP client (calls the daemon's REST API) ----
+
+function cliToken(secretFile: string): string {
+  if (!fs.existsSync(secretFile)) {
+    throw new Error("Daemon is not initialized. Run `tiny serve` once first");
+  }
+  return fs.readFileSync(secretFile, "utf8").trim();
+}
+
+async function api(pathname: string, init: RequestInit = {}): Promise<unknown> {
+  const p = tinyPaths();
+  const token = cliToken(p.secretFile);
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${p.port}${pathname}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        ...(init.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new Error(`Cannot connect to the daemon (port ${p.port}). Start it with \`tiny serve\` or \`tiny daemon install\``);
+  }
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(`API ${res.status}: ${body.error ?? pathname}`);
+  }
+  return res.json();
+}
+
+/** GET /v1/health (no auth). Returns null when the daemon is down. Used by setup's startup wait and by doctor */
+async function fetchHealth(port: number, timeoutMs = 2000): Promise<{ version: string } | null> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { version?: unknown };
+    return { version: typeof body.version === "string" ? body.version : "unknown" };
+  } catch {
+    return null;
+  }
+}
+
+/** Wait for health to respond right after daemon install ((1s-timeout fetch + 0.5s sleep) x 20 = up to ~30s) */
+async function waitHealthy(port: number): Promise<boolean> {
+  for (let i = 0; i < 20; i++) {
+    if (await fetchHealth(port, 1000)) return true;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return false;
+}
+
+function sameFile(a: string, b: string): boolean {
+  try {
+    return fs.realpathSync(a) === fs.realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+// ---- CLI definition ----
+
+const program = new Command()
+  .name("tiny")
+  .description("tiny: drive coding agents on your Mac from your iPhone")
+  .version(TINY_VERSION);
+
+program.command("serve").description("run the daemon in the foreground").action(async () => {
+  const { startServer } = await import("./server.js");
+  const srv = await startServer();
+  console.log(`[tinyd] listening on ${srv.url} (port ${srv.port})`);
+});
+
+program
+  .command("ls")
+  .description("list sessions")
+  .option("-a, --all", "include archived sessions")
+  .action(async (opts: { all?: boolean }) => {
+    const { sessions } = (await api("/v1/sessions")) as { sessions: SessionRecord[] };
+    const archived = opts.all
+      ? ((await api("/v1/sessions?archived=true")) as { sessions: SessionRecord[] }).sessions
+      : [];
+    const all = [...sessions, ...archived];
+    if (all.length === 0) {
+      console.log("No sessions");
+      return;
+    }
+    for (const s of all) {
+      const mark = s.archivedAt ? "  [archived]" : "";
+      console.log(`${s.id.slice(0, 8)}  ${s.status.padEnd(11)} ${s.profile.padEnd(10)} ${s.title ?? "(untitled)"}  ${s.cwd}${mark}`);
+    }
+  });
+
+program
+  .command("new")
+  .description("create a new session")
+  .requiredOption("--profile <name>", "profile name")
+  .option("--cwd <dir>", "working directory", process.cwd())
+  .option("--mode <mode>", "permission mode: default|acceptEdits|bypassPermissions", "default")
+  .action(async (opts: { profile: string; cwd: string; mode: string }) => {
+    const s = (await api("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ profile: opts.profile, cwd: path.resolve(opts.cwd), permissionMode: opts.mode }),
+    })) as SessionRecord;
+    console.log(`Created: ${s.id}`);
+  });
+
+program
+  .command("attach <idPrefix>")
+  .description("open the session in the agent's own CLI (e.g. claude --resume; handed back on exit)")
+  .action(async (idPrefix: string) => {
+    const p = tinyPaths();
+    // Resolve from both lists so archived sessions can be attached to as well
+    const { sessions } = (await api("/v1/sessions")) as { sessions: SessionRecord[] };
+    const { sessions: archived } = (await api("/v1/sessions?archived=true")) as { sessions: SessionRecord[] };
+    const id = resolveSessionId([...sessions, ...archived], idPrefix);
+    const session = (await api(`/v1/sessions/${id}`)) as SessionRecord;
+    const cmd = buildAttachCommand(session, p.profilesDir);
+    await api(`/v1/sessions/${id}/detach`, { method: "POST", body: JSON.stringify({ detached: true }) });
+    try {
+      const r = spawnSync(cmd.bin, cmd.args, { cwd: cmd.cwd, env: cmd.env as NodeJS.ProcessEnv, stdio: "inherit" });
+      if (r.error) throw r.error;
+    } finally {
+      await api(`/v1/sessions/${id}/detach`, { method: "POST", body: JSON.stringify({ detached: false }) });
+    }
+  });
+
+// Launched by agents as an MCP server (stdio). Not meant to be run by humans, so hidden from help
+program.command("mcp-server", { hidden: true }).action(async () => {
+  const { runTinyMcpServer } = await import("./mcp-server.js");
+  await runTinyMcpServer();
+});
+
+program.command("agents").description("list supported agents").action(() => {
+  for (const d of listDrivers()) console.log(`${d.id.padEnd(10)} ${d.label.padEnd(10)} bin=${d.bin}`);
+});
+
+program
+  .command("doctor")
+  .description("check node, the launchd daemon, server URL, push, and each supported agent CLI / profile")
+  .action(async () => {
+    const p = tinyPaths();
+    const report = await collectDoctor({
+      version: TINY_VERSION,
+      nodeVersion: process.version,
+      execPath: process.execPath,
+      entry: tinyEntry(),
+      installed: readInstalledDaemon(),
+      health: () => fetchHealth(p.port),
+      port: p.port,
+      settings: loadSettings(p),
+      tailscaleIp: detectTailscaleIp(),
+      drivers: listDrivers(),
+      findOnPath: (bin) => findOnPath(bin),
+      profiles: listProfiles(p.profilesDir),
+      fileExists: (f) => fs.existsSync(f),
+      sameFile,
+    });
+    console.log(formatDoctorReport(report));
+    if (!report.ok) process.exitCode = 1;
+  });
+
+program
+  .command("setup")
+  .description("one-shot setup: check prerequisites → profile + login → server URL → launchd daemon → pairing QR")
+  .option("--agent <id>", "agent to set up (see `tiny agents`)", "claude")
+  .option("--profile <name>", "profile name (default: the agent id)")
+  .action(async (opts: { agent: string; profile?: string }) => {
+    const p = tinyPaths();
+    await runSetup(
+      {
+        nodeVersion: process.version,
+        drivers: listDrivers(),
+        findOnPath: (bin) => findOnPath(bin),
+        profiles: () => listProfiles(p.profilesDir),
+        addProfile: (name, agent) => {
+          addProfile(p.profilesDir, name, agent);
+        },
+        login: (name) => {
+          runProfileLogin(name);
+        },
+        settings: () => loadSettings(p),
+        saveServerUrl: (url) => {
+          saveSettings(p, { serverUrl: normalizeServerUrl(url) });
+        },
+        tailscaleIp: detectTailscaleIp,
+        port: p.port,
+        installDaemon,
+        waitHealthy: () => waitHealthy(p.port),
+        showPairing: showPairingQr,
+        log: (line) => console.log(line),
+      },
+      { agent: opts.agent, profile: opts.profile ?? opts.agent },
+    );
+  });
+
+const profiles = program.command("profiles").description("manage agent account profiles");
+profiles.command("ls").action(() => {
+  const p = tinyPaths();
+  for (const prof of listProfiles(p.profilesDir)) {
+    console.log(formatProfileRow(prof));
+  }
+});
+profiles
+  .command("add <name>")
+  .option("--agent <id>", "agent to run in this profile (see `tiny agents`)", "claude")
+  .action((name: string, opts: { agent: string }) => {
+    const p = tinyPaths();
+    const prof = addProfile(p.profilesDir, name, opts.agent);
+    console.log(`Created: ${prof.dir} (${prof.label})\nNext, log in with \`tiny profiles login ${name}\``);
+  });
+profiles.command("rename <old> <new>").action((from: string, to: string) => {
+  const p = tinyPaths();
+  const db = openDb(p.dbFile);
+  try {
+    const stores = createStores(db);
+    const r = runProfileRename(
+      {
+        profilesDir: p.profilesDir,
+        runningProfiles: () => stores.sessions.list("running").map((s) => s.profile),
+        renameSessions: (a, b) => stores.sessions.renameProfile(a, b),
+        migrateCredential: (fromDir, toDir) =>
+          migrateClaudeCredential({ fromDir, toDir, account: os.userInfo().username }),
+      },
+      from,
+      to,
+    );
+    const cred = r.keychain === "migrated" ? "keychain credential moved" : "no keychain credential to move";
+    console.log(`Renamed ${from} -> ${to}\n  dir: ${r.dir}\n  sessions updated: ${r.sessionsUpdated}\n  ${cred}`);
+  } finally {
+    db.close();
+  }
+});
+/** Run the agent's login interactively under the given profile (inherits the terminal). Called from `profiles login` and `setup` */
+function runProfileLogin(name: string): void {
+  const p = tinyPaths();
+  const dir = profileDir(p.profilesDir, name);
+  const driver = profileDriver(p.profilesDir, name);
+  const cmd = driver.login();
+  const r = spawnSync(cmd.bin, cmd.args, {
+    env: agentEnv(driver, dir) as NodeJS.ProcessEnv,
+    stdio: "inherit",
+  });
+  if (r.error) throw r.error;
+}
+
+profiles.command("login <name>").action((name: string) => {
+  runProfileLogin(name);
+});
+
+/** Issue a pairing code and print the QR (used by `tiny pair` and at the end of `tiny setup`) */
+async function showPairingQr(): Promise<void> {
+  const started = (await api("/v1/pair/start", { method: "POST", body: "{}" })) as {
+    code: string; url: string; expiresAt: string;
+  };
+  const payload = JSON.stringify({ url: started.url, code: started.code });
+  qrcode.generate(payload, { small: true });
+  console.log(`URL:  ${started.url}\nCODE: ${started.code} (valid for 10 minutes)`);
+}
+
+program.command("pair").description("issue a pairing code for your iPhone").action(showPairingQr);
+
+const devicesCmd = program.command("devices").description("list paired devices").action(async () => {
+  const { devices } = (await api("/v1/devices")) as { devices: DeviceSummary[] };
+  if (devices.length === 0) {
+    console.log("No paired devices (add one with `tiny pair`)");
+    return;
+  }
+  for (const d of devices) console.log(formatDeviceRow(d));
+});
+
+devicesCmd
+  .command("revoke <ids...>")
+  .description("revoke paired devices by id prefix (their tokens stop working immediately)")
+  .action(async (ids: string[]) => {
+    const { devices } = (await api("/v1/devices")) as { devices: DeviceSummary[] };
+    for (const prefix of ids) {
+      const id = resolveDeviceId(devices, prefix);
+      await api(`/v1/devices/${id}`, { method: "DELETE" });
+      console.log(`revoked: ${id}`);
+    }
+  });
+
+program
+  .command("config")
+  .description("show or change the server URL embedded in pairing QR codes")
+  .option(
+    "--server-url <url>",
+    "URL the iPhone uses to reach this Mac (e.g. your Tailscale IP; empty string to fall back to hostname)",
+  )
+  .action((opts: { serverUrl?: string }) => {
+    const paths = tinyPaths();
+    const s =
+      opts.serverUrl !== undefined
+        ? saveSettings(paths, { serverUrl: normalizeServerUrl(opts.serverUrl) })
+        : loadSettings(paths);
+    console.log(`serverUrl : ${s.serverUrl === "" ? "(not set — pairing QR uses http://<hostname>:<port>)" : s.serverUrl}`);
+    console.log("Applies to new pairings only; no daemon restart needed");
+  });
+
+const push = program.command("push").description("push notification settings and test delivery");
+
+push
+  .command("config")
+  .description("show or change the relay URL and whether push is enabled")
+  .option("--relay <url>", "base URL of the push relay (empty string to disable)")
+  .option("--enable", "enable push")
+  .option("--disable", "disable push")
+  .action((opts: { relay?: string; enable?: boolean; disable?: boolean }) => {
+    const paths = tinyPaths();
+    if (opts.enable && opts.disable) throw new Error("--enable and --disable cannot be used together");
+    const patch: { relayUrl?: string; pushEnabled?: boolean } = {};
+    if (opts.relay !== undefined) patch.relayUrl = normalizeRelayUrl(opts.relay);
+    if (opts.enable) patch.pushEnabled = true;
+    if (opts.disable) patch.pushEnabled = false;
+    const s = Object.keys(patch).length > 0 ? saveSettings(paths, patch) : loadSettings(paths);
+    console.log(`relayUrl    : ${s.relayUrl === "" ? "(not set)" : s.relayUrl}`);
+    console.log(`pushEnabled : ${s.pushEnabled}`);
+    if (s.pushEnabled && s.relayUrl === "") {
+      console.log("Note: push will not be delivered because the relay URL is not set");
+    }
+  });
+
+push
+  .command("test")
+  .description("send a test notification to all paired devices")
+  .action(async () => {
+    const { results } = (await api("/v1/push/test", { method: "POST" })) as {
+      results: Array<{ ok?: boolean; status?: number; reason?: string; error?: string }>;
+    };
+    if (results.length === 0) {
+      console.log("No devices with an APNs token (check with `tiny devices`)");
+      return;
+    }
+    for (const r of results) {
+      if (r.ok) console.log("OK: accepted by APNs");
+      else console.log(`NG: status=${r.status ?? "-"} reason=${r.reason ?? r.error ?? "-"}`);
+    }
+  });
+
+const daemon = program.command("daemon").description("manage the launchd agent");
+daemon.command("install").action(() => {
+  console.log(installDaemon());
+});
+daemon.command("uninstall").action(() => {
+  console.log(uninstallDaemon());
+});
+
+/** Whether this file is the launched entry (false when imported from tests or other modules). npm's bin is a symlink at `.../bin/tiny`, so compare by realpath, not by name */
+function isMainModule(): boolean {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  try {
+    return fs.realpathSync(argv1) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  program.parseAsync(process.argv).catch((err: unknown) => {
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  });
+}

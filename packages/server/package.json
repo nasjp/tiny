@@ -1,0 +1,53 @@
+{
+  "name": "@nasjp/tiny",
+  "version": "0.1.0",
+  "description": "tinyd daemon + tiny CLI: drive coding agents on your Mac from the tiny iPhone app",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nasjp/tiny.git",
+    "directory": "packages/server"
+  },
+  "type": "module",
+  "bin": {
+    "tiny": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepack": "pnpm run build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/cli.ts serve"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.246",
+    "@hono/node-server": "^1.14.0",
+    "@hono/node-ws": "^1.1.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "better-sqlite3": "^12.0.0",
+    "commander": "^13.0.0",
+    "hono": "^4.7.0",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.10.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsup": "^8.5.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}

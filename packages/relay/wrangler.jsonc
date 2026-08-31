@@ -1,0 +1,22 @@
+// tiny push-relay. Holds only the APNs p8 and forwards opaque ciphertext to Apple.
+// Secrets go in via wrangler secret put (APNS_TEAM_ID / APNS_KEY_ID / APNS_SIGNING_KEY).
+// Deploys to the account wrangler is logged into. With multiple accounts, pass
+// CLOUDFLARE_ACCOUNT_ID as an env var or via .env (see .env.example; do not commit it).
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tiny-push-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-20",
+  "observability": { "enabled": true },
+  "vars": {
+    // APNs topic = bundle ID of the iOS app. Replace this when self-hosting.
+    "APNS_TOPIC": "com.tanirell.tiny"
+  },
+  "ratelimits": [
+    {
+      "name": "PUSH_LIMITER",
+      "namespace_id": "1",
+      "simple": { "limit": 60, "period": 60 }
+    }
+  ]
+}

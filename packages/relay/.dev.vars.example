@@ -1,0 +1,8 @@
+# cp .dev.vars.example .dev.vars and fill in (do not commit .dev.vars)
+# Where the values come from:
+#   APNS_TEAM_ID / APNS_KEY_ID ... the Keys page of the Apple Developer portal
+#   APNS_SIGNING_KEY           ... contents of the AuthKey_<KEYID>.p8 downloaded at creation
+# The values in production for this repo live in ../../.secrets/apns.env and ../../.secrets/AuthKey_*.p8 (never commit)
+APNS_TEAM_ID=XXXXXXXXXX
+APNS_KEY_ID=YYYYYYYYYY
+APNS_SIGNING_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"

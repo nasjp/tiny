@@ -1,0 +1,278 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  createCodexUsageFetcher,
+  createSdkUsageFetcher,
+  normalizeUsage,
+  UsageService,
+  UsageUnavailableError,
+} from "../src/usage.js";
+import { NotFoundError } from "../src/session-manager.js";
+import { fakeCodexServer } from "./fake-codex-server.js";
+
+// Condensed SDK usage response (rate_limits). limits[] is the server's raw array behind the /usage display
+const RATE_LIMITS = {
+  five_hour: { utilization: 29, resets_at: "2026-08-29T07:39:59Z" },
+  seven_day: { utilization: 7, resets_at: "2026-09-03T01:59:59Z" },
+  limits: [
+    { kind: "session", percent: 29, resets_at: "2026-08-29T07:39:59Z", scope: null },
+    { kind: "weekly_all", percent: 7, resets_at: "2026-09-03T01:59:59Z", scope: null },
+    { kind: "weekly_scoped", percent: 50, resets_at: "2026-09-03T01:59:59Z", scope: { model: { display_name: "Fable" } } },
+  ],
+};
+
+/** Fake query(). Records the usage response (or exception), the arguments passed, and close calls */
+function fakeQuery(result: unknown | Error, opts: { delayMs?: number } = {}) {
+  const calls: { args: unknown; closed: boolean }[] = [];
+  const queryFn = (args: unknown) => {
+    const rec = { args, closed: false };
+    calls.push(rec);
+    return {
+      async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+        if (opts.delayMs) await new Promise((r) => setTimeout(r, opts.delayMs));
+        if (result instanceof Error) throw result;
+        return result;
+      },
+      close() {
+        rec.closed = true;
+      },
+    };
+  };
+  return { calls, queryFn: queryFn as unknown as Parameters<typeof createSdkUsageFetcher>[0] extends infer O ? NonNullable<O extends { queryFn?: infer Q } ? Q : never> : never };
+}
+
+describe("createSdkUsageFetcher", () => {
+  it("starts Claude Code with the profile's CLAUDE_CONFIG_DIR, drops the API key, returns rate_limits, and closes", async () => {
+    const fq = fakeQuery({ rate_limits_available: true, rate_limits: RATE_LIMITS });
+    const fetch = createSdkUsageFetcher({
+      queryFn: fq.queryFn,
+      cwd: "/tmp/neutral",
+      env: { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-must-not-leak" },
+    });
+    await expect(fetch("/home/u/.tiny/profiles/work")).resolves.toBe(RATE_LIMITS);
+    expect(fq.calls).toHaveLength(1);
+    const args = fq.calls[0]!.args as { options: { cwd: string; env: Record<string, unknown> } };
+    expect(args.options.cwd).toBe("/tmp/neutral");
+    expect(args.options.env.CLAUDE_CONFIG_DIR).toBe("/home/u/.tiny/profiles/work");
+    expect(args.options.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(args.options.env.PATH).toBe("/usr/bin");
+    expect(fq.calls[0]!.closed).toBe(true);
+  });
+
+  it("the prompt streams nothing (never runs a turn)", async () => {
+    const fq = fakeQuery({ rate_limits_available: true, rate_limits: RATE_LIMITS });
+    await createSdkUsageFetcher({ queryFn: fq.queryFn })("/p");
+    const args = fq.calls[0]!.args as { prompt: AsyncIterable<unknown> };
+    // Even draining after close yields nothing
+    const seen: unknown[] = [];
+    for await (const m of args.prompt) seen.push(m);
+    expect(seen).toEqual([]);
+  });
+
+  it("not a subscription / missing scope (rate_limits_available=false) is UsageUnavailableError, and the process closes", async () => {
+    const fq = fakeQuery({ rate_limits_available: false, rate_limits: null });
+    await expect(createSdkUsageFetcher({ queryFn: fq.queryFn })("/p")).rejects.toBeInstanceOf(UsageUnavailableError);
+    expect(fq.calls[0]!.closed).toBe(true);
+  });
+
+  it("always closes even when the SDK throws", async () => {
+    const fq = fakeQuery(new Error("bridge died"));
+    await expect(createSdkUsageFetcher({ queryFn: fq.queryFn })("/p")).rejects.toThrow(/bridge died/);
+    expect(fq.calls[0]!.closed).toBe(true);
+  });
+
+  it("times out and closes when the response is slow", async () => {
+    const fq = fakeQuery({ rate_limits_available: true, rate_limits: RATE_LIMITS }, { delayMs: 200 });
+    await expect(createSdkUsageFetcher({ queryFn: fq.queryFn, timeoutMs: 20 })("/p")).rejects.toThrow(/timed out/);
+    expect(fq.calls[0]!.closed).toBe(true);
+  });
+});
+
+describe("normalizeUsage", () => {
+  it("uses limits[] when present (even picks up per-model display names)", () => {
+    const u = normalizeUsage("work", RATE_LIMITS);
+    expect(u.profile).toBe("work");
+    expect(u.limits).toEqual([
+      { kind: "session", label: "Session (5h)", percent: 29, resetsAt: "2026-08-29T07:39:59Z" },
+      { kind: "weekly_all", label: "Weekly (all models)", percent: 7, resetsAt: "2026-09-03T01:59:59Z" },
+      { kind: "weekly_scoped", label: "Weekly (Fable)", percent: 50, resetsAt: "2026-09-03T01:59:59Z" },
+    ]);
+  });
+
+  it("builds from the typed fields (five_hour / seven_day / model_scoped) when limits[] is absent", () => {
+    const u = normalizeUsage("work", {
+      five_hour: { utilization: 12, resets_at: "2026-08-29T07:39:59Z" },
+      seven_day: { utilization: null, resets_at: null },
+      seven_day_opus: null,
+      model_scoped: [{ display_name: "Opus", utilization: 3, resets_at: "2026-09-03T01:59:59Z" }],
+    });
+    expect(u.limits).toEqual([
+      { kind: "session", label: "Session (5h)", percent: 12, resetsAt: "2026-08-29T07:39:59Z" },
+      { kind: "weekly_all", label: "Weekly (all models)", percent: 0, resetsAt: null },
+      { kind: "weekly_scoped", label: "Weekly (Opus)", percent: 3, resetsAt: "2026-09-03T01:59:59Z" },
+    ]);
+  });
+
+  it("does not crash on empty or broken input", () => {
+    expect(normalizeUsage("work", null).limits).toEqual([]);
+    expect(normalizeUsage("work", { limits: "nope" }).limits).toEqual([]);
+  });
+});
+
+describe("UsageService", () => {
+  const profilesDir = "/does-not-matter";
+  const resolveDir = (name: string) => `${profilesDir}/${name}`;
+
+  it("a logged-out profile never starts Claude Code and maps to a 404", async () => {
+    const fetcher = vi.fn(async () => RATE_LIMITS);
+    const usage = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn: () => false });
+    await expect(usage.get("work")).rejects.toBeInstanceOf(NotFoundError);
+    await expect(usage.get("work")).rejects.toThrow(/not logged in: work/);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("passes the profile's directory to the fetcher", async () => {
+    const fetcher = vi.fn(async () => RATE_LIMITS);
+    const usage = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn: () => true });
+    await usage.get("work");
+    expect(fetcher).toHaveBeenCalledWith(`${profilesDir}/work`);
+  });
+
+  it("does not re-call the fetcher within the TTL", async () => {
+    const fetcher = vi.fn(async () => RATE_LIMITS);
+    const usage = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn: () => true, ttlMs: 60_000 });
+    await usage.get("work");
+    await usage.get("work");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("calls the fetcher once for concurrent requests to the same profile (no double Claude Code start)", async () => {
+    const fetcher = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+      return RATE_LIMITS;
+    });
+    const usage = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn: () => true });
+    const all = await Promise.all([usage.get("work"), usage.get("work"), usage.get("work")]);
+    expect(all.map((u) => u.limits.length)).toEqual([3, 3, 3]);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("retries on the next call after a fetcher failure (failures are not cached)", async () => {
+    const fetcher = vi
+      .fn<() => Promise<unknown>>()
+      .mockRejectedValueOnce(new Error("claude crashed"))
+      .mockResolvedValueOnce(RATE_LIMITS);
+    const usage = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn: () => true });
+    await expect(usage.get("work")).rejects.toThrow(/claude crashed/);
+    await expect(usage.get("work")).resolves.toMatchObject({ profile: "work" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("createCodexUsageFetcher", () => {
+  // Condensed measured account/rateLimits/read response (HANDOFF "Codex app-server measurements")
+  const RATE_LIMITS_RESPONSE = {
+    rateLimits: {
+      limitId: "codex",
+      primary: { usedPercent: 12, windowDurationMins: 10080, resetsAt: 1788490317 },
+      secondary: null,
+      planType: "pro",
+    },
+  };
+
+  it("starts codex app-server with CODEX_HOME, converts rateLimits to limits[], and closes", async () => {
+    const fake = fakeCodexServer({ onTurn: async () => null, rateLimits: RATE_LIMITS_RESPONSE });
+    process.env.OPENAI_API_KEY = "sk-must-not-leak";
+    try {
+      const limits = (await createCodexUsageFetcher({ spawn: fake.spawn })("/p/cx")) as { limits: unknown[] };
+      expect(limits).toEqual({
+        limits: [{ kind: "weekly_all", percent: 12, resets_at: new Date(1788490317 * 1000).toISOString() }],
+      });
+      expect(fake.spawned[0]).toMatchObject({ launch: { command: "codex", args: ["app-server"] } });
+      expect(fake.spawned[0]!.env.CODEX_HOME).toBe("/p/cx");
+      expect(fake.spawned[0]!.env.OPENAI_API_KEY).toBeUndefined();
+      expect(fake.killed).toBe(1);
+      expect(fake.received.map((r) => r.method)).toEqual(["initialize", "account/rateLimits/read"]);
+    } finally {
+      delete process.env.OPENAI_API_KEY;
+    }
+  });
+
+  it("the 5-hour window is session; other windows are weekly_scoped with limitName", async () => {
+    const fake = fakeCodexServer({
+      onTurn: async () => null,
+      rateLimits: {
+        rateLimits: {
+          limitName: "GPT-5.3-Codex-Spark",
+          primary: { usedPercent: 3, windowDurationMins: 300, resetsAt: 1788490317 },
+          secondary: { usedPercent: 40, windowDurationMins: 43200, resetsAt: 1788490317 },
+        },
+      },
+    });
+    const res = (await createCodexUsageFetcher({ spawn: fake.spawn })("/p/cx")) as unknown;
+    expect(normalizeUsage("cx", res).limits).toEqual([
+      { kind: "session", label: "Session (5h)", percent: 3, resetsAt: new Date(1788490317 * 1000).toISOString() },
+      { kind: "weekly_scoped", label: "Weekly (GPT-5.3-Codex-Spark)", percent: 40, resetsAt: new Date(1788490317 * 1000).toISOString() },
+    ]);
+  });
+
+  it("times out and kills the process when the response is slow", async () => {
+    const fake = fakeCodexServer({ hangInitialize: true, onTurn: async () => null });
+    await expect(createCodexUsageFetcher({ spawn: fake.spawn, timeoutMs: 20 })("/p/cx")).rejects.toThrow(/timed out/);
+    expect(fake.killed).toBe(1);
+  });
+
+  it("the 5-hour window exists only in rateLimitsByLimitId (measured), so scan it with the top level and dedupe", async () => {
+    // Measured: the top-level rateLimits mirrors the codex bucket and only has the 10080-min window.
+    // The 300-min (5-hour) window sits under named entries of rateLimitsByLimitId.
+    const fake = fakeCodexServer({
+      onTurn: async () => null,
+      rateLimits: {
+        rateLimits: { primary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 1788490317 }, secondary: null },
+        rateLimitsByLimitId: {
+          codex: { primary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 1788490317 }, secondary: null },
+          codex_bengalfox: {
+            limitName: "GPT-5.3-Codex-Spark",
+            primary: { usedPercent: 3, windowDurationMins: 300, resetsAt: 1788400000 },
+            secondary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 1788490317 },
+          },
+        },
+      },
+    });
+    const res = (await createCodexUsageFetcher({ spawn: fake.spawn })("/p/cx")) as unknown;
+    expect(normalizeUsage("cx", res).limits).toEqual([
+      { kind: "weekly_all", label: "Weekly (all models)", percent: 1, resetsAt: new Date(1788490317 * 1000).toISOString() },
+      { kind: "session", label: "Session (5h)", percent: 3, resetsAt: new Date(1788400000 * 1000).toISOString() },
+    ]);
+  });
+});
+
+describe("UsageService (per-agent fetchers)", () => {
+  const resolveDir = (name: string) => `/profiles/${name}`;
+
+  it("a codex profile calls the codex fetcher", async () => {
+    const claude = vi.fn(async () => RATE_LIMITS);
+    const codex = vi.fn(async () => ({ limits: [{ kind: "weekly_all", percent: 12, resets_at: null }] }));
+    const usage = new UsageService("/profiles", {
+      fetchers: { claude, codex },
+      resolveAgent: () => "codex",
+      resolveDir,
+      isLoggedIn: () => true,
+    });
+    const u = await usage.get("cx");
+    expect(codex).toHaveBeenCalledWith("/profiles/cx");
+    expect(claude).not.toHaveBeenCalled();
+    expect(u.limits).toEqual([{ kind: "weekly_all", label: "Weekly (all models)", percent: 12, resetsAt: null }]);
+  });
+
+  it("an agent without a fetcher (opencode) is UsageUnavailableError", async () => {
+    const usage = new UsageService("/profiles", { resolveAgent: () => "opencode", resolveDir, isLoggedIn: () => true });
+    await expect(usage.get("oc")).rejects.toBeInstanceOf(UsageUnavailableError);
+  });
+
+  it("the singular fetcher works as an alias for the claude fetcher", async () => {
+    const fetcher = vi.fn(async () => RATE_LIMITS);
+    const usage = new UsageService("/profiles", { fetcher, resolveAgent: () => "claude", resolveDir, isLoggedIn: () => true });
+    await usage.get("work");
+    expect(fetcher).toHaveBeenCalledWith("/profiles/work");
+  });
+});

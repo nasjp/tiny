@@ -1,0 +1,119 @@
+name: Tiny
+attributes:
+  # Silences Xcode's "Update to recommended settings" warning (Xcode 26.1 = 2611).
+  # On a major Xcode update, bump this and review what it flags
+  LastUpgradeCheck: 2611
+options:
+  bundleIdPrefix: com.tanirell
+  deploymentTarget:
+    iOS: "17.0"
+  developmentLanguage: en
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: TS295VKGNA
+    GENERATE_INFOPLIST_FILE: YES
+    CURRENT_PROJECT_VERSION: "28"
+    MARKETING_VERSION: "1.0"
+targets:
+  Tiny:
+    type: application
+    platform: iOS
+    sources:
+      - path: Tiny
+      - path: Shared
+    info:
+      path: Tiny/Info.plist
+      properties:
+        # Trap: xcodegen rewrites Info.plist on every generate and pins CFBundleVersion
+        # to "1" (measured in probes #2). Delegate to build settings
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        # Export compliance. Basis: Apple's exemption (c) "limited to authentication,
+        # digital signatures, and decryption of data or files" — the shipped targets
+        # (Tiny / TinyNSE / Shared) only ever decrypt notifications (ChaChaPoly.open),
+        # with zero seal operations (production sealing is tinyd on the Mac; test-only
+        # sealing lives in TinyTests helpers). bash scripts/check-ios-decrypt-only.sh
+        # enforces this mechanically. Reinforced by Note 4 (the primary function is not
+        # information security; crypto is ancillary). **It is NOT "exempt because it's
+        # the OS-standard CryptoKit"** — Apple's "OS built-in crypto" exemption means
+        # cases the OS performs on your behalf, like URLSession's HTTPS, and does not
+        # apply to rolling your own E2E with CryptoKit (settled by the user 2026-08-30; see HANDOFF)
+        ITSAppUsesNonExemptEncryption: false
+        # tinyd is reached over plain HTTP through Tailscale (already WireGuard-encrypted),
+        # so lift ATS's https requirement. The only peer is the user's own Mac (noted in review notes)
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        # QR destination validation allows 192.168/16, 10/8, 172.16/12, and .local, so
+        # LAN users get iOS's local-network permission prompt (Tailscale's 100.64/10
+        # does not trigger it). Without this copy the default text is shown
+        NSLocalNetworkUsageDescription: tiny connects to tinyd running on your Mac over your local network.
+        UIAppFonts:
+          - Inter-Variable.ttf
+          - NotoSansJP.ttf
+    entitlements:
+      path: Tiny/Tiny.entitlements
+      properties:
+        aps-environment: development
+        # Needed to deliver pending-permission notifications as Time Sensitive (enabled
+        # on the App ID side in Phase 2. Without it, interruptionLevel .timeSensitive
+        # falls back to normal priority — measured in device logs)
+        com.apple.developer.usernotifications.time-sensitive: true
+        com.apple.security.application-groups:
+          - group.com.tanirell.tiny
+    dependencies:
+      - target: TinyNSE
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tanirell.tiny
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_CFBundleDisplayName: tiny
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_NSCameraUsageDescription: The camera is used to scan the pairing QR code.
+        TARGETED_DEVICE_FAMILY: "1"
+    scheme:
+      testTargets:
+        - TinyTests
+        - TinyUITests
+  TinyNSE:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: TinyNSE
+      # The NSE is not turned into a framework; just double-compile the needed sources (probes style)
+      - path: Shared
+    info:
+      path: TinyNSE/Info.plist
+      properties:
+        CFBundleDisplayName: tiny
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    entitlements:
+      path: TinyNSE/TinyNSE.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.tanirell.tiny
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tanirell.tiny.nse
+        SKIP_INSTALL: YES
+  TinyTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: TinyTests
+    dependencies:
+      - target: Tiny
+  TinyUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: TinyUITests
+    dependencies:
+      - target: Tiny

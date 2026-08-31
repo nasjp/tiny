@@ -1,0 +1,16 @@
+{
+  "name": "tiny",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "build": "pnpm -C packages/server build",
+    "tiny": "pnpm -C packages/server exec tsx src/cli.ts"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  }
+}
