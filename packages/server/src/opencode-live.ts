@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { toolOutputPayload } from "./tool-output.js";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { opencodeXdg } from "./agents/opencode.js";
@@ -154,7 +155,10 @@ export function readOpencodeSession(profileDir: string, agentSessionId: string, 
               summary: oneLine(String(part.state?.title ?? part.tool ?? "tool")),
             },
           });
-          events.push({ type: "tool_finished", payload: { toolUseId: part.callID, isError: part.state?.status === "error" } });
+          events.push({
+            type: "tool_finished",
+            payload: { toolUseId: part.callID, isError: part.state?.status === "error", ...toolOutputPayload(part.state?.output) },
+          });
         }
         // patch / file / step-start / step-finish are bookkeeping
       }

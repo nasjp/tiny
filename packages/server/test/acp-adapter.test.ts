@@ -84,7 +84,7 @@ describe("AcpAdapter", () => {
       expect(events[1]!.payload).toEqual({ text: "thinking" });
       expect(events[2]!.payload).toEqual({ text: "I will run it." });
       expect(events[3]!.payload).toMatchObject({ toolUseId: "toolu_1", toolName: "bash", kind: "execute", summary: "bash", input: { cwd: "/tmp/repo" } });
-      expect(events[4]!.payload).toEqual({ toolUseId: "toolu_1", isError: false });
+      expect(events[4]!.payload).toEqual({ toolUseId: "toolu_1", isError: false, output: "hi" });
       expect(events[6]!.payload).toEqual({ costUsd: 0.0228, resultText: "I will run it.\ndone", contextTokens: 16488 });
       assertTurnEventInvariants(events);
 

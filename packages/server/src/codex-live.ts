@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { toolOutputPayload } from "./tool-output.js";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExternalRead, ExternalSession, ExternalTurn } from "./agent-storage.js";
@@ -236,7 +237,7 @@ export function readCodexRollout(file: string, sinceCursor: string | null): Exte
     }
     if (r.type === "response_item" && p.type === "custom_tool_call_output") {
       if (typeof p.call_id === "string") {
-        events.push({ type: "tool_finished", payload: { toolUseId: p.call_id, isError: false } });
+        events.push({ type: "tool_finished", payload: { toolUseId: p.call_id, isError: false, ...toolOutputPayload(p.output) } });
       }
       continue;
     }

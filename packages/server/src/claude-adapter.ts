@@ -1,4 +1,5 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
+import { toolOutputPayload } from "./tool-output.js";
 import type { CanUseTool, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentAdapter, RunTurnParams, TurnResult } from "./adapter.js";
 import { claudeConfigDirEnv } from "./agents/claude.js";
@@ -158,7 +159,10 @@ export class ClaudeAdapter implements AgentAdapter {
           case "user":
             for (const b of contentBlocks(raw)) {
               if (b.type === "tool_result") {
-                p.emit({ type: "tool_finished", payload: { toolUseId: b.tool_use_id, isError: b.is_error ?? false } });
+                p.emit({
+                  type: "tool_finished",
+                  payload: { toolUseId: b.tool_use_id, isError: b.is_error ?? false, ...toolOutputPayload(b.content) },
+                });
               }
             }
             break;

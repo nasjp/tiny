@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { clipToolOutput, toolOutputText } from "./tool-output.js";
 import os from "node:os";
 import type { AgentAdapter, RunTurnParams, TurnResult } from "./adapter.js";
 import { harvestAcpChoices, readAcpChoices, type AcpChoices } from "./acp-choices.js";
@@ -61,6 +62,21 @@ interface AcpToolCall {
   kind?: string | null;
   status?: string | null;
   rawInput?: unknown;
+  /** ToolCallContent[]: `{type:"content", content:{type:"text", text}}` carries what the tool printed; diff / terminal do not */
+  content?: unknown;
+  rawOutput?: unknown;
+}
+
+/** The text an ACP tool call reports, from its content blocks or, failing that, its raw output */
+function acpToolOutput(tc: AcpToolCall): string | null {
+  const blocks = Array.isArray(tc.content)
+    ? tc.content.map((c) => (c && typeof c === "object" && (c as { type?: unknown }).type === "content" ? (c as { content?: unknown }).content : null))
+    : [];
+  const text = toolOutputText(blocks);
+  if (text !== null) return text;
+  if (typeof tc.rawOutput === "string") return toolOutputText(tc.rawOutput);
+  if (tc.rawOutput && typeof tc.rawOutput === "object") return toolOutputText(tc.rawOutput) ?? JSON.stringify(tc.rawOutput);
+  return null;
 }
 
 interface PermissionOption {
@@ -134,10 +150,13 @@ export class AcpAdapter implements AgentAdapter {
       p.emit({ type: "assistant_thinking", payload: { text: thoughtBuf } });
       thoughtBuf = "";
     };
+    // Newest output text per tool call: content can arrive over several updates
+    const outputs = new Map<string, string>();
     const finish = (id: string, isError: boolean) => {
       if (finished.has(id)) return;
       finished.add(id);
-      p.emit({ type: "tool_finished", payload: { toolUseId: id, isError } });
+      const out = outputs.get(id);
+      p.emit({ type: "tool_finished", payload: { toolUseId: id, isError, ...(out === undefined ? {} : clipToolOutput(out)) } });
     };
     const isTerminal = (status: unknown) => status === "completed" || status === "failed";
     const startTool = (tc: AcpToolCall) => {
@@ -178,6 +197,8 @@ export class AcpAdapter implements AgentAdapter {
 
           const tc = u as AcpToolCall & SessionUpdate;
           if (!started.has(tc.toolCallId)) startTool(tc); // some agents omit tool_call
+          const out = acpToolOutput(tc);
+          if (out !== null) outputs.set(tc.toolCallId, out);
           if (isTerminal(tc.status)) finish(tc.toolCallId, tc.status === "failed");
           break;
         }

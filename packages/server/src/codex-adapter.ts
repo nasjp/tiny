@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { toolOutputPayload } from "./tool-output.js";
 import path from "node:path";
 import type { AgentAdapter, RunTurnParams, TurnResult } from "./adapter.js";
 import { writeTinyMcpServer } from "./agents/codex.js";
@@ -85,6 +86,10 @@ interface CodexItem {
   arguments?: unknown;
   query?: string;
   text?: string;
+  /** commandExecution: what the command printed (measured field name on the app-server) */
+  aggregatedOutput?: unknown;
+  /** mcpToolCall: the MCP result ({content: [...]}) */
+  result?: unknown;
 }
 
 interface ToolInfo {
@@ -279,10 +284,10 @@ export class CodexAdapter implements AgentAdapter {
       else abortWaiters.push(fn);
     };
 
-    const finish = (id: string, isError: boolean) => {
+    const finish = (id: string, isError: boolean, output?: unknown) => {
       if (finished.has(id)) return;
       finished.add(id);
-      p.emit({ type: "tool_finished", payload: { toolUseId: id, isError } });
+      p.emit({ type: "tool_finished", payload: { toolUseId: id, isError, ...toolOutputPayload(output) } });
     };
     const startTool = (id: string, info: ToolInfo) => {
       started.set(id, info);
@@ -329,7 +334,7 @@ export class CodexAdapter implements AgentAdapter {
       const info = describeCodexItem(item);
       if (!info) return;
       if (!started.has(item.id)) startTool(item.id, info); // safeguard for paths that skip item/started
-      finish(item.id, item.status === "failed" || item.status === "declined" || !!item.error);
+      finish(item.id, item.status === "failed" || item.status === "declined" || !!item.error, item.aggregatedOutput ?? item.result);
     });
     conn.onNotification("thread/tokenUsage/updated", (params) => {
       const usage = (params as { tokenUsage?: { last?: Record<string, unknown>; total?: Record<string, unknown> } })?.tokenUsage;
