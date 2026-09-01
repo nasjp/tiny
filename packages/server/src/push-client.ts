@@ -8,6 +8,7 @@ import type { DeviceRecord, EventRecord, SessionRecord } from "./types.js";
 
 export const PUSH_EVENT_TYPES = [
   "permission_requested",
+  "cli_question",
   "turn_completed",
   "turn_failed",
   "auth_error",
@@ -90,6 +91,19 @@ export function buildIntent(ev: EventRecord, session: SessionRecord | null): Pus
         category: isQuestion ? "tiny.question" : "tiny.permission",
         level: "time-sensitive",
         ...(reqId === undefined ? {} : { reqId }),
+      };
+    }
+    // A question the CLI asked its person. Same category as an AskUserQuestion tiny drove itself:
+    // no Allow/Deny actions, tapping opens the app, where it can be answered
+    case "cli_question": {
+      const input = ev.payload.input as Record<string, unknown> | undefined;
+      const questions = Array.isArray(input?.questions) ? (input.questions as Record<string, unknown>[]) : [];
+      const first = typeof questions[0]?.question === "string" ? (questions[0].question as string) : null;
+      return {
+        ...base,
+        body: truncate(first ? `Claude asks: ${first}` : "Claude is asking you a question", BODY_LIMIT),
+        category: "tiny.question",
+        level: "time-sensitive",
       };
     }
     case "turn_completed": {

@@ -33,6 +33,14 @@ final class ChatModelOptimisticSendTests: XCTestCase {
             throw APIError(status: 404, message: "n/a")
         }
         func pendingPermissions(sessionId: String) async throws -> [PendingPermission] { [] }
+
+    var answeredQuestions: [(toolUseId: String, answers: [String: String])] = []
+    var failAnswerWith: Error?
+    func answerCliQuestion(sessionId: String, toolUseId: String, answers: [String: String]) async throws {
+        answeredQuestions.append((toolUseId, answers))
+        if let failAnswerWith { throw failAnswerWith }
+    }
+
         func respondPermission(reqId: String, allow: Bool, message: String?, updatedInput: JSONValue?) async throws {}
         func fileData(fileId: String) async throws -> (data: Data, mime: String) { (Data(), "text/plain") }
         func eventStream(sessionId: String, since: Int) -> AsyncStream<EventRecord> {

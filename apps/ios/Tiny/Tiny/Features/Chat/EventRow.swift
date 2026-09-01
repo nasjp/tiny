@@ -96,9 +96,11 @@ struct EventRow: View {
                 .font(.caption).foregroundStyle(Color.tDetached)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-        case .turnStarted, .permissionRequested, .permissionResolved, .unknown:
+        case .turnStarted, .permissionRequested, .permissionResolved,
+             .cliQuestion, .cliQuestionAnswered, .unknown:
             // turnStarted is the progress indicator, permissions are banners, and
-            // AskUserQuestion answers are converted by buildChatItems into .qa cards
+            // AskUserQuestion answers — asked here or in the CLI — are converted by
+            // buildChatItems into .qa cards
             EmptyView()
         }
     }

@@ -178,6 +178,16 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
         queue.sync { pending }
     }
 
+    func answerCliQuestion(sessionId: String, toolUseId: String, answers: [String: String]) async throws {
+        emit("cli_question_answered", .object([
+            "toolUseId": .string(toolUseId),
+            "answers": .object(answers.mapValues { .string($0) }),
+        ]))
+        let chosen = answers.values.sorted().joined(separator: ", ")
+        emit("assistant_text", .object(["text": .string("(Demo) Got it — you chose: \(chosen).")]))
+        emit("turn_completed", .object(["costUsd": .number(0.01), "resultText": .string("Demo question answered")]))
+    }
+
     func respondPermission(reqId: String, allow: Bool, message: String?, updatedInput: JSONValue?) async throws {
         let resolved = queue.sync { () -> PendingPermission? in
             let p = pending.first { $0.id == reqId }

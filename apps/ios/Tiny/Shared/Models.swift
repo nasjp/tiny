@@ -267,6 +267,12 @@ enum TinyEvent: Equatable {
     case sessionStateChanged(status: String)
     /// The CLI that owns a live turn is waiting for its user (a permission prompt in the terminal)
     case cliAttention(reason: String)
+    /// A question the CLI asked its person (AskUserQuestion in a session tiny does not drive).
+    /// Read-only on the phone: only the CLI can answer it
+    case cliQuestion(toolUseId: String, input: JSONValue)
+    /// That question's outcome: the chosen answers keyed by question text, empty when it was
+    /// dismissed in the CLI
+    case cliQuestionAnswered(toolUseId: String, answers: [String: String], rejected: Bool)
     /// A message another Claude session sent into this one (agent teams, SendMessage between
     /// terminals). The server already unwrapped Claude Code's XML: `from` names the sender
     case peerMessage(from: String, summary: String?, text: String)
@@ -324,6 +330,12 @@ enum TinyEvent: Equatable {
             self = .sessionStateChanged(status: str("status") ?? "")
         case "cli_attention":
             self = .cliAttention(reason: str("reason") ?? "input")
+        case "cli_question":
+            self = .cliQuestion(toolUseId: str("toolUseId") ?? "", input: p["input"] ?? .null)
+        case "cli_question_answered":
+            let answers = p["answers"]?.objectValue?.compactMapValues(\.stringValue) ?? [:]
+            let rejected = { if case .bool(let b) = p["rejected"] { return b }; return false }()
+            self = .cliQuestionAnswered(toolUseId: str("toolUseId") ?? "", answers: answers, rejected: rejected)
         case "peer_message":
             self = .peerMessage(from: str("from") ?? "another session", summary: str("summary"),
                                 text: str("text") ?? "")

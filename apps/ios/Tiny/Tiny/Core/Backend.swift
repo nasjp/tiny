@@ -24,6 +24,8 @@ protocol TinyBackend: AnyObject {
     func pendingPermissions(sessionId: String) async throws -> [PendingPermission]
     /// Pass updatedInput only when returning AskUserQuestion answers written into input.answers
     func respondPermission(reqId: String, allow: Bool, message: String?, updatedInput: JSONValue?) async throws
+    /// Answer a question the CLI asked on its own (arrives as cli_question, not through the permission flow)
+    func answerCliQuestion(sessionId: String, toolUseId: String, answers: [String: String]) async throws
     func fileData(fileId: String) async throws -> (data: Data, mime: String)
     func eventStream(sessionId: String, since: Int) -> AsyncStream<EventRecord>
 }
@@ -74,6 +76,9 @@ final class LiveBackend: TinyBackend {
     }
     func respondPermission(reqId: String, allow: Bool, message: String?, updatedInput: JSONValue?) async throws {
         try await api.respondPermission(reqId: reqId, allow: allow, message: message, updatedInput: updatedInput)
+    }
+    func answerCliQuestion(sessionId: String, toolUseId: String, answers: [String: String]) async throws {
+        try await api.answerCliQuestion(sessionId: sessionId, toolUseId: toolUseId, answers: answers)
     }
     func fileData(fileId: String) async throws -> (data: Data, mime: String) {
         try await api.fileData(fileId: fileId)

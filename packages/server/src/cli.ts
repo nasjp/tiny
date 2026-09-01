@@ -160,6 +160,34 @@ export function parseHookSessionId(raw: string): string | null {
   return typeof id === "string" && id !== "" ? id : null;
 }
 
+export interface QuestionHook {
+  agentSessionId: string;
+  toolUseId: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * The PreToolUse payload for an AskUserQuestion, as Claude Code writes it to a hook's stdin
+ * (2.1.252: session_id / tool_name / tool_use_id / tool_input). Anything else is not ours to report.
+ */
+export function parseQuestionHook(raw: string): QuestionHook | null {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  const p = payload as Record<string, unknown>;
+  const str = (k: string): string | null => (typeof p[k] === "string" && p[k] !== "" ? (p[k] as string) : null);
+  const agentSessionId = str("session_id");
+  const toolUseId = str("tool_use_id");
+  const input = p.tool_input;
+  if (str("tool_name") !== "AskUserQuestion" || !agentSessionId || !toolUseId) return null;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
+  return { agentSessionId, toolUseId, input: input as Record<string, unknown> };
+}
+
 /**
  * Read stdin, giving up after `timeoutMs`. A hook payload arrives immediately; a human running
  * `tiny handoff` in a terminal must never be left waiting on input they do not know to give.
@@ -465,6 +493,33 @@ program
       const msg = err instanceof Error ? err.message : String(err);
       if (opts.auto) {
         console.error(`[tiny] handoff skipped: ${msg}`);
+        return;
+      }
+      throw err;
+    }
+  });
+
+// PreToolUse hook installed by `tiny live on`: tells tinyd about a question the CLI is asking, so
+// the phone can answer it while it is still on screen. Not meant to be run by hand
+program
+  .command("question", { hidden: true })
+  .description("hook mode: report an AskUserQuestion the CLI is showing")
+  .option("--auto", "hook mode: never fail the caller (always exits 0)")
+  .action(async (opts: { auto?: boolean }) => {
+    // Inside tiny's own agents the question comes through the permission flow instead
+    if (isInsideTinyAgent(process.env)) return;
+    try {
+      const hook = parseQuestionHook(await readStdinBriefly());
+      if (!hook) return;
+      await api("/v1/questions", {
+        method: "POST",
+        body: JSON.stringify(hook),
+      });
+    } catch (err) {
+      // A hook that fails must never stand between the person and their question
+      const msg = err instanceof Error ? err.message : String(err);
+      if (opts.auto) {
+        console.error(`[tiny] question not reported: ${msg}`);
         return;
       }
       throw err;
