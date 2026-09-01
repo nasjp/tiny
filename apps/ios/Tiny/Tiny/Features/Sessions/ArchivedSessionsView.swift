@@ -90,8 +90,13 @@ struct ArchivedSessionsView: View {
                 ToolbarItemGroup(placement: .bottomBar) {
                     Spacer()
                     Button { unarchive(chosenIds) } label: {
-                        Label(BulkSessionAction.buttonTitle(verb: "Unarchive", count: chosenIds.count),
-                              systemImage: "tray.and.arrow.up")
+                        // Not a Label: toolbars draw those icon-only, and the count is the point of this button
+                        HStack(spacing: 6) {
+                            Image(systemName: "tray.and.arrow.up")
+                            Text(BulkSessionAction.buttonTitle(verb: "Unarchive", count: chosenIds.count))
+                        }
+                        .font(.tinyHeadline)
+                        .padding(.horizontal, 6)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.tTint)

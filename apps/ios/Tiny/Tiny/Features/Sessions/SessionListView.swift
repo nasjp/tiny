@@ -126,8 +126,13 @@ struct SessionListView: View {
                     ToolbarItemGroup(placement: .bottomBar) {
                         Spacer()
                         Button { archive(chosenIds) } label: {
-                            Label(BulkSessionAction.buttonTitle(verb: "Archive", count: chosenIds.count),
-                                  systemImage: "archivebox")
+                            // Not a Label: toolbars draw those icon-only, and the count is the point of this button
+                            HStack(spacing: 6) {
+                                Image(systemName: "archivebox")
+                                Text(BulkSessionAction.buttonTitle(verb: "Archive", count: chosenIds.count))
+                            }
+                            .font(.tinyHeadline)
+                            .padding(.horizontal, 6)
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(.tTint)
