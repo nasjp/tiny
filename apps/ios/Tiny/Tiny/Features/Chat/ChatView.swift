@@ -61,7 +61,8 @@ struct ChatView: View {
                     VStack(spacing: 10) {
                         // Collapse consecutive tool calls into one row, Claude Code app style.
                         // Animate in only rows that just arrived (no effect on bulk history loads)
-                        ForEach(buildChatItems(model.inner?.events ?? [])) { item in
+                        ForEach(buildChatItems(model.inner?.events ?? [],
+                                               answeringNow: model.inner?.openCliQuestion?.toolUseId)) { item in
                             chatItemView(item)
                                 .transition(appearTransition(
                                     isNew: model.inner?.isNewlyArrived(item.id) ?? false))
@@ -319,6 +320,17 @@ struct ChatView: View {
                 .background(Color.tBg)
             }
 
+            // A question the CLI itself asked. Answering it here makes the CLI drop its own prompt
+            // and take these answers — the phone is not limited to watching
+            if let q = model.inner?.openCliQuestion {
+                QuestionBanner(questions: q.questions) { answers in
+                    Task { await model.inner?.answerCliQuestion(toolUseId: q.toolUseId, answers: answers) }
+                } onDismiss: {
+                    model.inner?.dismissCliQuestion(q.toolUseId)
+                }
+                .background(Color.tBg)
+            }
+
             // Hide the composer while an AskUserQuestion answer is pending
             // (keep focus on the answer card; same behavior as the official app)
             if !hasPendingQuestion {
@@ -512,6 +524,8 @@ struct ChatView: View {
             ToolSummaryRow(calls: calls) { toolSheet = calls }
         case .qa(_, let pairs):
             QuestionAnswerCard(pairs: pairs)
+        case .cliQuestion(_, _, let questions):
+            CLIQuestionCard(questions: questions)
         }
     }
 
@@ -605,7 +619,7 @@ struct ChatView: View {
 
     /// Whether an AskUserQuestion answer is pending (the standard composer is hidden while shown)
     private var hasPendingQuestion: Bool {
-        (model.inner?.pending ?? []).contains(where: \.isQuestion)
+        (model.inner?.pending ?? []).contains(where: \.isQuestion) || model.inner?.openCliQuestion != nil
     }
 
 

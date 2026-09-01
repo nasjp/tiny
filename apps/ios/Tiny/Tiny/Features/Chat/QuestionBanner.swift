@@ -7,7 +7,6 @@ import SwiftUI
 /// Multiple questions are a one-at-a-time carousel, not stacked vertically
 /// (selecting slides to the next question). While shown, ChatView hides the standard composer.
 struct QuestionBanner: View {
-    let permission: PendingPermission
     let onSubmit: ([String: String]) -> Void
     let onDismiss: () -> Void
 
@@ -20,13 +19,20 @@ struct QuestionBanner: View {
     @State private var page = 0
     @State private var forward = true
 
+    /// The questions to ask. Both sources land here: a permission tiny drove itself, and a
+    /// cli_question the CLI asked on its own
+    init(questions: [AskQuestion],
+         onSubmit: @escaping ([String: String]) -> Void,
+         onDismiss: @escaping () -> Void) {
+        self.onSubmit = onSubmit
+        self.onDismiss = onDismiss
+        self.questions = questions
+    }
+
     init(permission: PendingPermission,
          onSubmit: @escaping ([String: String]) -> Void,
          onDismiss: @escaping () -> Void) {
-        self.permission = permission
-        self.onSubmit = onSubmit
-        self.onDismiss = onDismiss
-        self.questions = AskUserQuestion.parse(permission.input)
+        self.init(questions: AskUserQuestion.parse(permission.input), onSubmit: onSubmit, onDismiss: onDismiss)
     }
 
     private var isLastPage: Bool { page >= questions.count - 1 }
@@ -242,6 +248,43 @@ struct QuestionAnswerCard: View {
                     Text(p.question).font(.callout).foregroundStyle(Color.tInkSub)
                     Text(p.answer).font(.body.weight(.medium))
                         .copyable(p.answer)
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.tCard))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .strokeBorder(.quaternary))
+    }
+}
+
+/// A question the CLI is asking its person, shown while it waits. The phone cannot answer it —
+/// the CLI owns the prompt — so this is the answer card's read-only twin: the question, the
+/// options it offered, and where the answer has to be given
+struct CLIQuestionCard: View {
+    let questions: [AskQuestion]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 6) {
+                Text("Question").font(.subheadline).foregroundStyle(Color.tInkSub)
+                Image(systemName: "desktopcomputer")
+                    .font(.caption2).foregroundStyle(Color.tInkSub)
+                Text("answer in the CLI").font(.caption).foregroundStyle(Color.tInkSub)
+            }
+            ForEach(Array(questions.enumerated()), id: \.offset) { _, q in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(q.question).font(.callout).foregroundStyle(Color.tInkSub)
+                        .copyable(q.question)
+                    ForEach(Array(q.options.enumerated()), id: \.offset) { _, o in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: "circle")
+                                .font(.system(size: 9)).foregroundStyle(Color.tInkSub)
+                            Text(o.label).font(.body.weight(.medium))
+                        }
+                    }
                 }
             }
         }

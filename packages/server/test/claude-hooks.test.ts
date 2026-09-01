@@ -26,6 +26,28 @@ describe("claude-hooks", () => {
     expect(s.hooks.SessionEnd[0].hooks[0].command).toBe(`${CMD} --ended`);
   });
 
+  it("installs the AskUserQuestion hook too, and takes it away again", () => {
+    // Claude Code writes an AskUserQuestion to the transcript only once it is answered, so without
+    // this hook the phone would see a question only after it was over
+    setLiveMode(dir, true, CMD);
+    const on = read();
+    expect(on.hooks.PreToolUse).toEqual([
+      { matcher: "AskUserQuestion", hooks: [{ type: "command", command: "/usr/local/bin/tiny question --auto" }] },
+    ]);
+    setLiveMode(dir, false, CMD);
+    expect(read().hooks).toBeUndefined();
+  });
+
+  it("leaves another PreToolUse hook alone when turning off", () => {
+    fs.writeFileSync(settings(), JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo audit" }] }] },
+    }));
+    setLiveMode(dir, true, CMD);
+    setLiveMode(dir, false, CMD);
+    const cmds = read().hooks.PreToolUse.flatMap((e: any) => e.hooks.map((h: any) => h.command));
+    expect(cmds).toEqual(["echo audit"]);
+  });
+
   it("keeps unrelated settings and unrelated hooks intact", () => {
     fs.writeFileSync(settings(), JSON.stringify({
       model: "claude-opus-5",

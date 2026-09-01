@@ -16,6 +16,16 @@ export function buildHookCommand(command: string, args: string[]): string {
   return [command, ...args, "handoff", "--auto"].map(quote).join(" ");
 }
 
+/**
+ * The tail that turns the handoff command line into the question hook's. Claude Code does not write
+ * an AskUserQuestion to the transcript until it is answered (measured on 2.1.252: a question left on
+ * screen for 60s wrote nothing), so the transcript alone would show the phone a question only after
+ * it was over. This hook fires before the prompt is drawn and carries tool_use_id + the questions.
+ */
+function questionCommand(handoffCommand: string): string {
+  return handoffCommand.replace(/handoff --auto$/, "question --auto");
+}
+
 interface HookCommand { type?: string; command?: string }
 interface HookEntry { matcher?: string; hooks?: HookCommand[] }
 type Settings = Record<string, unknown> & { hooks?: Record<string, HookEntry[]> };
@@ -43,7 +53,7 @@ function load(configDir: string): Settings {
  * deletes whatever it claims. The leading path varies by install shape (dist vs source via
  * tsx), so only the tail can be relied on.
  */
-const OURS = /(^|\s)handoff\s+--auto(\s+--ended)?$/;
+const OURS = /(^|\s)(handoff\s+--auto(\s+--ended)?|question\s+--auto)$/;
 
 function isOurs(cmd: HookCommand): boolean {
   return typeof cmd.command === "string" && OURS.test(cmd.command);
@@ -65,11 +75,17 @@ export function setLiveMode(configDir: string, on: boolean, command: string): vo
   const s = load(configDir);
   const hooks = (s.hooks ?? {}) as Record<string, HookEntry[]>;
 
-  for (const [event, cmd] of [["SessionStart", command], ["SessionEnd", `${command} --ended`]] as const) {
+  const wanted = [
+    ["SessionStart", command, ""],
+    ["SessionEnd", `${command} --ended`, ""],
+    // Only AskUserQuestion: every other tool call would pay the cost of a hook process
+    ["PreToolUse", questionCommand(command), "AskUserQuestion"],
+  ] as const;
+  for (const [event, cmd, matcher] of wanted) {
     const entries = (hooks[event] ?? [])
       .map((e) => ({ ...e, hooks: (e.hooks ?? []).filter((h) => !isOurs(h)) }))
       .filter((e) => (e.hooks ?? []).length > 0);
-    if (on) entries.push({ matcher: "", hooks: [{ type: "command", command: cmd }] });
+    if (on) entries.push({ matcher, hooks: [{ type: "command", command: cmd }] });
     if (entries.length > 0) hooks[event] = entries;
     else delete hooks[event];
   }

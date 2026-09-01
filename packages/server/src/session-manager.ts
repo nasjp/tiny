@@ -130,6 +130,16 @@ interface LiveTurn {
 /** Registry statuses that mean "a turn is in progress over there" (a permission prompt is mid-turn too) */
 const CLI_BUSY: ReadonlySet<string> = new Set(["busy", "waiting"]);
 
+/**
+ * How one frame goes down the CLI's messaging socket. `question` marks it as the answer to an
+ * AskUserQuestion the CLI is showing: it is not a message the person typed, and it must arrive with
+ * priority "now" — a queued frame would sit behind the very prompt it is meant to answer
+ */
+interface LiveSend {
+  priority: "next" | "now";
+  question?: { toolUseId: string; answers: Record<string, string> };
+}
+
 /** A message waiting for the running turn to end. Already in the conversation when it gets here */
 interface QueuedTurn {
   prompt: string;
@@ -162,12 +172,40 @@ export class SessionManager extends EventEmitter {
    * so the file a session resolves to can change under us
    */
   private transcriptStats = new Map<string, { path: string; size: number; mtimeMs: number }>();
+  /**
+   * AskUserQuestion calls answered from the phone, by session. Delivering an answer cancels the
+   * CLI's own question prompt, so the transcript then records the call as rejected — that echo is
+   * dropped here, otherwise the answer card would be followed by "Dismissed in the CLI"
+   */
+  private phoneAnswered = new Map<string, Set<string>>();
+  /**
+   * Questions the CLI has asked and not yet resolved, by session. The transcript reader needs them
+   * to recognise a dismissed question: the tool_result of a dismissed AskUserQuestion looks like any
+   * other rejection, and the question that named the id was imported in an earlier read
+   */
+  private openQuestions = new Map<string, Set<string>>();
+  /**
+   * Every question already in a session's history, by session. The PreToolUse hook announces a
+   * question the moment it is asked; the same question turns up in the transcript later, and only
+   * one of the two may become an event
+   */
+  private seenQuestions = new Map<string, Set<string>>();
 
   constructor(private deps: SessionManagerDeps) {
     super();
   }
 
   private emitEvent(sessionId: string, type: string, payload: Record<string, unknown>): void {
+    if (type === "cli_question" || type === "cli_question_answered") {
+      const ids = this.openQuestionIds(sessionId);
+      const toolUseId = typeof payload.toolUseId === "string" ? payload.toolUseId : "";
+      if (type === "cli_question") {
+        ids.add(toolUseId);
+        this.seenQuestions.get(sessionId)?.add(toolUseId);
+      } else {
+        ids.delete(toolUseId);
+      }
+    }
     const ev = this.deps.stores.events.append(sessionId, type, payload);
     try {
       this.emit("event", ev);
@@ -423,10 +461,15 @@ export class SessionManager extends EventEmitter {
     const stat = this.transcriptChange(id, file);
     if (!stat) return SessionManager.noImport();
     const read = readTranscript(file, {
+      // Questions from earlier reads: their tool_result is an answer (or a dismissal), not a tool finishing
+      openQuestions: this.openQuestionIds(id),
       sinceUuid: s.sourceCursor,
       ...(s.sourceCursor ? {} : { turns: SessionManager.BACKFILL_TURNS }),
     });
-    for (const ev of read.events) this.emitEvent(id, ev.type, ev.payload);
+    for (const ev of read.events) {
+      if (this.isRejectedEcho(id, ev) || this.isKnownQuestion(id, ev)) continue;
+      this.emitEvent(id, ev.type, ev.payload);
+    }
     if (read.turn) this.transcriptTurns.set(id, { ...read.turn, readAt: Date.now() });
     const patch: SessionPatch = {};
     if (read.cursor && read.cursor !== s.sourceCursor) patch.sourceCursor = read.cursor;
@@ -438,7 +481,11 @@ export class SessionManager extends EventEmitter {
     // stood still, and those records would never be imported. Leave the old entry: the next call retries
     if (read.cursor) this.transcriptStats.set(id, { path: file, size: stat.size, mtimeMs: stat.mtimeMs });
     const responded = read.events.some(
-      (ev) => ev.type === "assistant_text" || ev.type === "assistant_thinking" || ev.type === "tool_started",
+      (ev) =>
+        ev.type === "assistant_text" || ev.type === "assistant_thinking" || ev.type === "tool_started" ||
+        // A question back to the person is a response too — without it a turn answered only by
+        // AskUserQuestion would look like the CLI never took our message
+        ev.type === "cli_question",
     );
     // Record delivery/response evidence directly on the live turn (if any), not just in the return
     // value: this call can come from a live turn's own watcher tick OR from any other caller of
@@ -655,6 +702,118 @@ export class SessionManager extends EventEmitter {
     return this.deps.peer.resolve(s);
   }
 
+  /**
+   * Answer, from the phone, a question the CLI is asking (AskUserQuestion). The socket carries
+   * messages, not tool results, so the answer goes in with priority "now": the CLI abandons its own
+   * question prompt (recording the call as rejected) and takes the answers as the next thing its
+   * person said — measured against Claude Code 2.1.251. The rejected echo is dropped on import, so
+   * what both ends show is the question with the chosen answers under it.
+   */
+  async answerCliQuestion(id: string, toolUseId: string, answers: Record<string, string>): Promise<void> {
+    const s = this.getSession(id);
+    const target = this.joinTarget(s);
+    if (!target) throw new ConflictError("the CLI holding this session is not reachable");
+    if (Object.keys(answers).length === 0) throw new ValidationError("no answers");
+    const text = SessionManager.answerMessage(answers);
+    const live = this.liveTurns.get(id);
+    // The question came out of a turn tiny started: that turn's watcher is still running and will
+    // pick up the reply, so the answer only has to reach the socket
+    if (live) {
+      const content = wrapForPeer(text, { name: "tiny", mode: this.deps.peer!.mode(s, target) });
+      await this.deps.peer!.send(s, target, {
+        agentSessionId: s.agentSessionId!, msgId: crypto.randomUUID(), content, priority: "now",
+      });
+      this.recordPhoneAnswer(id, toolUseId, answers);
+      return;
+    }
+    // The CLI asked on its own. Answering starts a live turn, so the phone sees it run and gets the
+    // reply, exactly as sending a message from the phone does
+    if (this.running.has(id)) throw new ConflictError("a turn is already running");
+    this.launchTurn(s, text, undefined, null, { priority: "now", question: { toolUseId, answers } });
+  }
+
+  /** What the CLI receives as the answer. Spelled out: it arrives as a message, not as a tool result */
+  private static answerMessage(answers: Record<string, string>): string {
+    const lines = Object.entries(answers).map(([q, a]) => `- ${q}\n  -> ${a}`);
+    return [
+      "Answers to the question you just asked, chosen by your user on their phone:",
+      lines.join("\n"),
+      "(Delivering this cancelled the question prompt in the terminal, so the tool call shows as " +
+        "rejected there. These are the real answers — continue with them.)",
+    ].join("\n\n");
+  }
+
+  /**
+   * Questions this session is waiting on. Rebuilt from the event log the first time it is asked
+   * for: after a tinyd restart the phone would otherwise be left with a question card nothing can
+   * ever close
+   */
+  private openQuestionIds(id: string): Set<string> {
+    const known = this.openQuestions.get(id);
+    if (known) return known;
+    const open = new Set<string>();
+    const seen = new Set<string>();
+    for (const ev of this.deps.stores.events.listSince(id, 0)) {
+      if (ev.type !== "cli_question" && ev.type !== "cli_question_answered") continue;
+      const toolUseId = typeof ev.payload.toolUseId === "string" ? ev.payload.toolUseId : "";
+      if (ev.type === "cli_question") {
+        open.add(toolUseId);
+        seen.add(toolUseId);
+      } else {
+        open.delete(toolUseId);
+      }
+    }
+    this.openQuestions.set(id, open);
+    this.seenQuestions.set(id, seen);
+    return open;
+  }
+
+  /**
+   * A question the CLI is asking right now, reported by the PreToolUse hook `tiny live` installs.
+   * Returns false when there is no such session or the question is already in its history (the
+   * transcript import can get there first on a hookless CLI). Never throws: it runs inside a hook
+   */
+  recordCliQuestion(agentSessionId: string, toolUseId: string, input: Record<string, unknown>): boolean {
+    const s = this.deps.stores.sessions.byAgentSessionId(agentSessionId);
+    if (!s) return false;
+    this.openQuestionIds(s.id); // seeds seenQuestions from history
+    if (this.seenQuestions.get(s.id)?.has(toolUseId)) return false;
+    this.emitEvent(s.id, "cli_question", { toolUseId, input });
+    return true;
+  }
+
+  private recordPhoneAnswer(id: string, toolUseId: string, answers: Record<string, string>): void {
+    let ids = this.phoneAnswered.get(id);
+    if (!ids) {
+      ids = new Set();
+      this.phoneAnswered.set(id, ids);
+    }
+    ids.add(toolUseId);
+    this.emitEvent(id, "cli_question_answered", { toolUseId, answers });
+  }
+
+  /** A question the hook already announced. The transcript's copy of it must not show up twice */
+  private isKnownQuestion(id: string, ev: { type: string; payload: Record<string, unknown> }): boolean {
+    if (ev.type !== "cli_question") return false;
+    const toolUseId = typeof ev.payload.toolUseId === "string" ? ev.payload.toolUseId : "";
+    return this.seenQuestions.get(id)?.has(toolUseId) === true;
+  }
+
+  /**
+   * The transcript's record of a question this phone already answered: the CLI had to cancel its
+   * prompt to take the answer, so it writes the call down as rejected. Dropped once — a later real
+   * rejection of a re-asked question is a different tool_use id
+   */
+  private isRejectedEcho(id: string, ev: { type: string; payload: Record<string, unknown> }): boolean {
+    if (ev.type !== "cli_question_answered" || ev.payload.rejected !== true) return false;
+    const ids = this.phoneAnswered.get(id);
+    const toolUseId = typeof ev.payload.toolUseId === "string" ? ev.payload.toolUseId : "";
+    if (!ids?.has(toolUseId)) return false;
+    ids.delete(toolUseId);
+    if (ids.size === 0) this.phoneAnswered.delete(id);
+    return true;
+  }
+
   /** Whether a turn sent now would run inside the user's CLI (live join) rather than be refused */
   canJoin(s: SessionRecord): boolean {
     return this.joinTarget(s) !== null;
@@ -699,6 +858,7 @@ export class SessionManager extends EventEmitter {
     prompt: string,
     images: TurnImage[] | undefined,
     saved: { paths: string[] } | null,
+    live?: LiveSend,
   ): void {
     const id = s.id;
     // A turn the agent's own CLI is running (seen through its storage): a second writer on the
@@ -726,8 +886,10 @@ export class SessionManager extends EventEmitter {
     const entry: RunningTurn = { abort, done: Promise.resolve() };
     this.running.set(id, entry);
     if (target) {
-      const paths = saved ? saved.paths : this.persistUserMessage(id, prompt, images).paths;
-      entry.done = this.runLiveTurn(s, prompt, paths, target, abort.signal).finally(finish);
+      // An answer to a question is not a message the person typed: it belongs in the conversation
+      // as the question's answer card, which runLiveTurn writes once the CLI has taken it
+      const paths = live?.question ? [] : saved ? saved.paths : this.persistUserMessage(id, prompt, images).paths;
+      entry.done = this.runLiveTurn(s, prompt, paths, target, abort.signal, live).finally(finish);
       return;
     }
     if (!saved) this.persistUserMessage(id, prompt, images);
@@ -908,6 +1070,7 @@ export class SessionManager extends EventEmitter {
     imagePaths: string[],
     target: PeerTarget,
     signal: AbortSignal,
+    send?: LiveSend,
   ): Promise<void> {
     const timing = this.deps.liveTiming ?? DEFAULT_LIVE_TIMING;
     const live: LiveTurn = {
@@ -921,12 +1084,15 @@ export class SessionManager extends EventEmitter {
       const body = prompt + imagePaths.map((p) => `\n[attached image: ${p}]`).join("");
       const content = wrapForPeer(body, { name: "tiny", mode: this.deps.peer!.mode(s, target) });
       try {
-        await this.deps.peer!.send(s, target, { agentSessionId: s.agentSessionId!, msgId: live.msgId, content, priority: "next" });
+        await this.deps.peer!.send(s, target, {
+          agentSessionId: s.agentSessionId!, msgId: live.msgId, content, priority: send?.priority ?? "next",
+        });
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         this.emitEvent(s.id, "turn_failed", { error: `could not reach the CLI: ${reason}` });
         return;
       }
+      if (send?.question) this.recordPhoneAnswer(s.id, send.question.toolUseId, send.question.answers);
       this.emitEvent(s.id, "turn_started", { agentSessionId: s.agentSessionId });
       for (;;) {
         await new Promise((r) => setTimeout(r, timing.pollMs));

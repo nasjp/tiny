@@ -1439,6 +1439,132 @@ describe("SessionManager", () => {
       expect(stores.sessions.get(session.id)!.status).toBe("idle");
     });
 
+    // A question the CLI asks (AskUserQuestion) can only be answered by the CLI itself. The phone
+    // answers it by having the CLI abandon its own prompt and take the answers as a message
+    describe("answering a question the CLI asked", () => {
+      function questionRecords(toolUseId: string) {
+        return [
+          {
+            type: "assistant", uuid: `q-${toolUseId}`,
+            message: { content: [{ type: "tool_use", id: toolUseId, name: "AskUserQuestion",
+              input: { questions: [{ question: "Which goal?", header: "Goal", multiSelect: false,
+                options: [{ label: "staging", description: "" }] }] } }] },
+          },
+        ];
+      }
+
+      /** The record Claude Code writes once the injected answer cancelled its question prompt */
+      function rejectedRecord(toolUseId: string): Record<string, unknown> {
+        return {
+          type: "user", uuid: `r-${toolUseId}`,
+          message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, is_error: true,
+            content: "The user doesn't want to proceed with this tool use." }] },
+          toolUseResult: "User rejected tool use",
+        };
+      }
+
+      it("sends the answers into the CLI with priority now and keeps them in history", async () => {
+        const { peer, sent, setStatus } = fakePeer();
+        const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+        const { session, file } = liveSession(manager, home, "agent-q");
+        fs.writeFileSync(file, jsonl(questionRecords("tu-1")));
+        manager.syncTranscript(session.id);
+        const seen: EventRecord[] = [];
+        manager.on("event", (e) => seen.push(e));
+
+        await manager.answerCliQuestion(session.id, "tu-1", { "Which goal?": "staging" });
+        await until(() => sent.length === 1);
+        expect(sent[0]!.priority).toBe("now");
+        expect(sent[0]!.content).toContain("Which goal?");
+        expect(sent[0]!.content).toContain("staging");
+        // The answer is in the conversation as the question's answer, not as a message the person typed
+        const answered = seen.find((e) => e.type === "cli_question_answered");
+        expect(answered!.payload).toEqual({ toolUseId: "tu-1", answers: { "Which goal?": "staging" } });
+        expect(seen.some((e) => e.type === "user_message")).toBe(false);
+        expect(seen.some((e) => e.type === "turn_started")).toBe(true);
+
+        // The CLI records the cancelled prompt as a rejection. That echo must not land on top of
+        // the answer card as "Dismissed in the CLI"
+        setStatus({ status: "busy", waitingFor: null });
+        fs.appendFileSync(file, jsonl([rejectedRecord("tu-1"), peerRecord(sent[0]!.msgId), assistantRecord("going with staging")]));
+        setStatus({ status: "idle", waitingFor: null });
+        await manager.waitForIdle(session.id);
+        expect(seen.filter((e) => e.type === "cli_question_answered")).toHaveLength(1);
+        expect(seen.at(-1)!.type).toBe("turn_completed");
+      });
+
+      it("delivers into the live turn that asked, without starting a second one", async () => {
+        const { peer, sent, setStatus } = fakePeer();
+        const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+        const { session, file } = liveSession(manager, home, "agent-q-live");
+        const seen: EventRecord[] = [];
+        manager.on("event", (e) => seen.push(e));
+        manager.startTurn(session.id, "plan the release");
+        await until(() => sent.length === 1);
+        setStatus({ status: "busy", waitingFor: null });
+        fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId), ...questionRecords("tu-2")]));
+        await until(() => seen.some((e) => e.type === "cli_question"));
+        setStatus({ status: "waiting", waitingFor: "question" });
+
+        await manager.answerCliQuestion(session.id, "tu-2", { "Which goal?": "staging" });
+        expect(sent).toHaveLength(2);
+        expect(sent[1]!.priority).toBe("now");
+        // One turn, one turn_started: the answer rides the turn that asked
+        expect(seen.filter((e) => e.type === "turn_started")).toHaveLength(1);
+        setStatus({ status: "busy", waitingFor: null });
+        fs.appendFileSync(file, jsonl([rejectedRecord("tu-2"), assistantRecord("going with staging")]));
+        setStatus({ status: "idle", waitingFor: null });
+        await manager.waitForIdle(session.id);
+        expect(seen.filter((e) => e.type === "cli_question_answered")).toHaveLength(1);
+      });
+
+      it("takes the question from the hook and does not repeat it when the transcript catches up", async () => {
+        // Claude Code writes an AskUserQuestion to the transcript only once it is answered, so the
+        // PreToolUse hook is what puts the question on the phone while it is still on screen
+        const { peer } = fakePeer();
+        const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+        const { session, file } = liveSession(manager, home, "agent-hook");
+        const seen: EventRecord[] = [];
+        manager.on("event", (e) => seen.push(e));
+
+        const input = { questions: [{ question: "Which goal?", header: "Goal", multiSelect: false, options: [] }] };
+        expect(manager.recordCliQuestion("agent-hook", "tu-9", input)).toBe(true);
+        expect(seen.map((e) => e.type)).toEqual(["cli_question"]);
+        expect(seen[0]!.payload).toEqual({ toolUseId: "tu-9", input });
+        // the same question again (hook retried, or a second CLI) stays one question
+        expect(manager.recordCliQuestion("agent-hook", "tu-9", input)).toBe(false);
+
+        // and the transcript's own copy, which arrives once the question is answered, is not a second card
+        fs.writeFileSync(file, jsonl([
+          {
+            type: "assistant", uuid: "q1",
+            message: { content: [{ type: "tool_use", id: "tu-9", name: "AskUserQuestion", input }] },
+          },
+          {
+            type: "user", uuid: "r1",
+            message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-9" }] },
+            toolUseResult: { questions: input.questions, answers: { "Which goal?": "staging" } },
+          },
+        ]));
+        manager.syncTranscript(session.id);
+        expect(seen.map((e) => e.type)).toEqual(["cli_question", "cli_question_answered"]);
+        expect(seen[1]!.payload).toEqual({ toolUseId: "tu-9", answers: { "Which goal?": "staging" } });
+      });
+
+      it("reports nothing for a session tiny does not know", () => {
+        const { peer } = fakePeer();
+        const { manager } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer } });
+        expect(manager.recordCliQuestion("nobody", "tu-1", { questions: [] })).toBe(false);
+      });
+
+      it("refuses when the CLI holding the session cannot be reached", async () => {
+        const { peer } = fakePeer({ resolve: () => null });
+        const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+        const { session } = liveSession(manager, home, "agent-q-gone");
+        await expect(manager.answerCliQuestion(session.id, "tu-3", { q: "a" })).rejects.toThrow(/not reachable/);
+      });
+    });
+
     it("still refuses with 409 when the CLI is live but cannot be joined", () => {
       const { peer } = fakePeer({ resolve: () => null });
       const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer } });

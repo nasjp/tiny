@@ -204,6 +204,14 @@ final class APIClient {
         }
     }
 
+    /// Answer a question the CLI itself asked (AskUserQuestion in a session tiny does not drive).
+    /// The server hands it to the CLI over its messaging socket; 409 = that CLI is gone
+    func answerCliQuestion(sessionId: String, toolUseId: String, answers: [String: String]) async throws {
+        struct Body: Codable { let toolUseId: String; let answers: [String: String] }
+        let bodyData = try JSONEncoder().encode(Body(toolUseId: toolUseId, answers: answers))
+        _ = try await request("POST", "/v1/sessions/\(sessionId)/questions", body: bodyData)
+    }
+
     func registerApnsToken(_ hexToken: String, env: String) async throws {
         struct Body: Codable { let apnsToken: String; let apnsEnv: String }
         let bodyData = try JSONEncoder().encode(Body(apnsToken: hexToken, apnsEnv: env))

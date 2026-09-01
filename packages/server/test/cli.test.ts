@@ -13,6 +13,7 @@ import {
   normalizeServerUrl,
   resolveDeviceId,
   isInsideTinyAgent,
+  parseQuestionHook,
   parseHookSessionId,
   resolveHandoffInput,
   resolveLiveConfigDir,
@@ -388,5 +389,28 @@ describe("handoff", () => {
     const b = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cd-"));
     expect(ensureHandoffProfile(root, a)).toBe("local");
     expect(ensureHandoffProfile(root, b)).toBe("local-2");
+  });
+});
+
+describe("parseQuestionHook", () => {
+  const payload = {
+    session_id: "agent-1",
+    hook_event_name: "PreToolUse",
+    tool_name: "AskUserQuestion",
+    tool_use_id: "toolu_1",
+    tool_input: { questions: [{ question: "Tea or coffee?", options: [] }] },
+  };
+
+  it("reads what the phone needs to show and answer the question", () => {
+    expect(parseQuestionHook(JSON.stringify(payload))).toEqual({
+      agentSessionId: "agent-1", toolUseId: "toolu_1", input: payload.tool_input,
+    });
+  });
+
+  it("reports nothing for another tool, a truncated payload, or a missing id", () => {
+    expect(parseQuestionHook(JSON.stringify({ ...payload, tool_name: "Bash" }))).toBeNull();
+    expect(parseQuestionHook('{"session_id":')).toBeNull();
+    expect(parseQuestionHook(JSON.stringify({ ...payload, tool_use_id: "" }))).toBeNull();
+    expect(parseQuestionHook(JSON.stringify({ ...payload, tool_input: "x" }))).toBeNull();
   });
 });

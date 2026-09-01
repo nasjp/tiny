@@ -29,6 +29,13 @@ final class ChatModelCliLiveTests: XCTestCase {
             throw APIError(status: 404, message: "n/a")
         }
         func pendingPermissions(sessionId: String) async throws -> [PendingPermission] { [] }
+        var answeredQuestions: [(toolUseId: String, answers: [String: String])] = []
+        var failAnswerWith: Error?
+        func answerCliQuestion(sessionId: String, toolUseId: String, answers: [String: String]) async throws {
+            answeredQuestions.append((toolUseId, answers))
+            if let failAnswerWith { throw failAnswerWith }
+        }
+
         func respondPermission(reqId: String, allow: Bool, message: String?, updatedInput: JSONValue?) async throws {}
         func fileData(fileId: String) async throws -> (data: Data, mime: String) { (Data(), "text/plain") }
         func eventStream(sessionId: String, since: Int) -> AsyncStream<EventRecord> {
@@ -122,5 +129,54 @@ final class ChatModelCliLiveTests: XCTestCase {
         backend.sessionsList = [makeSession(cliLive: true, cliJoin: true)]
         await model.refreshCliLive()
         XCTAssertFalse(model.isHeldByCLI, "once tinyd can join, the composer must unlock without reopening the chat")
+    }
+
+    // A question the CLI asked reaches the phone as cli_question. It has to be answerable from
+    // here, not just readable — the answer goes to the CLI over the socket
+    private func questionEvent(_ id: Int, toolUseId: String) -> EventRecord {
+        EventRecord(id: id, sessionId: "s1", type: "cli_question", payload: .object([
+            "toolUseId": .string(toolUseId),
+            "input": .object(["questions": .array([.object([
+                "question": .string("Which goal?"), "header": .string("Goal"),
+                "multiSelect": .bool(false),
+                "options": .array([.object(["label": .string("staging"), "description": .string("")])]),
+            ])])]),
+        ]), createdAt: "2026-09-01T00:00:00Z")
+    }
+
+    func testOpenCliQuestionIsAnswerableAndClearsOnceAnswered() async {
+        let backend = MockBackend()
+        let model = ChatModel(backend: backend, session: makeSession(cliLive: true, cliJoin: true))
+        model.handle(questionEvent(1, toolUseId: "tu-1"))
+        XCTAssertEqual(model.openCliQuestion?.toolUseId, "tu-1")
+        XCTAssertEqual(model.openCliQuestion?.questions.first?.question, "Which goal?")
+
+        await model.answerCliQuestion(toolUseId: "tu-1", answers: ["Which goal?": "staging"])
+        XCTAssertEqual(backend.answeredQuestions.first?.toolUseId, "tu-1")
+        XCTAssertEqual(backend.answeredQuestions.first?.answers, ["Which goal?": "staging"])
+        XCTAssertNil(model.openCliQuestion, "the card must not stay up while the answer is in flight")
+
+        model.handle(EventRecord(id: 2, sessionId: "s1", type: "cli_question_answered",
+                                 payload: .object(["toolUseId": .string("tu-1"),
+                                                   "answers": .object(["Which goal?": .string("staging")])]),
+                                 createdAt: "2026-09-01T00:00:01Z"))
+        XCTAssertNil(model.openCliQuestion)
+    }
+
+    func testAnswerFailureBringsTheQuestionBackWithAnExplanation() async {
+        let backend = MockBackend()
+        backend.failAnswerWith = APIError(status: 409, message: "the CLI holding this session is not reachable")
+        let model = ChatModel(backend: backend, session: makeSession(cliLive: true, cliJoin: true))
+        model.handle(questionEvent(1, toolUseId: "tu-1"))
+        await model.answerCliQuestion(toolUseId: "tu-1", answers: ["Which goal?": "staging"])
+        XCTAssertEqual(model.openCliQuestion?.toolUseId, "tu-1", "an answer that never landed must be answerable again")
+        XCTAssertNotNil(model.errorBanner)
+    }
+
+    func testDismissingLeavesTheQuestionToTheTerminal() {
+        let model = ChatModel(backend: MockBackend(), session: makeSession(cliLive: true, cliJoin: true))
+        model.handle(questionEvent(1, toolUseId: "tu-1"))
+        model.dismissCliQuestion("tu-1")
+        XCTAssertNil(model.openCliQuestion)
     }
 }

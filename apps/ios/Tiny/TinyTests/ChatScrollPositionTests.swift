@@ -59,6 +59,9 @@ final class ChatScrollPositionTests: XCTestCase {
             try await inner.updateSession(sessionId: sessionId, model: model, permissionMode: permissionMode, effort: effort, title: title)
         }
         func pendingPermissions(sessionId: String) async throws -> [PendingPermission] { [] }
+
+    func answerCliQuestion(sessionId: String, toolUseId: String, answers: [String: String]) async throws {}
+
         func respondPermission(reqId: String, allow: Bool, message: String?, updatedInput: JSONValue?) async throws {}
         func fileData(fileId: String) async throws -> (data: Data, mime: String) { try await inner.fileData(fileId: fileId) }
         func eventStream(sessionId: String, since: Int) -> AsyncStream<EventRecord> { AsyncStream { _ in } }

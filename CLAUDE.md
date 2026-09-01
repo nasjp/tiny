@@ -115,7 +115,7 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
 - **Any code that spawns child processes must strip `ANTHROPIC_API_KEY` from the env**
   (leaving it set bills the API pay-as-you-go instead of the subscription; every
   existing spawn path already strips it)
-- Read test counts, not just pass/fail (currently server 618 / relay 37 / iOS unit 158
+- Read test counts, not just pass/fail (currently server 636 / relay 37 / iOS unit 180
   + 1 demo-UI + 3 live E2E [need a real tinyd — see HANDOFF]). **`xcodebuild test |
   tail` exits 0 even on failure** — always check for the literal
   `** TEST FAILED **` / `** TEST SUCCEEDED **` strings
@@ -146,6 +146,13 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
   Codex's rollout jsonl / thread-writer-locks live only in `src/codex-live.ts`, and
   OpenCode's opencode.db / locks only in `src/opencode-live.ts`** (both read-only,
   degrading to null/empty)
+- **A CLI session's AskUserQuestion never reaches the transcript until it is answered**
+  (measured on Claude Code 2.1.252: a question left on screen for 60s wrote nothing). The phone
+  learns about it from the `PreToolUse` hook `tiny live on` installs (`tiny question --auto`, which
+  carries `tool_use_id` + the questions), and answers it by injecting the chosen answers with
+  `priority: "now"` — the CLI abandons its own prompt (recording the tool call as rejected, an echo
+  tinyd drops) and takes the answers as a message. Everything the transcript reader can see —
+  answers chosen at the Mac, a dismissed question — still comes from the jsonl
 - **The rtk hook rewrites `git diff` / `grep` / `awk` pipelines too**, not just `npx` —
   a review diff generated through it showed modified lines as unchanged context. Run
   scripts that produce diffs for another reader with `rtk proxy bash <script>`, and

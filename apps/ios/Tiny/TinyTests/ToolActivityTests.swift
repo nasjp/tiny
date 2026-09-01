@@ -130,4 +130,68 @@ final class ToolActivityTests: XCTestCase {
                             input: .object(["path": .string("/tmp/report.html")]), isError: false)
         XCTAssertEqual(send.label, "Sent: report.html")
     }
+
+    // A CLI-owned session asks through the transcript, not the permission flow: cli_question /
+    // cli_question_answered. Both the question and the chosen answer have to survive in history
+    func testCLIQuestionShowsReadOnlyCardThenTurnsIntoTheAnswerCard() {
+        func q(_ text: String) -> JSONValue {
+            .object(["question": .string(text), "header": .string("Goal"),
+                     "multiSelect": .bool(false),
+                     "options": .array([
+                         .object(["label": .string("staging"), "description": .string("")]),
+                         .object(["label": .string("production"), "description": .string("")]),
+                     ])])
+        }
+        let asked = ev(1, "cli_question", .object([
+            "toolUseId": .string("t1"), "input": .object(["questions": .array([q("Which goal?")])])]))
+
+        // While the CLI waits, the question is on screen read-only
+        let pending = buildChatItems([asked])
+        XCTAssertEqual(pending.count, 1)
+        guard case .cliQuestion(_, _, let questions) = pending[0] else { return XCTFail("\(pending[0])") }
+        XCTAssertEqual(questions.map(\.question), ["Which goal?"])
+        XCTAssertEqual(questions.first?.options.map(\.label), ["staging", "production"])
+
+        // Once answered in the CLI it becomes the answer card, in the same place
+        let answered = buildChatItems([
+            asked,
+            ev(2, "cli_question_answered", .object([
+                "toolUseId": .string("t1"),
+                "answers": .object(["Which goal?": .string("staging")])])),
+        ])
+        XCTAssertEqual(answered.count, 1)
+        guard case .qa(let id, let pairs) = answered[0] else { return XCTFail("\(answered[0])") }
+        XCTAssertEqual(id, 1)   // keeps the question's identity, so the card is not re-inserted
+        XCTAssertEqual(pairs, [QAPair(question: "Which goal?", answer: "staging")])
+    }
+
+    func testDismissedCLIQuestionKeepsTheQuestionInHistory() {
+        let events = [
+            ev(1, "cli_question", .object([
+                "toolUseId": .string("t1"),
+                "input": .object(["questions": .array([.object([
+                    "question": .string("Which goal?"), "header": .string("Goal"),
+                    "multiSelect": .bool(false),
+                    "options": .array([.object(["label": .string("staging"), "description": .string("")])]),
+                ])])])])),
+            ev(2, "cli_question_answered", .object([
+                "toolUseId": .string("t1"), "answers": .object([:]), "rejected": .bool(true)])),
+        ]
+        let items = buildChatItems(events)
+        XCTAssertEqual(items.count, 1)
+        guard case .qa(_, let pairs) = items[0] else { return XCTFail("\(items[0])") }
+        XCTAssertEqual(pairs, [QAPair(question: "Which goal?", answer: dismissedInCLIAnswer)])
+    }
+
+    func testAnswersWhoseQuestionFellOutsideTheWindowStillShow() {
+        let items = buildChatItems([
+            ev(9, "cli_question_answered", .object([
+                "toolUseId": .string("t1"),
+                "answers": .object(["Which goal?": .string("production")])])),
+        ])
+        XCTAssertEqual(items.count, 1)
+        guard case .qa(let id, let pairs) = items[0] else { return XCTFail("\(items[0])") }
+        XCTAssertEqual(id, 9)
+        XCTAssertEqual(pairs, [QAPair(question: "Which goal?", answer: "production")])
+    }
 }

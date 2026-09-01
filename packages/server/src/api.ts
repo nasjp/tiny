@@ -78,6 +78,17 @@ const permissionSchema = z.discriminatedUnion("behavior", [
   z.object({ behavior: z.literal("allow"), updatedInput: z.record(z.unknown()).optional() }),
   z.object({ behavior: z.literal("deny"), message: z.string().default("denied") }),
 ]);
+// Answers to an AskUserQuestion the CLI is showing: question text -> the chosen label(s)
+const cliQuestionSchema = z.object({
+  toolUseId: z.string().min(1).max(200),
+  answers: z.record(z.string().max(4000)),
+});
+// What the PreToolUse hook reports: a question the CLI is asking right now
+const askedQuestionSchema = z.object({
+  agentSessionId: z.string().min(1).max(200),
+  toolUseId: z.string().min(1).max(200),
+  input: z.record(z.unknown()),
+});
 const deviceSchema = z.object({ code: z.string(), name: z.string().min(1) });
 const apnsSchema = z.object({
   apnsToken: z.string().min(1),
@@ -243,6 +254,22 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
     if (!fs.existsSync(body.path)) return c.json({ error: `file not found: ${body.path}` }, 404);
     const rec = deps.manager.saveUserFile(c.req.param("id"), body.path, body.caption);
     return c.json({ fileId: rec.id, mime: rec.mime }, 201);
+  });
+
+  // The `tiny question --auto` hook: the CLI is showing an AskUserQuestion. Local hook, so CLI token only
+  app.post("/v1/questions", async (c) => {
+    const denied = requireCli(c);
+    if (denied) return denied;
+    const body = askedQuestionSchema.parse(await c.req.json());
+    return c.json({ recorded: deps.manager.recordCliQuestion(body.agentSessionId, body.toolUseId, body.input) });
+  });
+
+  // Answering, from the phone, a question the CLI itself asked. Not a permission: it reaches the
+  // CLI over the messaging socket (see SessionManager.answerCliQuestion)
+  app.post("/v1/sessions/:id/questions", async (c) => {
+    const body = cliQuestionSchema.parse(await c.req.json());
+    await deps.manager.answerCliQuestion(c.req.param("id"), body.toolUseId, body.answers);
+    return c.json({ ok: true }, 202);
   });
 
   app.get("/v1/sessions/:id/permissions", (c) =>

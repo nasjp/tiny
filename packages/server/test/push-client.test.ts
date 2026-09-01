@@ -39,6 +39,19 @@ describe("buildIntent", () => {
     expect(i.body).toContain("Bash");
   });
 
+  it("notifies a question the CLI itself asked, with the question category", () => {
+    const intent = buildIntent(
+      event("cli_question", {
+        toolUseId: "tu-1",
+        input: { questions: [{ question: "Which goal?", header: "Goal", options: [] }] },
+      }),
+      null,
+    );
+    expect(intent!.body).toBe("Claude asks: Which goal?");
+    expect(intent!.category).toBe("tiny.question");
+    expect(intent!.level).toBe("time-sensitive");
+  });
+
   it("uses the question text as the body for AskUserQuestion", () => {
     const withQ = buildIntent(
       event("permission_requested", {

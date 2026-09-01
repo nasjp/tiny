@@ -76,6 +76,9 @@ struct ToolCall: Identifiable, Equatable {
     }
 }
 
+/// Shown in place of an answer when the person dismissed the question in the CLI
+let dismissedInCLIAnswer = "Dismissed in the CLI"
+
 /// An AskUserQuestion question-answer pair (contents of the card kept in history after answering)
 struct QAPair: Equatable {
     let question: String
@@ -88,19 +91,24 @@ enum ChatItem: Identifiable {
     case tools(groupId: Int, calls: [ToolCall])
     /// An answered AskUserQuestion (kept in history as a question+answer card, official-app style)
     case qa(id: Int, pairs: [QAPair])
+    /// A question the CLI is asking its person right now. Read-only: only the CLI can answer it
+    case cliQuestion(id: Int, toolUseId: String, questions: [AskQuestion])
 
     var id: Int {
         switch self {
         case .event(let ev): ev.id
         case .tools(let groupId, _): groupId
         case .qa(let id, _): id
+        case .cliQuestion(let id, _, _): id
         }
     }
 }
 
 /// Event sequence → display-unit sequence. Groups runs of tool_started/tool_finished.
 /// Non-displayed events (turn_started, permissions, unknown) do not split a group
-func buildChatItems(_ events: [EventRecord]) -> [ChatItem] {
+/// `answeringNow` is the question the answer card at the bottom of the chat is showing: it owns
+/// that question until it is answered, so history leaves it out rather than printing it twice
+func buildChatItems(_ events: [EventRecord], answeringNow: String? = nil) -> [ChatItem] {
     var out: [ChatItem] = []
     var current: [ToolCall] = []
     var groupId = 0
@@ -108,8 +116,13 @@ func buildChatItems(_ events: [EventRecord]) -> [ChatItem] {
     // is not displayed (the current state is the "In use by CLI" banner's job;
     // prevents a volley of toggles from becoming a wall)
     var stateRun: EventRecord?
-    // AskUserQuestion question order (reqId → questions). Used to order the answer card
+    // AskUserQuestion question order (reqId / toolUseId → questions). Used to order the answer card
     var askedQuestions: [String: [AskQuestion]] = [:]
+    // Where a CLI question's read-only card sits in `out`, so the answer replaces it in place
+    // instead of leaving the question hanging above its own answer
+    var cliQuestionAt: [String: Int] = [:]
+    // Questions that already have an answer card, so a second answer for the same question is dropped
+    var answeredQuestions: Set<String> = []
 
     func flushTools() {
         if !current.isEmpty {
@@ -161,6 +174,43 @@ func buildChatItems(_ events: [EventRecord]) -> [ChatItem] {
                 pairs += answers.filter { !known.contains($0.key) }
                     .sorted { $0.key < $1.key }
                     .map { QAPair(question: $0.key, answer: $0.value) }
+                out.append(.qa(id: ev.id, pairs: pairs))
+            }
+        case .cliQuestion(let toolUseId, let input):
+            // A question asked in a session tiny does not drive. It arrives from the transcript,
+            // never through the permission flow, so it can only be shown, not answered
+            let qs = AskUserQuestion.parse(input)
+            if qs.isEmpty { continue }
+            flushTools()
+            flushStateRun()
+            askedQuestions[toolUseId] = qs
+            if toolUseId == answeringNow { continue }
+            cliQuestionAt[toolUseId] = out.count
+            out.append(.cliQuestion(id: ev.id, toolUseId: toolUseId, questions: qs))
+        case .cliQuestionAnswered(let toolUseId, let answers, let rejected):
+            // The CLI writes its own record of a question the phone already answered (its prompt was
+            // cancelled to deliver the answer). One answer card per question, whoever answered it
+            if !answeredQuestions.insert(toolUseId).inserted { continue }
+            let asked = askedQuestions[toolUseId] ?? []
+            let order = asked.isEmpty ? answers.keys.sorted() : asked.map(\.question)
+            var pairs = order.compactMap { q in
+                answers[q].map { QAPair(question: q, answer: $0) }
+                    // Dismissed in the CLI: the question stays in history, with no answer under it
+                    ?? (rejected ? QAPair(question: q, answer: dismissedInCLIAnswer) : nil)
+            }
+            let known = Set(order)
+            pairs += answers.filter { !known.contains($0.key) }
+                .sorted { $0.key < $1.key }
+                .map { QAPair(question: $0.key, answer: $0.value) }
+            if pairs.isEmpty { continue }
+            // Replace the read-only card in place when it is still on screen; a card whose question
+            // fell outside the imported window is simply appended here
+            if let at = cliQuestionAt[toolUseId], case .cliQuestion(let id, _, _) = out[at] {
+                out[at] = .qa(id: id, pairs: pairs)
+                cliQuestionAt[toolUseId] = nil
+            } else {
+                flushTools()
+                flushStateRun()
                 out.append(.qa(id: ev.id, pairs: pairs))
             }
         case .turnStarted, .unknown:

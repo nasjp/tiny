@@ -644,3 +644,118 @@ describe("claude-transcript thinking and turn progress", () => {
     expect(readTranscript(file).turn).toEqual({ startedAt: "2026-08-31T12:06:55.000Z", outputTokens: 0 });
   });
 });
+
+// AskUserQuestion in a CLI-owned session. Nobody on the phone can answer it (the messaging socket
+// takes messages, not tool results), but the question and the chosen answer are conversation and
+// have to reach the phone — as a read-only question card, then as a question+answer card
+describe("claude-transcript AskUserQuestion", () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-trq-"));
+  });
+
+  const QUESTION_INPUT = {
+    questions: [{
+      question: "Which goal?",
+      header: "Goal",
+      multiSelect: false,
+      options: [{ label: "staging", description: "up to staging" }, { label: "production", description: "all the way" }],
+    }],
+  };
+
+  function ask(uuid: string, id: string): Record<string, unknown> {
+    return {
+      type: "assistant", uuid,
+      message: { content: [{ type: "tool_use", id, name: "AskUserQuestion", input: QUESTION_INPUT }] },
+    };
+  }
+
+  it("emits cli_question instead of tool_started for the question", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [ask("a1", "t1")]);
+    const r = readTranscript(file);
+    expect(r.events.map((e) => e.type)).toEqual(["cli_question"]);
+    expect(r.events[0]!.payload).toEqual({ toolUseId: "t1", input: QUESTION_INPUT });
+  });
+
+  it("emits cli_question_answered with the answers keyed by question text", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      ask("a1", "t1"),
+      {
+        type: "user", uuid: "u1",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "Your questions have been answered" }] },
+        toolUseResult: { questions: QUESTION_INPUT.questions, answers: { "Which goal?": "staging" }, annotations: {} },
+      },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events.map((e) => e.type)).toEqual(["cli_question", "cli_question_answered"]);
+    expect(r.events[1]!.payload).toEqual({ toolUseId: "t1", answers: { "Which goal?": "staging" } });
+  });
+
+  it("recognises the answers even when the question fell outside this read", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      ask("a1", "t1"),
+      {
+        type: "user", uuid: "u1",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] },
+        toolUseResult: { questions: QUESTION_INPUT.questions, answers: { "Which goal?": "production" } },
+      },
+    ]);
+    const r = readTranscript(file, { sinceUuid: "a1" });
+    expect(r.events.map((e) => e.type)).toEqual(["cli_question_answered"]);
+    expect(r.events[0]!.payload).toEqual({ toolUseId: "t1", answers: { "Which goal?": "production" } });
+  });
+
+  it("closes the card as rejected when the question was dismissed in the CLI", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      ask("a1", "t1"),
+      {
+        type: "user", uuid: "u1",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: "The user doesn't want to proceed with this tool use." }],
+        },
+        toolUseResult: "User rejected tool use",
+      },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events.map((e) => e.type)).toEqual(["cli_question", "cli_question_answered"]);
+    expect(r.events[1]!.payload).toEqual({ toolUseId: "t1", answers: {}, rejected: true });
+  });
+
+  it("closes a question from an earlier read when openQuestions names it", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      ask("a1", "t1"),
+      {
+        type: "user", uuid: "u1",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", is_error: true }] },
+        toolUseResult: "User rejected tool use",
+      },
+    ]);
+    // The question was imported before this read, so only the caller still knows the id
+    const r = readTranscript(file, { sinceUuid: "a1", openQuestions: ["t1"] });
+    expect(r.events.map((e) => e.type)).toEqual(["cli_question_answered"]);
+    expect(r.events[0]!.payload).toEqual({ toolUseId: "t1", answers: {}, rejected: true });
+  });
+
+  it("leaves ordinary tool results alone", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      {
+        type: "assistant", uuid: "a1",
+        message: { content: [{ type: "tool_use", id: "t9", name: "Read", input: { file_path: "/tmp/x" } }] },
+      },
+      {
+        type: "user", uuid: "u1",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t9", is_error: false }] },
+        toolUseResult: { type: "text", file: { filePath: "/tmp/x" } },
+      },
+    ]);
+    const r = readTranscript(file);
+    expect(r.events.map((e) => e.type)).toEqual(["tool_started", "tool_finished"]);
+  });
+});

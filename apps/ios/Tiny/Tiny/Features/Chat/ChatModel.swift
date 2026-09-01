@@ -43,6 +43,10 @@ final class ChatModel: ObservableObject {
     /// at once; start() sets it to "max history id + 1" right after pouring in the
     /// history. Initial .max = nothing is new (no animation)
     @Published private(set) var animateFrom = Int.max
+    /// CLI questions left to the terminal on this phone (× on the answer card)
+    @Published private var dismissedQuestions: Set<String> = []
+    /// CLI questions whose answer is in flight (the card is hidden so it cannot be answered twice)
+    @Published private var answeringQuestions: Set<String> = []
 
     /// Presents as "running" including right after the send tap (before turn_started arrives) and
     /// while the CLI runs a turn of its own (activity). Who started the turn makes no difference here
@@ -271,6 +275,45 @@ final class ChatModel: ObservableObject {
         } catch {
             errorBanner = "Could not stop: \(error.localizedDescription)"
         }
+    }
+
+    /// The question the CLI is waiting on right now, if any: the newest cli_question with no answer
+    /// yet, minus the ones this phone dismissed or is answering. Unlike a permission this lives in
+    /// the event history, so it survives a tinyd restart and needs no reconcile
+    var openCliQuestion: (toolUseId: String, questions: [AskQuestion])? {
+        var settled = dismissedQuestions.union(answeringQuestions)
+        for ev in events {
+            if case .cliQuestionAnswered(let toolUseId, _, _) = ev.event { settled.insert(toolUseId) }
+        }
+        for ev in events.reversed() {
+            guard case .cliQuestion(let toolUseId, let input) = ev.event, !settled.contains(toolUseId) else { continue }
+            let questions = AskUserQuestion.parse(input)
+            return questions.isEmpty ? nil : (toolUseId, questions)
+        }
+        return nil
+    }
+
+    /// Answer a question the CLI asked. The server has the CLI drop its own prompt and take these
+    /// answers instead, so the phone is not a second-class seat: same question, same answer, either end
+    func answerCliQuestion(toolUseId: String, answers: [String: String]) async {
+        answeringQuestions.insert(toolUseId)
+        do {
+            try await backend.answerCliQuestion(sessionId: sessionId, toolUseId: toolUseId, answers: answers)
+            errorBanner = nil
+        } catch let e as APIError {
+            answeringQuestions.remove(toolUseId)
+            errorBanner = e.status == 409
+                ? "The CLI holding this session is gone — answer it in the terminal"
+                : "Could not answer: \(e.message)"
+        } catch {
+            answeringQuestions.remove(toolUseId)
+            errorBanner = error.localizedDescription
+        }
+    }
+
+    /// × on a CLI question: leave it to the terminal. The question stays in history
+    func dismissCliQuestion(_ toolUseId: String) {
+        dismissedQuestions.insert(toolUseId)
     }
 
     func respond(reqId: String, allow: Bool, updatedInput: JSONValue? = nil) async {

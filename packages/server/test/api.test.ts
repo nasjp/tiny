@@ -264,6 +264,61 @@ describe("REST API", () => {
     });
   });
 
+  it("questions: the hook's report becomes a cli_question event", async () => {
+    const adopted = await app.request("/v1/sessions/adopt", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd, agentSessionId: "agent-hooked" }),
+    });
+    const s = await adopted.json();
+    const input = { questions: [{ question: "Tea or coffee?", options: [] }] };
+    const res = await app.request("/v1/questions", {
+      method: "POST", headers: H(),
+      body: JSON.stringify({ agentSessionId: "agent-hooked", toolUseId: "tu-1", input }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ recorded: true });
+    const events = await (await app.request(`/v1/sessions/${s.id}/events`, { headers: H() })).json();
+    const q = events.events.find((e: { type: string }) => e.type === "cli_question");
+    expect(q.payload).toEqual({ toolUseId: "tu-1", input });
+
+    // a session tiny does not know is not an error: the hook must never fail its CLI
+    const unknown = await app.request("/v1/questions", {
+      method: "POST", headers: H(),
+      body: JSON.stringify({ agentSessionId: "nobody", toolUseId: "tu-2", input }),
+    });
+    expect(await unknown.json()).toEqual({ recorded: false });
+  });
+
+  it("questions: answers reach the CLI over the socket, and a session no CLI holds is 409", async () => {
+    const created = await app.request("/v1/sessions", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd }),
+    });
+    const sess = await created.json();
+    // No live CLI to answer into
+    const refused = await app.request(`/v1/sessions/${sess.id}/questions`, {
+      method: "POST", headers: H(), body: JSON.stringify({ toolUseId: "tu-1", answers: { Q: "A" } }),
+    });
+    expect(refused.status).toBe(409);
+
+    cliLive = true;
+    peerTarget = { pid: 4242, sockPath: "/srv/cc-socks/4242.sock" };
+    const adopted = await app.request("/v1/sessions/adopt", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "work", cwd, agentSessionId: "agent-q" }),
+    });
+    const live = await adopted.json();
+    const ok = await app.request(`/v1/sessions/${live.id}/questions`, {
+      method: "POST", headers: H(), body: JSON.stringify({ toolUseId: "tu-1", answers: { "Which goal?": "staging" } }),
+    });
+    expect(ok.status).toBe(202);
+    expect(peerSent).toHaveLength(1);
+    expect(peerSent[0]!.priority).toBe("now");
+    expect(peerSent[0]!.content).toContain("staging");
+
+    const bad = await app.request(`/v1/sessions/${live.id}/questions`, {
+      method: "POST", headers: H(), body: JSON.stringify({ answers: { Q: "A" } }),
+    });
+    expect(bad.status).toBe(400);
+  });
+
   it("permissions: unknown reqId is 404", async () => {
     // Pending creation-to-resolution integration is covered by the Task 7 tests. The API layer only checks the 404 response.
     const notFound = await app.request(`/v1/permissions/nope`, {
