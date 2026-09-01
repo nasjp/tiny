@@ -1847,6 +1847,18 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
     expect(manager.activity(manager.getSession(s.id))).toBeNull();
   });
 
+  it("reports a background shell task the CLI is waiting on as running, with the reason", () => {
+    // Measured: after a turn that started a Bash task in the background, the registry reads "shell"
+    // until the task exits and the CLI picks up again. The official app shows this as a running task
+    const { manager, home } = makeManager(okAdapter, {
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "shell", statusUpdatedAt: "2026-09-01T15:09:17.919Z" }) },
+    });
+    const { session } = liveSession(manager, home, "agent-bg-task");
+    expect(manager.activity(manager.getSession(session.id))).toEqual({
+      since: "2026-09-01T15:09:17.919Z", outputTokens: null, reason: "background",
+    });
+  });
+
   it("reports a turn typed into the CLI from the registry, and its tokens once the transcript is synced", () => {
     const { manager, home } = makeManager(okAdapter, {
       deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.000Z" }) },
@@ -1890,8 +1902,8 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
     expect(manager.activity(s)).toBeNull();
     status = "unknown";
     expect(manager.activity(s)).toBeNull();
-    status = "shell";
-    expect(manager.activity(s)).toBeNull();
+    status = "shell"; // a background task the CLI waits on is work in progress (see the test below)
+    expect(manager.activity(s)).toEqual({ since: null, outputTokens: null, reason: "background" });
     status = "waiting";
     expect(manager.activity(s)).toEqual({ since: null, outputTokens: null });
   });

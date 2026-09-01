@@ -136,8 +136,12 @@ interface LiveTurn {
   lastAssistantText: string | null;
 }
 
-/** Registry statuses that mean "a turn is in progress over there" (a permission prompt is mid-turn too) */
-const CLI_BUSY: ReadonlySet<string> = new Set(["busy", "waiting"]);
+/**
+ * Registry statuses that mean "work is in progress over there": a turn (busy), a permission prompt
+ * mid-turn (waiting), or a background shell task the CLI is waiting on after its turn ended (shell —
+ * measured: a `!cmd` typed at the prompt reads busy, not shell). The CLI resumes when that task exits
+ */
+const CLI_BUSY: ReadonlySet<string> = new Set(["busy", "waiting", "shell"]);
 
 /**
  * How one frame goes down the CLI's messaging socket. `question` marks it as the answer to an
@@ -977,6 +981,9 @@ export class SessionManager extends EventEmitter {
     }
     const st = this.deps.cliState?.(s);
     if (!st || !CLI_BUSY.has(st.status)) return null;
+    // Waiting on a background task: the turn is over, so its tokens are not "so far"; the clock
+    // runs from when the wait began
+    if (st.status === "shell") return { since: st.statusUpdatedAt, outputTokens: null, reason: "background" };
     // The transcript's newest turn is only trustworthy if it was read after the CLI went busy;
     // otherwise it is the PREVIOUS turn (nobody syncs the transcript while the phone sits on the
     // session list), and its token count would be shown against the wrong turn
