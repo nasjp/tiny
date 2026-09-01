@@ -256,7 +256,9 @@ enum TinyEvent: Equatable {
     // kind / summary are display hints attached by the server (ACP ToolKind vocabulary: read / edit /
     // delete / move / search / execute / think / fetch / other, plus a one-line summary). nil on older servers
     case toolStarted(toolName: String, toolUseId: String, input: JSONValue, kind: String?, summary: String?)
-    case toolFinished(toolUseId: String, isError: Bool)
+    /// output = what the tool printed, as the agent saw it (nil on older servers or when nothing was recorded);
+    /// truncated = the server kept only the head of a long output
+    case toolFinished(toolUseId: String, isError: Bool, output: String?, truncated: Bool)
     case turnCompleted(costUsd: Double?, resultText: String?, contextTokens: Int?)
     case turnFailed(reason: String)
     case authError(String)
@@ -302,7 +304,9 @@ enum TinyEvent: Equatable {
                                 kind: str("kind"), summary: str("summary"))
         case "tool_finished":
             let isError = { if case .bool(let b) = p["isError"] { return b }; return false }()
-            self = .toolFinished(toolUseId: str("toolUseId") ?? "", isError: isError)
+            let truncated = { if case .bool(let b) = p["truncated"] { return b }; return false }()
+            self = .toolFinished(toolUseId: str("toolUseId") ?? "", isError: isError,
+                                 output: str("output"), truncated: truncated)
         case "turn_completed":
             let cost = { if case .number(let n) = p["costUsd"] { return n as Double? }; return nil }()
             let ctx = { if case .number(let n) = p["contextTokens"] { return Int(n) as Int? }; return nil }()

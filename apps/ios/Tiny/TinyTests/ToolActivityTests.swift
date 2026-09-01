@@ -221,4 +221,43 @@ final class ToolActivityTests: XCTestCase {
             XCTAssertEqual(pairs, [QAPair(question: "Which goal?", answer: "staging")])
         }
     }
+
+    func testToolFinishedAttachesTheOutputToItsCall() {
+        let events = [
+            ev(1, "tool_started", .object(["toolName": .string("Bash"), "toolUseId": .string("t1"),
+                                           "input": .object(["command": .string("npm test")])])),
+            ev(2, "tool_started", .object(["toolName": .string("Read"), "toolUseId": .string("t2"),
+                                           "input": .object(["file_path": .string("/a/x.md")])])),
+            ev(3, "tool_finished", .object(["toolUseId": .string("t1"), "isError": .bool(false),
+                                            "output": .string("42 passed"), "truncated": .bool(true)])),
+            ev(4, "tool_finished", .object(["toolUseId": .string("t2"), "isError": .bool(true)])),
+        ]
+        guard case .tools(_, let calls) = buildChatItems(events)[0] else { return XCTFail("no tool group") }
+        XCTAssertEqual(calls.map(\.output), ["42 passed", nil])
+        XCTAssertEqual(calls.map(\.outputTruncated), [true, false])
+        XCTAssertEqual(calls.map(\.isError), [false, true])
+    }
+
+    func testInputFieldsPutTheCommandFirstAndTheRestAfter() {
+        let bash = ToolCall(id: "t1", name: "Bash",
+                            input: .object(["command": .string("ls -la"), "description": .string("List files"), "timeout": .number(5000)]),
+                            isError: false)
+        XCTAssertEqual(bash.inputFields, [
+            ToolInputField(label: "Command", text: "ls -la"),
+            ToolInputField(label: "Description", text: "List files"),
+            ToolInputField(label: "timeout", text: "5000"),
+        ])
+        let edit = ToolCall(id: "t2", name: "Edit",
+                            input: .object(["file_path": .string("/a/b.swift"), "old_string": .string("x"), "new_string": .string("y")]),
+                            isError: false)
+        XCTAssertEqual(edit.inputFields.map(\.label), ["File", "Replace", "With"])
+        let other = ToolCall(id: "t3", name: "WebFetch",
+                             input: .object(["url": .string("https://example.com"), "opts": .object(["raw": .bool(true)])]),
+                             isError: false)
+        XCTAssertEqual(other.inputFields, [
+            ToolInputField(label: "opts", text: "{\n  \"raw\": true\n}"),
+            ToolInputField(label: "url", text: "https://example.com"),
+        ])
+        XCTAssertEqual(ToolCall(id: "t4", name: "X", input: .null, isError: false).inputFields, [])
+    }
 }

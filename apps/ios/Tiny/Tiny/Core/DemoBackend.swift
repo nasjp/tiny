@@ -53,7 +53,8 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
                 ev(fix, "assistant_text", .object(["text": .string("I'll look into the failing test in my-app. Let me run the tests first to find where it's failing.")])),
                 ev(fix, "tool_started", .object(["toolName": .string("Bash"), "toolUseId": .string("t1"),
                                                  "input": .object(["command": .string("npm test")])])),
-                ev(fix, "tool_finished", .object(["toolUseId": .string("t1"), "isError": .bool(false)])),
+                ev(fix, "tool_finished", .object(["toolUseId": .string("t1"), "isError": .bool(false),
+                                                  "output": .string("> my-app@1.4.2 test\n> vitest run\n\n ✓ src/date-utils.test.ts (12 tests)\n ✗ src/range.test.ts (1 failed)\n   × includes the end of the range\n\n Tests  1 failed | 41 passed (42)")])),
                 ev(fix, "assistant_text", .object(["text": .string("It was a boundary condition in date-utils.ts. I fixed it and confirmed the tests pass. Sending you a report.")])),
                 ev(fix, "file_sent", .object(["fileId": .string(Self.demoFileId), "mime": .string("text/html"),
                                               "caption": .string("Fix report"),
@@ -293,7 +294,8 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
                 self.emit(sessionId, "tool_started", .object(["toolName": .string("Bash"), "toolUseId": .string("t9"),
                                                    "input": .object(["command": .string("npm run build")])]))
                 try? await Task.sleep(nanoseconds: 900_000_000)
-                self.emit(sessionId, "tool_finished", .object(["toolUseId": .string("t9"), "isError": .bool(false)]))
+                self.emit(sessionId, "tool_finished", .object(["toolUseId": .string("t9"), "isError": .bool(false),
+                                                                "output": .string("> my-app@1.4.2 build\n> vite build\n\n✓ 128 modules transformed.\ndist/index.html   0.46 kB\n✓ built in 1.92s")]))
                 self.emit(sessionId, "turn_completed", .object(["costUsd": .number(0.08),
                                                      "resultText": .string("Build succeeded")]))
             }

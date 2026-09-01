@@ -316,4 +316,24 @@ final class ModelsTests: XCTestCase {
         """.utf8))
         XCTAssertNil(b.reqId)
     }
+
+    func testToolFinishedCarriesTheOutputWhenTheServerRecordedIt() {
+        let with = EventRecord(id: 1, sessionId: "s", type: "tool_finished",
+                               payload: .object(["toolUseId": .string("t1"), "isError": .bool(false),
+                                                 "output": .string("42 passed"), "truncated": .bool(true)]),
+                               createdAt: "c")
+        guard case let .toolFinished(id, isError, output, truncated) = with.event else { return XCTFail("\(with.event)") }
+        XCTAssertEqual(id, "t1")
+        XCTAssertFalse(isError)
+        XCTAssertEqual(output, "42 passed")
+        XCTAssertTrue(truncated)
+
+        // an older tinyd sends neither field
+        let without = EventRecord(id: 2, sessionId: "s", type: "tool_finished",
+                                  payload: .object(["toolUseId": .string("t2"), "isError": .bool(true)]), createdAt: "c")
+        guard case let .toolFinished(_, isError2, output2, truncated2) = without.event else { return XCTFail("\(without.event)") }
+        XCTAssertTrue(isError2)
+        XCTAssertNil(output2)
+        XCTAssertFalse(truncated2)
+    }
 }
