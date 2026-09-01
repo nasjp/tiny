@@ -259,8 +259,8 @@ describe("claude-transcript", () => {
         message: {
           role: "user",
           content: [
-            { type: "tool_result", tool_use_id: "t1", is_error: false },
-            { type: "tool_result", tool_use_id: "t2", is_error: true },
+            { type: "tool_result", tool_use_id: "t1", is_error: false, content: "42 passed" },
+            { type: "tool_result", tool_use_id: "t2", is_error: true, content: [{ type: "text", text: "boom" }] },
           ],
         },
       },
@@ -268,6 +268,9 @@ describe("claude-transcript", () => {
     const r = readTranscript(file);
     expect(r.events.map((e) => e.type)).toEqual(["tool_finished", "tool_finished"]);
     expect(r.events[0]!.payload.toolUseId).toBe("t1");
+    // what the tool printed rides along, whichever shape the content took
+    expect(r.events[0]!.payload.output).toBe("42 passed");
+    expect(r.events[1]!.payload.output).toBe("boom");
     expect(r.events[0]!.payload.isError).toBe(false);
     expect(r.events[1]!.payload.toolUseId).toBe("t2");
     expect(r.events[1]!.payload.isError).toBe(true);
@@ -322,6 +325,7 @@ describe("claude-transcript", () => {
       expect(started.payload.summary).toBe("tiny handoff");
       expect(started.payload.toolUseId).toBe(finished.payload.toolUseId);
       expect(started.payload.toolUseId).toBe("b1");
+      expect(finished.payload.output).toBe("Handed off: abc123");
     });
 
     it("sets isError true only when bash-stderr is non-empty", () => {

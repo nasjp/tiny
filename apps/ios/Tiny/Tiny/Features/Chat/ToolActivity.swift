@@ -13,6 +13,10 @@ struct ToolCall: Identifiable, Equatable {
     /// Server display hints (the ACP ToolKind vocabulary and a one-line summary). When present, they win over name matching
     var kindHint: String? = nil
     var summary: String? = nil
+    /// What the tool printed (tool_finished.output). nil = not recorded (older tinyd, or the call is still running)
+    var output: String? = nil
+    /// The server kept only the head of the output
+    var outputTruncated: Bool = false
 
     /// Leading verb (matches the Claude Code app's wording)
     var verb: String {
@@ -57,6 +61,32 @@ struct ToolCall: Identifiable, Equatable {
 
     enum Kind { case command, edit, read, send, other }
 
+    /// The input, laid out for the detail screen: the fields a person wants to read first (a command,
+    /// a file path, the text an edit replaces) and then everything else the call carried
+    var inputFields: [ToolInputField] {
+        guard let obj = input.objectValue else {
+            return input == .null ? [] : [ToolInputField(label: "Input", text: input.prettyText)]
+        }
+        // Keys shown first, with their labels; the rest follow in key order
+        let preferred: [(key: String, label: String)] = switch kind {
+        case .command: [("command", "Command"), ("description", "Description")]
+        case .edit, .read: [("file_path", "File"), ("path", "File"), ("old_string", "Replace"), ("new_string", "With"), ("content", "Content")]
+        default: []
+        }
+        var fields: [ToolInputField] = []
+        var used = Set<String>()
+        for (key, label) in preferred {
+            guard let v = obj[key] else { continue }
+            used.insert(key)
+            fields.append(ToolInputField(label: label, text: v.stringValue ?? v.prettyText))
+        }
+        for key in obj.keys.sorted() where !used.contains(key) {
+            let v = obj[key]!
+            fields.append(ToolInputField(label: key, text: v.stringValue ?? v.prettyText))
+        }
+        return fields
+    }
+
     var kind: Kind {
         // Use the server's kind (ACP vocabulary) if present; no need to know per-agent tool names
         switch kindHint {
@@ -72,6 +102,36 @@ struct ToolCall: Identifiable, Equatable {
         case "Read", "Grep", "Glob": return .read
         case let n where n.contains("send_user_file"): return .send
         default: return .other
+        }
+    }
+}
+
+/// One labelled piece of a tool call's input on the detail screen
+struct ToolInputField: Equatable {
+    let label: String
+    let text: String
+}
+
+extension JSONValue {
+    /// Readable JSON for the detail screen: sorted keys, two-space indent, strings unescaped where they stand alone
+    var prettyText: String { pretty(indent: 0) }
+
+    private func pretty(indent: Int) -> String {
+        let pad = String(repeating: "  ", count: indent)
+        let inner = String(repeating: "  ", count: indent + 1)
+        switch self {
+        case .string(let s):
+            let escaped = s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
+        case .number(let n): return n == n.rounded() && abs(n) < 1e15 ? String(Int(n)) : String(n)
+        case .bool(let b): return b ? "true" : "false"
+        case .null: return "null"
+        case .array(let items):
+            if items.isEmpty { return "[]" }
+            return "[\n" + items.map { inner + $0.pretty(indent: indent + 1) }.joined(separator: ",\n") + "\n" + pad + "]"
+        case .object(let obj):
+            if obj.isEmpty { return "{}" }
+            return "{\n" + obj.keys.sorted().map { inner + "\"\($0)\": " + obj[$0]!.pretty(indent: indent + 1) }.joined(separator: ",\n") + "\n" + pad + "}"
         }
     }
 }
@@ -149,9 +209,11 @@ func buildChatItems(_ events: [EventRecord], answeringNow: String? = nil) -> [Ch
             current.append(ToolCall(id: useId.isEmpty ? "ev-\(ev.id)" : useId,
                                     name: name, input: input, isError: false,
                                     kindHint: kind, summary: summary))
-        case .toolFinished(let useId, let isError):
-            if isError, let idx = current.lastIndex(where: { $0.id == useId }) {
-                current[idx].isError = true
+        case .toolFinished(let useId, let isError, let output, let truncated):
+            if let idx = current.lastIndex(where: { $0.id == useId }) {
+                if isError { current[idx].isError = true }
+                current[idx].output = output
+                current[idx].outputTruncated = truncated
             }
         case .sessionStateChanged:
             flushTools()
@@ -278,7 +340,12 @@ struct ToolSummaryRow: View {
     }
 }
 
-/// Detail sheet opened by tapping
+/// Which call a row in the tool sheet opens (navigation value; the call itself is looked up by id)
+struct ToolCallRef: Hashable {
+    let id: String
+}
+
+/// Detail sheet opened by tapping. Each row opens the call's own screen (input and output)
 struct ToolGroupSheet: View {
     let calls: [ToolCall]
     @Environment(\.dismiss) private var dismiss
@@ -288,25 +355,33 @@ struct ToolGroupSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(calls.enumerated()), id: \.element.id) { index, call in
-                        HStack(alignment: .center, spacing: 12) {
-                            Image(systemName: call.iconName)
-                                .font(.system(size: 15))
-                                .frame(width: 24)
-                                .foregroundStyle(.primary)
-                            Text(call.verb)
-                                .font(.callout)
-                            Text(call.label)
-                                .font(.callout)
-                                .fontDesign(.monospaced)
-                                .foregroundStyle(Color.tInkSub)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            if call.isError {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .font(.caption).foregroundStyle(Color.tDetached)
+                        NavigationLink(value: ToolCallRef(id: call.id)) {
+                            HStack(alignment: .center, spacing: 12) {
+                                Image(systemName: call.iconName)
+                                    .font(.system(size: 15))
+                                    .frame(width: 24)
+                                    .foregroundStyle(.primary)
+                                Text(call.verb)
+                                    .font(.callout)
+                                Text(call.label)
+                                    .font(.callout)
+                                    .fontDesign(.monospaced)
+                                    .foregroundStyle(Color.tInkSub)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                if call.isError {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .font(.caption).foregroundStyle(Color.tDetached)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(Color.tInkSub)
                             }
-                            Spacer()
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("toolRow_\(call.id)")
                         .padding(.vertical, 10)
                         // Connector line (all but the last row)
                         if index < calls.count - 1 {
@@ -322,6 +397,11 @@ struct ToolGroupSheet: View {
             }
             .navigationTitle(toolGroupSummary(calls))
             .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: ToolCallRef.self) { ref in
+                if let call = calls.first(where: { $0.id == ref.id }) {
+                    ToolCallDetailView(call: call)
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button { dismiss() } label: { Image(systemName: "xmark") }

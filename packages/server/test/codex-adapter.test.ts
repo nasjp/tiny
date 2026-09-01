@@ -44,7 +44,7 @@ async function echoTurn(ctx: FakeCodexCtx) {
   item(ctx, "item/started", { type: "reasoning", id: "rsn_1" });
   item(ctx, "item/completed", { type: "reasoning", id: "rsn_1" });
   item(ctx, "item/started", { type: "commandExecution", id: "exec-1", status: "inProgress", command: "/bin/zsh -lc 'echo hi'", cwd: "/tmp/repo" });
-  item(ctx, "item/completed", { type: "commandExecution", id: "exec-1", status: "completed", command: "/bin/zsh -lc 'echo hi'", cwd: "/tmp/repo", exitCode: 0 });
+  item(ctx, "item/completed", { type: "commandExecution", id: "exec-1", status: "completed", command: "/bin/zsh -lc 'echo hi'", cwd: "/tmp/repo", exitCode: 0, aggregatedOutput: "hi\n" });
   item(ctx, "item/started", { type: "agentMessage", id: "msg_1", text: "" });
   ctx.notify("item/agentMessage/delta", { delta: "do" });
   item(ctx, "item/completed", { type: "agentMessage", id: "msg_1", text: "done" });
@@ -76,7 +76,7 @@ describe("CodexAdapter", () => {
       kind: "execute",
       summary: "echo hi", // strips the /bin/zsh -lc '…' wrapper
     });
-    expect(events[2]!.payload).toEqual({ toolUseId: "exec-1", isError: false });
+    expect(events[2]!.payload).toEqual({ toolUseId: "exec-1", isError: false, output: "hi\n" });
     expect(events[3]!.payload).toEqual({ text: "done" });
     // contextTokens = last's inputTokens + cachedInputTokens + outputTokens
     expect(events[4]!.payload).toEqual({ costUsd: null, resultText: "done", contextTokens: 5100 });

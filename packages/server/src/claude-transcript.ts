@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { clipToolOutput, toolOutputPayload, toolOutputText } from "./tool-output.js";
 import path from "node:path";
 import { describeClaudeTool } from "./tool-kinds.js";
 
@@ -82,7 +83,7 @@ function blocks(content: unknown): Array<Record<string, unknown>> {
  * the content starting with the tag, so a sentence that merely mentions "<bash-input>" is untouched.
  */
 const BASH_INPUT_RE = /^<bash-input>([\s\S]*)<\/bash-input>\s*$/;
-const BASH_OUTPUT_RE = /^<bash-stdout>[\s\S]*?<\/bash-stdout><bash-stderr>([\s\S]*?)<\/bash-stderr>\s*$/;
+const BASH_OUTPUT_RE = /^<bash-stdout>([\s\S]*?)<\/bash-stdout><bash-stderr>([\s\S]*?)<\/bash-stderr>\s*$/;
 
 function parseBashInput(text: string): string | null {
   if (!text.startsWith("<bash-input>")) return null;
@@ -90,10 +91,10 @@ function parseBashInput(text: string): string | null {
   return m ? m[1]! : null;
 }
 
-function parseBashOutput(text: string): { isError: boolean } | null {
+function parseBashOutput(text: string): { isError: boolean; output: string | null } | null {
   if (!text.startsWith("<bash-stdout>")) return null;
   const m = text.match(BASH_OUTPUT_RE);
-  return m ? { isError: m[1]!.length > 0 } : null;
+  return m ? { isError: m[2]!.length > 0, output: toolOutputText({ stdout: m[1]!, stderr: m[2]! }) } : null;
 }
 
 /**
@@ -188,7 +189,7 @@ function isHarnessNoise(text: string): boolean {
 type UserText =
   | { kind: "human"; text: string }
   | { kind: "bash-input"; command: string }
-  | { kind: "bash-output"; isError: boolean }
+  | { kind: "bash-output"; isError: boolean; output: string | null }
   | { kind: "peer"; message: PeerMessage }
   | { kind: "command"; text: string }
   | { kind: "noise" };
@@ -197,7 +198,7 @@ function classifyUserText(text: string): UserText {
   const command = parseBashInput(text);
   if (command !== null) return { kind: "bash-input", command };
   const output = parseBashOutput(text);
-  if (output !== null) return { kind: "bash-output", isError: output.isError };
+  if (output !== null) return { kind: "bash-output", isError: output.isError, output: output.output };
   if (isHarnessNoise(text)) return { kind: "noise" };
   const slash = parseSlashCommand(text);
   if (slash !== null) return { kind: "command", text: slash };
@@ -428,7 +429,10 @@ export function readTranscript(
           }
           case "bash-output":
             if (pendingBashUuid !== null) {
-              events.push({ type: "tool_finished", payload: { toolUseId: pendingBashUuid, isError: u.isError } });
+              events.push({
+                type: "tool_finished",
+                payload: { toolUseId: pendingBashUuid, isError: u.isError, ...(u.output === null ? {} : clipToolOutput(u.output)) },
+              });
               pendingBashUuid = null;
             }
             break;
@@ -467,7 +471,7 @@ export function readTranscript(
         }
         events.push({
           type: "tool_finished",
-          payload: { toolUseId: b.tool_use_id, isError: b.is_error ?? false },
+          payload: { toolUseId: b.tool_use_id, isError: b.is_error ?? false, ...toolOutputPayload(b.content) },
         });
       }
       continue;

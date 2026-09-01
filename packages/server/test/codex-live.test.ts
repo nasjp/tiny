@@ -64,6 +64,7 @@ describe("codex-live", () => {
     expect(read1.events.map((e) => e.type)).toEqual(["user_message", "tool_started", "tool_finished", "assistant_thinking"]);
     expect(read1.events[0]!.payload).toEqual({ text: "fix the failing test" });
     expect(read1.events[1]!.payload).toMatchObject({ toolName: "exec", toolUseId: "call_1", kind: "execute", summary: "echo hi" });
+    expect(read1.events[2]!.payload).toEqual({ toolUseId: "call_1", isError: false, output: "hi" });
     expect(read1.events[3]!.payload).toEqual({ text: "Looking at the test first." });
     expect(read1.turn).toEqual({ startedAt: "2026-08-29T15:00:05.000Z", outputTokens: 81, open: true });
     expect(read1.title).toBe("fix the failing test");

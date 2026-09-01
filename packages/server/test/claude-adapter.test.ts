@@ -66,13 +66,14 @@ describe("ClaudeAdapter", () => {
         { type: "text", text: "Thinking it over" },
         { type: "tool_use", id: "tu1", name: "Read", input: { file_path: "/a" } },
       ] } },
-      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", is_error: false }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", is_error: false, content: "1\tline one" }] } },
       RESULT,
     ], capture) as any);
     const { p, events } = baseParams();
     const result = await adapter.runTurn(p);
 
     expect(result).toEqual({ agentSessionId: "sess-uuid-1", costUsd: 0.12, resultText: "done" });
+    expect(events[3]!.payload).toEqual({ toolUseId: "tu1", isError: false, output: "1\tline one" });
     expect(events.map((e) => e.type)).toEqual([
       "turn_started", "assistant_text", "tool_started", "tool_finished", "turn_completed",
     ]);

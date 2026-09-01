@@ -54,7 +54,7 @@ describe("opencode-live", () => {
     }, [
       { type: "step-start" },
       { type: "reasoning", text: "Simple request.", time: { start: 1, end: 2 } },
-      { type: "tool", tool: "bash", callID: "call_1", state: { status: "completed", input: { command: "pnpm test" }, title: "pnpm test" } },
+      { type: "tool", tool: "bash", callID: "call_1", state: { status: "completed", input: { command: "pnpm test" }, title: "pnpm test", output: "42 passed" } },
       { type: "text", text: "All green." },
       { type: "step-finish", tokens: { output: 47 } },
     ]);
@@ -63,6 +63,7 @@ describe("opencode-live", () => {
       "user_message", "assistant_thinking", "tool_started", "tool_finished", "assistant_text",
     ]);
     expect(r1.events[2]!.payload).toMatchObject({ toolName: "bash", toolUseId: "call_1", summary: "pnpm test" });
+    expect(r1.events[3]!.payload).toEqual({ toolUseId: "call_1", isError: false, output: "42 passed" });
     expect(r1.turn).toEqual({ startedAt: "1970-01-01T00:00:01.000Z", outputTokens: 47, open: false });
     expect(r1.title).toBe("fix the tests");
 
