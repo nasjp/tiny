@@ -194,4 +194,31 @@ final class ToolActivityTests: XCTestCase {
         XCTAssertEqual(id, 9)
         XCTAssertEqual(pairs, [QAPair(question: "Which goal?", answer: "production")])
     }
+
+    func testChosenAnswersWinOverTheCancelledPromptWhicheverArrivesFirst() {
+        // Answering from the phone makes the CLI cancel its own prompt, which it records as a
+        // rejection. Either order must leave one card, showing what was chosen (device report:
+        // three answers all read "Dismissed in the CLI")
+        func question(_ id: Int) -> EventRecord {
+            ev(id, "cli_question", .object([
+                "toolUseId": .string("t1"),
+                "input": .object(["questions": .array([.object([
+                    "question": .string("Which goal?"), "header": .string("Goal"),
+                    "multiSelect": .bool(false),
+                    "options": .array([.object(["label": .string("staging"), "description": .string("")])]),
+                ])])]),
+            ]))
+        }
+        let dismissal = ev(2, "cli_question_answered", .object([
+            "toolUseId": .string("t1"), "answers": .object([:]), "rejected": .bool(true)]))
+        let answer = ev(3, "cli_question_answered", .object([
+            "toolUseId": .string("t1"), "answers": .object(["Which goal?": .string("staging")])]))
+
+        for events in [[question(1), dismissal, answer], [question(1), answer, dismissal]] {
+            let items = buildChatItems(events)
+            XCTAssertEqual(items.count, 1, "\(items)")
+            guard case .qa(_, let pairs) = items[0] else { return XCTFail("\(items[0])") }
+            XCTAssertEqual(pairs, [QAPair(question: "Which goal?", answer: "staging")])
+        }
+    }
 }

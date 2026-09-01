@@ -720,15 +720,25 @@ export class SessionManager extends EventEmitter {
     // pick up the reply, so the answer only has to reach the socket
     if (live) {
       const content = wrapForPeer(text, { name: "tiny", mode: this.deps.peer!.mode(s, target) });
-      await this.deps.peer!.send(s, target, {
-        agentSessionId: s.agentSessionId!, msgId: crypto.randomUUID(), content, priority: "now",
-      });
+      // Claimed BEFORE the send: the CLI writes its rejection the instant the frame lands, and any
+      // concurrent import (the phone has the chat open, so the stream syncs every 1.5s) would
+      // otherwise turn that into a "Dismissed in the CLI" card ahead of the answer (device report)
+      this.claimRejectedEcho(id, toolUseId);
+      try {
+        await this.deps.peer!.send(s, target, {
+          agentSessionId: s.agentSessionId!, msgId: crypto.randomUUID(), content, priority: "now",
+        });
+      } catch (err) {
+        this.releaseRejectedEcho(id, toolUseId);
+        throw err;
+      }
       this.recordPhoneAnswer(id, toolUseId, answers);
       return;
     }
     // The CLI asked on its own. Answering starts a live turn, so the phone sees it run and gets the
     // reply, exactly as sending a message from the phone does
     if (this.running.has(id)) throw new ConflictError("a turn is already running");
+    this.claimRejectedEcho(id, toolUseId);
     this.launchTurn(s, text, undefined, null, { priority: "now", question: { toolUseId, answers } });
   }
 
@@ -782,13 +792,26 @@ export class SessionManager extends EventEmitter {
     return true;
   }
 
-  private recordPhoneAnswer(id: string, toolUseId: string, answers: Record<string, string>): void {
+  /** From here on, the CLI's rejection of this question is our own doing and must not be shown */
+  private claimRejectedEcho(id: string, toolUseId: string): void {
     let ids = this.phoneAnswered.get(id);
     if (!ids) {
       ids = new Set();
       this.phoneAnswered.set(id, ids);
     }
     ids.add(toolUseId);
+  }
+
+  /** The answer never reached the CLI: a rejection over there is the person's, and belongs on screen */
+  private releaseRejectedEcho(id: string, toolUseId: string): void {
+    const ids = this.phoneAnswered.get(id);
+    if (!ids) return;
+    ids.delete(toolUseId);
+    if (ids.size === 0) this.phoneAnswered.delete(id);
+  }
+
+  private recordPhoneAnswer(id: string, toolUseId: string, answers: Record<string, string>): void {
+    this.claimRejectedEcho(id, toolUseId);
     this.emitEvent(id, "cli_question_answered", { toolUseId, answers });
   }
 
@@ -1089,6 +1112,8 @@ export class SessionManager extends EventEmitter {
         });
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
+        // Nothing reached the CLI, so nothing over there was cancelled: let a real dismissal through again
+        if (send?.question) this.releaseRejectedEcho(s.id, send.question.toolUseId);
         this.emitEvent(s.id, "turn_failed", { error: `could not reach the CLI: ${reason}` });
         return;
       }

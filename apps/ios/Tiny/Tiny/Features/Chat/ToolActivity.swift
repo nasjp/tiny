@@ -121,8 +121,9 @@ func buildChatItems(_ events: [EventRecord], answeringNow: String? = nil) -> [Ch
     // Where a CLI question's read-only card sits in `out`, so the answer replaces it in place
     // instead of leaving the question hanging above its own answer
     var cliQuestionAt: [String: Int] = [:]
-    // Questions that already have an answer card, so a second answer for the same question is dropped
-    var answeredQuestions: Set<String> = []
+    // Where each question's answer card sits in `out`, so a second answer for the same question
+    // updates that card instead of adding another one
+    var answeredQuestionAt: [String: Int] = [:]
 
     func flushTools() {
         if !current.isEmpty {
@@ -188,9 +189,6 @@ func buildChatItems(_ events: [EventRecord], answeringNow: String? = nil) -> [Ch
             cliQuestionAt[toolUseId] = out.count
             out.append(.cliQuestion(id: ev.id, toolUseId: toolUseId, questions: qs))
         case .cliQuestionAnswered(let toolUseId, let answers, let rejected):
-            // The CLI writes its own record of a question the phone already answered (its prompt was
-            // cancelled to deliver the answer). One answer card per question, whoever answered it
-            if !answeredQuestions.insert(toolUseId).inserted { continue }
             let asked = askedQuestions[toolUseId] ?? []
             let order = asked.isEmpty ? answers.keys.sorted() : asked.map(\.question)
             var pairs = order.compactMap { q in
@@ -203,14 +201,23 @@ func buildChatItems(_ events: [EventRecord], answeringNow: String? = nil) -> [Ch
                 .sorted { $0.key < $1.key }
                 .map { QAPair(question: $0.key, answer: $0.value) }
             if pairs.isEmpty { continue }
+            // The CLI writes its own record of a question the phone already answered (its prompt
+            // was cancelled to deliver the answer), and the two can arrive in either order. One
+            // card per question, and chosen answers always win over that cancellation
+            if let at = answeredQuestionAt[toolUseId] {
+                if !answers.isEmpty, case .qa(let id, _) = out[at] { out[at] = .qa(id: id, pairs: pairs) }
+                continue
+            }
             // Replace the read-only card in place when it is still on screen; a card whose question
             // fell outside the imported window is simply appended here
             if let at = cliQuestionAt[toolUseId], case .cliQuestion(let id, _, _) = out[at] {
                 out[at] = .qa(id: id, pairs: pairs)
                 cliQuestionAt[toolUseId] = nil
+                answeredQuestionAt[toolUseId] = at
             } else {
                 flushTools()
                 flushStateRun()
+                answeredQuestionAt[toolUseId] = out.count
                 out.append(.qa(id: ev.id, pairs: pairs))
             }
         case .turnStarted, .unknown:
