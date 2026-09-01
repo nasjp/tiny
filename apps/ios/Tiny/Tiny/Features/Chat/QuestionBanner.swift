@@ -15,9 +15,11 @@ struct QuestionBanner: View {
     @State private var otherExpanded: Set<Int> = []
     @State private var otherDrafts: [Int: String] = [:]
     @FocusState private var otherFocus: Int?
-    // Current carousel page and travel direction (used for the slide direction)
+    // Current carousel page, the live drag on the strip, and what each page and the card measure
     @State private var page = 0
-    @State private var forward = true
+    @State private var drag: CGFloat = 0
+    @State private var cardWidth: CGFloat = 0
+    @State private var pageHeights: [Int: CGFloat] = [:]
 
     /// The questions to ask. Both sources land here: a permission tiny drove itself, and a
     /// cli_question the CLI asked on its own
@@ -52,10 +54,13 @@ struct QuestionBanner: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
+                // Crossfade with the slide instead of snapping a beat ahead of it
                 Text(currentHeader).font(.subheadline).foregroundStyle(Color.tInkSub)
+                    .contentTransition(.opacity)
                 if questions.count > 1 {
                     Text("\(page + 1) / \(questions.count)")
                         .font(.caption).foregroundStyle(Color.tInkSub)
+                        .contentTransition(.opacity)
                 }
                 Spacer()
                 Button { onDismiss() } label: {
@@ -67,16 +72,10 @@ struct QuestionBanner: View {
                 }
                 .accessibilityIdentifier("questionDismissButton")
             }
-            // Show only the current question. Content-sized when it fits; scrolls only when long
-            ViewThatFits(in: .vertical) {
-                currentQuestion
-                ScrollView { currentQuestion }.frame(maxHeight: 380)
-            }
-            .clipped()   // keep the push transition's slide inside the card
+            carousel
             HStack {
                 if page > 0 {
                     Button {
-                        forward = false
                         withAnimation(.spring(duration: 0.35)) { page -= 1 }
                     } label: {
                         Image(systemName: "chevron.left")
@@ -121,16 +120,83 @@ struct QuestionBanner: View {
         .padding(.top, 4)
     }
 
-    private var currentQuestion: some View {
-        questionSection(page)
-            .id(page)   // break view identity on page change so the push transition kicks in
-            .transition(.push(from: forward ? .trailing : .leading))
-            .frame(maxWidth: .infinity, alignment: .leading)
+    /// Every question laid side by side, the strip slid to the current one — a real carousel.
+    /// It replaced `.transition(.push)`: inside `ViewThatFits` that transition never animated
+    /// (a UI test watching the frames saw the next question appear with no travel at all), which
+    /// is what made answering a question set feel like a hard cut
+    private var carousel: some View {
+        VStack(spacing: 0) {
+            // Color is flexible, so it reports the width the card gives its content
+            Color.clear.frame(height: 0)
+                .background(GeometryReader { g in
+                    Color.clear.preference(key: CardWidthKey.self, value: g.size.width)
+                })
+            HStack(alignment: .top, spacing: 0) {
+                ForEach(questions.indices, id: \.self) { qi in
+                    page(qi)
+                }
+            }
+            .offset(x: QuestionCarousel.offset(page: page, drag: drag, width: cardWidth))
+            .frame(width: cardWidth, alignment: .leading)
+        }
+        .frame(height: visibleHeight)
+        .clipped()
+        .contentShape(Rectangle())
+        // Swipe between questions. Only where the page fits: a page that scrolls needs the
+        // vertical drag for itself, and two competing gestures make both feel broken
+        .gesture(swipe, including: needsScroll(page) ? .subviews : .all)
+        .onPreferenceChange(CardWidthKey.self) { cardWidth = $0 }
+        .onPreferenceChange(PageHeightKey.self) { heights in
+            for (qi, h) in heights where h > 0 { pageHeights[qi] = h }
+        }
+    }
+
+    /// Height of the card's question area: the current page's own height, capped so a long
+    /// question scrolls inside the card instead of pushing the buttons off screen
+    private var visibleHeight: CGFloat? {
+        let h = pageHeights[page] ?? 0
+        return h == 0 ? nil : min(h, QuestionCarousel.maxPageHeight)
+    }
+
+    private func needsScroll(_ qi: Int) -> Bool {
+        (pageHeights[qi] ?? 0) > QuestionCarousel.maxPageHeight
+    }
+
+    @ViewBuilder
+    private func page(_ qi: Int) -> some View {
+        let content = questionSection(qi)
+            .background(GeometryReader { g in
+                Color.clear.preference(key: PageHeightKey.self, value: [qi: g.size.height])
+            })
+        Group {
+            if needsScroll(qi) {
+                ScrollView { content }
+            } else {
+                content
+            }
+        }
+        .frame(width: cardWidth, alignment: .topLeading)
+    }
+
+    private var swipe: some Gesture {
+        DragGesture(minimumDistance: 12)
+            .onChanged { v in
+                guard abs(v.translation.width) > abs(v.translation.height) else { return }
+                drag = QuestionCarousel.rubberBanded(v.translation.width, page: page,
+                                                     count: questions.count, width: cardWidth)
+            }
+            .onEnded { v in
+                let target = QuestionCarousel.target(page: page, translation: v.translation.width,
+                                                     width: cardWidth, count: questions.count)
+                withAnimation(.spring(duration: 0.35)) {
+                    page = target
+                    drag = 0
+                }
+            }
     }
 
     private func advance() {
         guard !isLastPage else { return }
-        forward = true
         withAnimation(.spring(duration: 0.35)) { page += 1 }
     }
 
@@ -232,6 +298,47 @@ struct QuestionBanner: View {
             if !labels.isEmpty { out[q.question] = labels.joined(separator: ", ") }
         }
         return out
+    }
+}
+
+/// The carousel's arithmetic, kept out of the view so it can be tested without a screen
+enum QuestionCarousel {
+    /// A page taller than this scrolls inside the card instead of growing it
+    static let maxPageHeight: CGFloat = 380
+
+    static func offset(page: Int, drag: CGFloat, width: CGFloat) -> CGFloat {
+        -CGFloat(page) * width + drag
+    }
+
+    /// Dragging past the first or last question pulls against a spring instead of tearing the
+    /// strip off the card
+    static func rubberBanded(_ translation: CGFloat, page: Int, count: Int, width: CGFloat) -> CGFloat {
+        let atStart = page == 0 && translation > 0
+        let atEnd = page >= count - 1 && translation < 0
+        return atStart || atEnd ? translation * 0.35 : translation
+    }
+
+    /// Where a swipe lands: a quarter of the card's width is enough to turn the page
+    static func target(page: Int, translation: CGFloat, width: CGFloat, count: Int) -> Int {
+        let threshold = max(width * 0.25, 40)
+        if translation <= -threshold { return min(page + 1, count - 1) }
+        if translation >= threshold { return max(page - 1, 0) }
+        return page
+    }
+}
+
+private struct CardWidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let next = nextValue()
+        if next > 0 { value = next }
+    }
+}
+
+private struct PageHeightKey: PreferenceKey {
+    static let defaultValue: [Int: CGFloat] = [:]
+    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+        value.merge(nextValue()) { _, new in new }
     }
 }
 
