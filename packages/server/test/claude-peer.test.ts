@@ -82,6 +82,13 @@ describe("claude-peer: readPeerStatus", () => {
     expect(readPeerStatus(root, target, alwaysAlive)).toEqual({ status: "idle", waitingFor: null });
   });
 
+  it("carries the time of the status change when the entry records it", () => {
+    writeEntry(root, 111, entry(111, { status: "idle", statusUpdatedAt: 1788272896588 }));
+    expect(readPeerStatus(root, target, alwaysAlive)).toEqual({ status: "idle", waitingFor: null, since: 1788272896588 });
+    writeEntry(root, 111, entry(111, { status: "busy", statusUpdatedAt: "soon" }));
+    expect(readPeerStatus(root, target, alwaysAlive)).toEqual({ status: "busy", waitingFor: null });
+  });
+
   it("is null when the process is gone or the registry entry was removed (a clean exit)", () => {
     writeEntry(root, 111, entry(111));
     expect(readPeerStatus(root, target, neverAlive)).toBeNull();

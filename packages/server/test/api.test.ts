@@ -72,7 +72,7 @@ describe("REST API", () => {
     };
     manager = new SessionManager({
       stores, profilesDir, adapters: { claude: okAdapter }, broker: new PermissionBroker(1000), outbox,
-      isCliLive, cliState: () => cliState, peer, liveTiming: { pollMs: 10, deliveryTimeoutMs: 50, maxTurnMs: 500 },
+      isCliLive, cliState: () => cliState, peer, liveTiming: { pollMs: 10, deliveryTimeoutMs: 50, idleSettleMs: 30 },
     });
     auth = new AuthService(stores, path.join(home, "secret"));
     token = auth.cliToken();
