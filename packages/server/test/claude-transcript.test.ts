@@ -669,6 +669,9 @@ describe("claude-transcript AskUserQuestion", () => {
       message: { content: [{ type: "tool_use", id, name: "AskUserQuestion", input: QUESTION_INPUT }] },
     };
   }
+  const human = (uuid: string, text: string): Record<string, unknown> => ({
+    type: "user", uuid, message: { role: "user", content: text },
+  });
 
   it("emits cli_question instead of tool_started for the question", () => {
     const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
@@ -740,6 +743,64 @@ describe("claude-transcript AskUserQuestion", () => {
     const r = readTranscript(file, { sinceUuid: "a1", openQuestions: ["t1"] });
     expect(r.events.map((e) => e.type)).toEqual(["cli_question_answered"]);
     expect(r.events[0]!.payload).toEqual({ toolUseId: "t1", answers: {}, rejected: true });
+  });
+
+  // A question the hook announced while nobody was importing the transcript (no cursor yet, or a
+  // cursor the file no longer has). The answer is written long before the window a first read
+  // covers, and the phone's card would otherwise wait forever
+  it("answers an open question whose record lies before the backfill window", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      ask("a1", "t1"),
+      {
+        type: "user", uuid: "u1",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "Your questions have been answered" }] },
+        toolUseResult: { questions: QUESTION_INPUT.questions, answers: { "Which goal?": "staging" }, annotations: {} },
+      },
+      ...[1, 2, 3, 4, 5, 6].map((n) => human(`h${n}`, `turn ${n}`)),
+    ]);
+    const r = readTranscript(file, { turns: 5, openQuestions: ["t1"] });
+    const answered = r.events.filter((e) => e.type === "cli_question_answered");
+    expect(answered).toEqual([{ type: "cli_question_answered", payload: { toolUseId: "t1", answers: { "Which goal?": "staging" } } }]);
+    // It happened before everything in the window, so it comes first
+    expect(r.events[0]!.type).toBe("cli_question_answered");
+    expect(r.events.filter((e) => e.type === "user_message")).toHaveLength(5);
+  });
+
+  it("closes an open question that was dismissed before the backfill window", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      ask("a1", "t1"),
+      {
+        type: "user", uuid: "u1",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", is_error: true }] },
+        toolUseResult: "User rejected tool use",
+      },
+      ...[1, 2, 3, 4, 5, 6].map((n) => human(`h${n}`, `turn ${n}`)),
+    ]);
+    const r = readTranscript(file, { turns: 5, openQuestions: ["t1"] });
+    expect(r.events[0]).toEqual({ type: "cli_question_answered", payload: { toolUseId: "t1", answers: {}, rejected: true } });
+  });
+
+  it("answers an open question even when the cursor is no longer in the file", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [
+      ask("a1", "t1"),
+      {
+        type: "user", uuid: "u1",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "Your questions have been answered" }] },
+        toolUseResult: { questions: QUESTION_INPUT.questions, answers: { "Which goal?": "production" }, annotations: {} },
+      },
+    ]);
+    const r = readTranscript(file, { sinceUuid: "gone", openQuestions: ["t1"] });
+    expect(r.events).toEqual([{ type: "cli_question_answered", payload: { toolUseId: "t1", answers: { "Which goal?": "production" } } }]);
+  });
+
+  it("leaves an open question open when the transcript has no result for it yet", () => {
+    const file = path.join(root, "projects", "-srv-a-x", `${SID}.jsonl`);
+    writeJsonl(file, [ask("a1", "t1"), ...[1, 2, 3, 4, 5, 6].map((n) => human(`h${n}`, `turn ${n}`))]);
+    const r = readTranscript(file, { turns: 5, openQuestions: ["t1"] });
+    expect(r.events.some((e) => e.type === "cli_question_answered")).toBe(false);
   });
 
   it("leaves ordinary tool results alone", () => {

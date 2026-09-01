@@ -1603,6 +1603,46 @@ describe("SessionManager", () => {
         expect(seen[1]!.payload).toEqual({ toolUseId: "tu-9", answers: { "Which goal?": "staging" } });
       });
 
+      it("closes a hook question answered in the CLI long before the transcript's first import", () => {
+        // Seen on a real session: adopted at SessionStart (no transcript yet, so no cursor), the hook
+        // put the question on the phone, the person answered it at the Mac, and the phone only came
+        // back hours later. That first import covers the newest turns, and the answer was far behind
+        // them — the card sat on the phone forever
+        const { peer } = fakePeer();
+        const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+        const { session, file } = liveSession(manager, home, "agent-hook");
+        const seen: EventRecord[] = [];
+        manager.on("event", (e) => seen.push(e));
+
+        const input = { questions: [{ question: "Which goal?", header: "Goal", multiSelect: false, options: [] }] };
+        expect(manager.recordCliQuestion("agent-hook", "tu-9", input)).toBe(true);
+
+        const later = [1, 2, 3, 4, 5, 6, 7].flatMap((n) => [
+          { type: "user", uuid: `h${n}`, message: { role: "user", content: `turn ${n}` } },
+          assistantRecord(`reply ${n}`),
+        ]);
+        fs.writeFileSync(file, jsonl([
+          {
+            type: "assistant", uuid: "q1",
+            message: { content: [{ type: "tool_use", id: "tu-9", name: "AskUserQuestion", input }] },
+          },
+          {
+            type: "user", uuid: "r1",
+            message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-9" }] },
+            toolUseResult: { questions: input.questions, answers: { "Which goal?": "staging" } },
+          },
+          ...later,
+        ]));
+        manager.syncTranscript(session.id);
+        const answered = seen.filter((e) => e.type === "cli_question_answered");
+        expect(answered.map((e) => e.payload)).toEqual([{ toolUseId: "tu-9", answers: { "Which goal?": "staging" } }]);
+        // and it is closed for good: the next import does not answer it again
+        fs.appendFileSync(file, jsonl([assistantRecord("one more")]));
+        manager.syncTranscript(session.id);
+        expect(seen.filter((e) => e.type === "cli_question_answered")).toHaveLength(1);
+        expect(seen.filter((e) => e.type === "cli_question")).toHaveLength(1);
+      });
+
       it("reports nothing for a session tiny does not know", () => {
         const { peer } = fakePeer();
         const { manager } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer } });
