@@ -38,8 +38,6 @@ export async function startServer(env: Record<string, string | undefined> = proc
   ensureDirs(paths);
   const db = openDb(paths.dbFile);
   const stores = createStores(db);
-  const fixed = stores.sessions.fixupRunning();
-  if (fixed > 0) console.log(`[tinyd] corrected ${fixed} running session(s) to interrupted`);
 
   const broker = new PermissionBroker();
   const outbox = new FileOutbox(paths.outboxDir, stores.files);
@@ -153,6 +151,10 @@ export async function startServer(env: Record<string, string | undefined> = proc
     externalBusy,
     liveScanEnabled: (name) => readProfileLive(paths.profilesDir, name),
   });
+
+  // Turns the previous tinyd was driving. Closed before push (or anyone) listens, so nothing is notified
+  const recovered = manager.recoverAfterRestart();
+  if (recovered > 0) console.log(`[tinyd] closed ${recovered} turn(s) left open by the previous tinyd`);
 
   // Settings are reloaded on every delivery, so `tiny push config` changes take effect without a restart.
   const push = new PushClient({ stores, settings: () => loadSettings(paths, env) });

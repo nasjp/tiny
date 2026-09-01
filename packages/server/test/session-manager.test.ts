@@ -2024,3 +2024,71 @@ describe("SessionManager external sessions (Step 3 Wave 1)", () => {
     expect(manager.scanExternalSessions()).toBe(0);
   });
 });
+
+// A restart of tinyd loses every turn it was driving. What the phone must be told depends on who
+// was actually doing the work
+describe("SessionManager restart recovery", () => {
+  function runningSession(manager: SessionManager, stores: ReturnType<typeof createStores>, home: string, agentSessionId: string) {
+    const { session } = liveSession(manager, home, agentSessionId);
+    // What the previous tinyd left behind: status running, a turn_started with nothing closing it
+    stores.events.append(session.id, "user_message", { text: "hello" });
+    stores.events.append(session.id, "turn_started", { agentSessionId });
+    stores.sessions.patch(session.id, { status: "running" });
+    return session;
+  }
+
+  it("closes a turn the CLI still holds as completed — the CLI kept working through the restart", () => {
+    const { peer } = fakePeer();
+    const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer } });
+    const session = runningSession(manager, stores, home, "agent-live");
+    const seen: EventRecord[] = [];
+    manager.on("event", (e) => seen.push(e));
+    expect(manager.recoverAfterRestart()).toBe(1);
+    expect(seen.map((e) => e.type)).toEqual(["turn_completed"]);
+    expect(seen[0]!.payload).toEqual({ costUsd: null, resultText: null });
+    expect(stores.sessions.get(session.id)!.status).toBe("idle");
+  });
+
+  it("closes tiny's own turn as interrupted — its child died with the daemon", () => {
+    const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => false } });
+    const session = runningSession(manager, stores, home, "agent-own");
+    const seen: EventRecord[] = [];
+    manager.on("event", (e) => seen.push(e));
+    expect(manager.recoverAfterRestart()).toBe(1);
+    expect(seen.map((e) => e.type)).toEqual(["turn_failed"]);
+    expect(seen[0]!.payload).toEqual({ error: "interrupted" });
+    expect(stores.sessions.get(session.id)!.status).toBe("idle");
+  });
+
+  it("repairs a session an older tinyd left as interrupted with its turn still open", () => {
+    const { peer } = fakePeer();
+    const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer } });
+    const session = runningSession(manager, stores, home, "agent-old");
+    stores.sessions.patch(session.id, { status: "interrupted" });
+    const seen: EventRecord[] = [];
+    manager.on("event", (e) => seen.push(e));
+    expect(manager.recoverAfterRestart()).toBe(1);
+    expect(seen.map((e) => e.type)).toEqual(["turn_completed"]);
+    expect(stores.sessions.get(session.id)!.status).toBe("idle");
+  });
+
+  it("only sets the status right when the turn was already closed in the log", () => {
+    const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => false } });
+    const session = runningSession(manager, stores, home, "agent-closed");
+    stores.events.append(session.id, "turn_completed", { costUsd: null, resultText: "done" });
+    const seen: EventRecord[] = [];
+    manager.on("event", (e) => seen.push(e));
+    expect(manager.recoverAfterRestart()).toBe(1);
+    expect(seen).toEqual([]);
+    expect(stores.sessions.get(session.id)!.status).toBe("idle");
+  });
+
+  it("leaves idle sessions alone", () => {
+    const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer: fakePeer().peer } });
+    liveSession(manager, home, "agent-idle");
+    const seen: EventRecord[] = [];
+    manager.on("event", (e) => seen.push(e));
+    expect(manager.recoverAfterRestart()).toBe(0);
+    expect(seen).toEqual([]);
+  });
+});

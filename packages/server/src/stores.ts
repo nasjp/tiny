@@ -87,9 +87,6 @@ export function createStores(db: Database.Database) {
     renameProfile(from: string, to: string): number {
       return db.prepare(`UPDATE sessions SET profile = ? WHERE profile = ?`).run(to, from).changes;
     },
-    fixupRunning(): number {
-      return db.prepare(`UPDATE sessions SET status = 'interrupted' WHERE status = 'running'`).run().changes;
-    },
     byAgentSessionId(agentSessionId: string): SessionRecord | null {
       const row = db.prepare(`SELECT * FROM sessions WHERE agent_session_id = ? ORDER BY created_at ASC LIMIT 1`)
         .get(agentSessionId) as SessionRow | undefined;
