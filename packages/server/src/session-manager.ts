@@ -58,11 +58,16 @@ export interface LiveTiming {
   pollMs: number;
   /** How long the CLI may sit idle without recording our message before we call it dropped */
   deliveryTimeoutMs: number;
-  /** Hard stop for one live turn */
-  maxTurnMs: number;
+  /**
+   * How long the CLI may sit idle after recording our message before that idle counts as the turn
+   * being over, when neither a reply nor the registry's own clock has said so yet
+   */
+  idleSettleMs: number;
 }
 
-const DEFAULT_LIVE_TIMING: LiveTiming = { pollMs: 1000, deliveryTimeoutMs: 60_000, maxTurnMs: 30 * 60_000 };
+// No overall cap: a CLI that is busy is working, however long it takes, and the registry (plus the
+// process itself) is what says when it is not. Every way a turn can end is evidence-based
+const DEFAULT_LIVE_TIMING: LiveTiming = { pollMs: 1000, deliveryTimeoutMs: 60_000, idleSettleMs: 5000 };
 
 export interface SessionManagerDeps {
   stores: Stores;
@@ -116,6 +121,10 @@ interface LiveTurn {
   sawResponse: boolean;
   /** Since when the CLI has been idle without having recorded our message (null while busy / delivered) */
   idleUndeliveredSince: number | null;
+  /** Since when the CLI has been idle after recording our message (null while busy / undelivered) */
+  idleDeliveredSince: number | null;
+  /** Since when the registry entry has been unreadable (null while it reads) */
+  unknownSince: number | null;
   lastStatus: PeerStatus["status"] | null;
   /** msg_id of the Stop message sent on interrupt(); the turn ends as "interrupted" once the CLI took it */
   stopMsgId: string | null;
@@ -1098,7 +1107,8 @@ export class SessionManager extends EventEmitter {
     const timing = this.deps.liveTiming ?? DEFAULT_LIVE_TIMING;
     const live: LiveTurn = {
       msgId: crypto.randomUUID(), target, startedAt: Date.now(), deliveredAt: null,
-      sawResponse: false, idleUndeliveredSince: null, lastStatus: null, stopMsgId: null, stopDeliveredAt: null,
+      sawResponse: false, idleUndeliveredSince: null, idleDeliveredSince: null, unknownSince: null,
+      lastStatus: null, stopMsgId: null, stopDeliveredAt: null,
       stopFailure: null, lastAssistantText: null,
     };
     this.liveTurns.set(s.id, live);
@@ -1167,23 +1177,27 @@ export class SessionManager extends EventEmitter {
     // syncTranscript caller cannot steal it) — this call only advances the cursor and, if this tick
     // is the one that catches it, updates that evidence. Read `live.*` below, not the return value
     this.importTranscript(s.id);
-    const outOfTime = (): { type: "turn_failed"; payload: Record<string, unknown> } => ({
-      type: "turn_failed",
-      payload: { error: `no response from the CLI in ${Math.round(timing.maxTurnMs / 60_000)} minutes` },
-    });
 
     const st = this.deps.peer!.status(s, live.target);
     if (st === null) return { type: "turn_failed", payload: { error: "the CLI closed" } };
     // Stop was tapped but never reached the CLI. The turn is still running over there, yet the
-    // person is owed an answer now rather than at the 30-minute backstop
+    // person is owed an answer now rather than whenever the CLI finishes
     if (live.stopFailure !== null) {
       return { type: "turn_failed", payload: { error: `could not stop the CLI: ${live.stopFailure}` } };
     }
     // "unknown" means the registry entry was caught mid-write, not that the CLI changed state. It
     // carries no information, so the tick must leave every clock and every latch exactly as it was:
     // recording it in lastStatus would make the next readable tick look like a fresh wait, and
-    // treating it as "not idle" would restart the delivery clock on every second tick
-    if (st.status === "unknown") return now - live.startedAt > timing.maxTurnMs ? outOfTime() : null;
+    // treating it as "not idle" would restart the delivery clock on every second tick. Only an entry
+    // that stays unreadable is a verdict: the turn cannot be judged from a broken registry
+    if (st.status === "unknown") {
+      live.unknownSince ??= now;
+      if (now - live.unknownSince > timing.deliveryTimeoutMs) {
+        return { type: "turn_failed", payload: { error: "the CLI's state could not be read" } };
+      }
+      return null;
+    }
+    live.unknownSince = null;
     if (st.status === "waiting" && live.lastStatus !== "waiting") {
       this.emitEvent(s.id, "cli_attention", { reason: st.waitingFor ?? "input" });
     }
@@ -1195,14 +1209,26 @@ export class SessionManager extends EventEmitter {
     if (live.stopMsgId !== null && live.stopDeliveredAt !== null && st.status === "idle") {
       return { type: "turn_failed", payload: { error: "interrupted" } };
     }
-    if (live.deliveredAt !== null && live.sawResponse && st.status === "idle") {
-      return { type: "turn_completed", payload: { costUsd: null, resultText: live.lastAssistantText ?? null } };
+    if (live.deliveredAt !== null && st.status === "idle") {
+      // The CLI marks itself busy BEFORE it writes our message down (measured on 2.1.252: 56ms
+      // earlier) and idle once the reply is written. So idle after delivery is the turn ending. Three
+      // ways to be sure the reading is not older than the delivery: the reply already arrived; the
+      // registry's own clock puts the idle after our delivery; or the CLI has now been idle for a
+      // settle period (covers a turn so short it ended before the poll that noticed the delivery,
+      // and produced nothing we could see)
+      live.idleDeliveredSince ??= now;
+      const idleAfterDelivery = st.since !== undefined && st.since >= live.deliveredAt;
+      if (live.sawResponse || idleAfterDelivery || now - live.idleDeliveredSince >= timing.idleSettleMs) {
+        return { type: "turn_completed", payload: { costUsd: null, resultText: live.lastAssistantText ?? null } };
+      }
+      return null;
     }
+    live.idleDeliveredSince = null;
     // Idle or waiting time counts against delivery: while the CLI is busy with its own turn our
-    // message sits in its queue, and that can legitimately take minutes. "waiting" must count too —
-    // a fresh bypass session with no transcript yet holds an unattested message and reports
-    // status: "waiting" indistinguishably from a real permission prompt, so it would otherwise hang
-    // for the full turn instead of surfacing as a failure
+    // message sits in its queue, and that can legitimately take minutes — or hours; a busy CLI is
+    // never given up on. "waiting" must count too — a fresh bypass session with no transcript yet
+    // holds an unattested message and reports status: "waiting" indistinguishably from a real
+    // permission prompt, so it would otherwise hang instead of surfacing as a failure
     if (live.deliveredAt === null && (st.status === "idle" || st.status === "waiting")) {
       live.idleUndeliveredSince ??= now;
       if (now - live.idleUndeliveredSince > timing.deliveryTimeoutMs) {
@@ -1214,7 +1240,8 @@ export class SessionManager extends EventEmitter {
     } else {
       live.idleUndeliveredSince = null;
     }
-    if (now - live.startedAt > timing.maxTurnMs) return outOfTime();
+    // busy / shell (the person's own `!` command) / waiting for the person at the terminal: the CLI
+    // is doing something, and no clock runs against that. Stop from the phone is the way out
     return null;
   }
 

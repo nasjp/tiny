@@ -1399,19 +1399,74 @@ describe("SessionManager", () => {
       expect(seen.at(-1)!.payload.error).toMatch(/dropped/);
     });
 
-    it("gives up after the maximum turn time when the CLI took the message but never answered", async () => {
+    it("never gives up on a busy CLI — however long it works — and completes once it goes idle", async () => {
       const { peer, sent, setStatus } = fakePeer();
-      setStatus({ status: "busy", waitingFor: null }); // busy forever: no other rule ends this turn
+      setStatus({ status: "busy", waitingFor: null, since: Date.now() });
       const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
-      const { session, file } = liveSession(manager, home, "agent-backstop");
+      const { session, file } = liveSession(manager, home, "agent-long");
       const seen: EventRecord[] = [];
       manager.on("event", (e) => seen.push(e));
       manager.startTurn(session.id, "hello");
       await until(() => sent.length === 1);
-      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId)])); // taken, but never answered
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId)])); // taken; the CLI is now working on it
+      // Far past every other clock (delivery timeout, settle time): still running, because busy is busy
+      await new Promise((r) => setTimeout(r, FAST_LIVE.deliveryTimeoutMs * 3));
+      expect(seen.some((e) => e.type === "turn_failed" || e.type === "turn_completed")).toBe(false);
+      expect(stores.sessions.get(session.id)!.status).toBe("running");
+      fs.appendFileSync(file, jsonl([assistantRecord("finally")]));
+      setStatus({ status: "idle", waitingFor: null, since: Date.now() });
       await manager.waitForIdle(session.id);
-      expect(seen.at(-1)).toMatchObject({ type: "turn_failed" });
-      expect(seen.at(-1)!.payload.error).toMatch(/no response from the CLI/);
+      expect(seen.at(-1)).toMatchObject({ type: "turn_completed", payload: { resultText: "finally" } });
+    });
+
+    it("completes when the CLI goes idle after taking the message, even with no visible reply", async () => {
+      // The registry's own clock puts the idle after our delivery, so the turn is over whatever the
+      // transcript showed (a reply written to a file tiny cannot see, or none at all)
+      const { peer, sent, setStatus } = fakePeer();
+      setStatus({ status: "busy", waitingFor: null, since: Date.now() });
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-silent");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId)]));
+      await new Promise((r) => setTimeout(r, FAST_LIVE.pollMs * 3)); // let the watcher notice the delivery
+      setStatus({ status: "idle", waitingFor: null, since: Date.now() });
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)).toEqual(expect.objectContaining({ type: "turn_completed", payload: { costUsd: null, resultText: null } }));
+    });
+
+    it("does not take an idle reading older than the delivery for the end of the turn until it has settled", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      const stale = Date.now() - 60_000;
+      setStatus({ status: "idle", waitingFor: null, since: stale }); // never updated: the CLI's clock says nothing new
+      const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session, file } = liveSession(manager, home, "agent-stale");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      fs.writeFileSync(file, jsonl([peerRecord(sent[0]!.msgId)]));
+      await until(() => seen.some((e) => e.type === "turn_started"));
+      const deliveredAt = Date.now();
+      await manager.waitForIdle(session.id);
+      // it did end — by the settle clock, not on the first idle tick
+      expect(seen.at(-1)!.type).toBe("turn_completed");
+      expect(Date.now() - deliveredAt).toBeGreaterThanOrEqual(FAST_LIVE.idleSettleMs - FAST_LIVE.pollMs);
+    });
+
+    it("fails the turn when the registry entry stays unreadable", async () => {
+      const { peer, sent, setStatus } = fakePeer();
+      setStatus({ status: "unknown", waitingFor: null });
+      const { manager, stores, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+      const { session } = liveSession(manager, home, "agent-unreadable");
+      const seen: EventRecord[] = [];
+      manager.on("event", (e) => seen.push(e));
+      manager.startTurn(session.id, "hello");
+      await until(() => sent.length === 1);
+      await manager.waitForIdle(session.id);
+      expect(seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "the CLI's state could not be read" } });
       expect(stores.sessions.get(session.id)!.status).toBe("idle");
     });
 
@@ -1685,7 +1740,7 @@ describe("SessionManager", () => {
 });
 
 /** Watcher timings short enough for tests: poll 10ms, give up on delivery after 200ms idle, 2s max */
-const FAST_LIVE = { pollMs: 10, deliveryTimeoutMs: 200, maxTurnMs: 2000 };
+const FAST_LIVE = { pollMs: 10, deliveryTimeoutMs: 200, idleSettleMs: 100 };
 
 function fakePeer(over: Partial<PeerBridge> = {}) {
   const sent: PeerFrame[] = [];

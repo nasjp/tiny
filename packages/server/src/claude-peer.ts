@@ -29,6 +29,8 @@ export interface PeerStatus {
   status: "busy" | "idle" | "waiting" | "shell" | "unknown";
   /** e.g. "permission prompt" while status is waiting */
   waitingFor: string | null;
+  /** When the CLI switched to this status (its own clock, ms since epoch). Absent when the entry does not say */
+  since?: number;
 }
 
 /** peerProtocol values this code understands. A newer Claude Code means we stop guessing */
@@ -97,6 +99,7 @@ export function readPeerStatus(
   return {
     status: e.status as PeerStatus["status"],
     waitingFor: typeof e.waitingFor === "string" ? e.waitingFor : null,
+    ...(typeof e.statusUpdatedAt === "number" ? { since: e.statusUpdatedAt } : {}),
   };
 }
 
