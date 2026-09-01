@@ -22,6 +22,7 @@
 		3260D2F44B1E4EEC4267F5AA /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44541477AF5D068ECE2D35D8 /* NotificationService.swift */; };
 		3452D14C678C42F8AE100111 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 134AD98023026BAC41E60302 /* Models.swift */; };
 		37DDCE186286C604CD002015 /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28FC16244A73C5B2A4252A1C /* PairingView.swift */; };
+		392EF6E1B25F1D4414F7D018 /* QuestionCarouselTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8075B9C9BB0213449C23B3DC /* QuestionCarouselTests.swift */; };
 		3AC0B330E13911985F43263A /* LiveDetachUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDF4C93115340B896EEBADA6 /* LiveDetachUITests.swift */; };
 		3BC98408DF232BDA9A041983 /* SmokeUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 193D6C70421A66AA2E001819 /* SmokeUITests.swift */; };
 		4A2E8516598B7F9A01102532 /* AppModelCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78B6867B39EF17D636C8F5BB /* AppModelCacheTests.swift */; };
@@ -45,6 +46,7 @@
 		886E0D4749083D9BF8BA694B /* SharedKeychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = C99B8BFD3581663C2E62B098 /* SharedKeychain.swift */; };
 		8EE56D5FE80E94D8F5AF679C /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0456A9DF2175BBEDAC8D1772 /* ChatView.swift */; };
 		904AD44CBBFE078BF1007F9D /* ThemeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8C0289B83F48948A7DEF728 /* ThemeTests.swift */; };
+		92A6617C229296CA0FFECD47 /* QuestionCarouselUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D565248A4B1415B841D2D75 /* QuestionCarouselUITests.swift */; };
 		93F25E0141C8019CD0E8DB2A /* PushCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80681FE26187071771FA4EAE /* PushCrypto.swift */; };
 		9A85BA15CDAEFC401B9BEA09 /* OFL-NotoSansJP.txt in Resources */ = {isa = PBXBuildFile; fileRef = 0201B012B2A6882C34DE279E /* OFL-NotoSansJP.txt */; };
 		9C7DE3722C4F9E3C1C1A67CC /* DemoBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1C2F756EAB37DC7DBC3ACDF /* DemoBackend.swift */; };
@@ -148,6 +150,7 @@
 		5243699118A40748D5FB99F6 /* MarkdownTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTextTests.swift; sourceTree = "<group>"; };
 		54034E11E3A77FA8FEBBF02B /* ActivityFormatTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityFormatTests.swift; sourceTree = "<group>"; };
 		5CB885AAC0F2503AAEDB1DC2 /* ArchivedSessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArchivedSessionsView.swift; sourceTree = "<group>"; };
+		5D565248A4B1415B841D2D75 /* QuestionCarouselUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuestionCarouselUITests.swift; sourceTree = "<group>"; };
 		5F465C94EB1C8784D463A1DE /* EventStreamTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventStreamTests.swift; sourceTree = "<group>"; };
 		60EC015CB23473D03C6D1AF7 /* ChatScrollPositionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatScrollPositionTests.swift; sourceTree = "<group>"; };
 		641D55E60406FDC3E8EC79B5 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -160,6 +163,7 @@
 		7B9E275ED5C390172901B7F4 /* OFL-Inter.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "OFL-Inter.txt"; sourceTree = "<group>"; };
 		7DFE20CF39DA8FFB49FE5F5A /* EventRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventRow.swift; sourceTree = "<group>"; };
 		80681FE26187071771FA4EAE /* PushCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushCrypto.swift; sourceTree = "<group>"; };
+		8075B9C9BB0213449C23B3DC /* QuestionCarouselTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuestionCarouselTests.swift; sourceTree = "<group>"; };
 		825FB5D4A11434EE6064C548 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		8B11078F35F48A669A6F133A /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		8B99BB40B42A005338884113 /* MessageCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageCopyTests.swift; sourceTree = "<group>"; };
@@ -199,6 +203,7 @@
 			isa = PBXGroup;
 			children = (
 				FDF4C93115340B896EEBADA6 /* LiveDetachUITests.swift */,
+				5D565248A4B1415B841D2D75 /* QuestionCarouselUITests.swift */,
 				193D6C70421A66AA2E001819 /* SmokeUITests.swift */,
 			);
 			path = TinyUITests;
@@ -299,6 +304,7 @@
 				3A1A1E9ED613F6A2A874AAF8 /* PairingURLTests.swift */,
 				35B0321A3D2C90E0EE2B8F54 /* PairingViewTests.swift */,
 				E9F57F68D7FC615F6A9BE3A6 /* PushCryptoTests.swift */,
+				8075B9C9BB0213449C23B3DC /* QuestionCarouselTests.swift */,
 				D78870A3A7ADD799D0AD9E94 /* SharedKeychainTests.swift */,
 				E8C0289B83F48948A7DEF728 /* ThemeTests.swift */,
 				44471149F4309C3F0EAE8503 /* ToolActivityTests.swift */,
@@ -562,6 +568,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				3AC0B330E13911985F43263A /* LiveDetachUITests.swift in Sources */,
+				92A6617C229296CA0FFECD47 /* QuestionCarouselUITests.swift in Sources */,
 				3BC98408DF232BDA9A041983 /* SmokeUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -600,6 +607,7 @@
 				AF05B916BB4FE45DAF06BE0A /* PairingURLTests.swift in Sources */,
 				1380B7491878207380581B6C /* PairingViewTests.swift in Sources */,
 				EB3B097B2CD18D7160203B47 /* PushCryptoTests.swift in Sources */,
+				392EF6E1B25F1D4414F7D018 /* QuestionCarouselTests.swift in Sources */,
 				E1A460A17D9C99F959977A23 /* SharedKeychainTests.swift in Sources */,
 				904AD44CBBFE078BF1007F9D /* ThemeTests.swift in Sources */,
 				C9DA023658D05B084BF63B99 /* ToolActivityTests.swift in Sources */,
@@ -701,7 +709,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 36;
+				CURRENT_PROJECT_VERSION = 37;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = TS295VKGNA;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -795,7 +803,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 36;
+				CURRENT_PROJECT_VERSION = 37;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = TS295VKGNA;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

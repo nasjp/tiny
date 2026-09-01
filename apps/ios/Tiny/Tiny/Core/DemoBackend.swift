@@ -130,6 +130,47 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
                 self.emit("permission_requested", .object([
                     "reqId": .string(reqId), "toolName": .string("Bash"),
                     "input": .object(["command": .string("npm run build")])]))
+            } else if prompt.lowercased().contains("questions") {
+                // Plural: a three-question set, which is what exercises the carousel
+                let reqId = UUID().uuidString
+                func q(_ text: String, _ header: String, _ a: String, _ b: String) -> JSONValue {
+                    .object([
+                        "question": .string(text), "header": .string(header), "multiSelect": .bool(false),
+                        "options": .array([
+                            .object(["label": .string(a), "description": .string("")]),
+                            .object(["label": .string(b), "description": .string("")]),
+                        ]),
+                    ])
+                }
+                // The last one is deliberately long: a question taller than the card has to scroll
+                // inside it rather than push the buttons off screen
+                let long: JSONValue = .object([
+                    "question": .string("Who reviews it?"), "header": .string("Review"),
+                    "multiSelect": .bool(false),
+                    "options": .array([
+                        .object(["label": .string("You"),
+                                 "description": .string("You read the diff yourself before it ships, the way you would review a teammate's branch.")]),
+                        .object(["label": .string("A teammate"),
+                                 "description": .string("Hand it to whoever owns the module and wait for their pass before merging anything.")]),
+                        .object(["label": .string("Both of us"),
+                                 "description": .string("You read it first, then a second pair of eyes goes over the parts that touch the data model.")]),
+                        .object(["label": .string("Nobody"),
+                                 "description": .string("Ship it and rely on the tests; anything that slips through gets fixed in the next pass.")]),
+                    ]),
+                ])
+                let input: JSONValue = .object(["questions": .array([
+                    q("Which approach should I take?", "Approach", "Quick fix", "Refactor"),
+                    q("Where should it ship?", "Target", "Staging", "Production"),
+                    long,
+                ])])
+                self.queue.sync {
+                    self.pending = [PendingPermission(
+                        id: reqId, sessionId: self.sessionId, toolName: "AskUserQuestion",
+                        input: input,
+                        requestedAt: ISO8601DateFormatter().string(from: Date()))]
+                }
+                self.emit("permission_requested", .object([
+                    "reqId": .string(reqId), "toolName": .string("AskUserQuestion"), "input": input]))
             } else if prompt.lowercased().contains("question") {
                 // Prompts containing "question" reproduce AskUserQuestion (a multiple-choice question)
                 let reqId = UUID().uuidString
