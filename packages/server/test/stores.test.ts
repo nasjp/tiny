@@ -47,16 +47,6 @@ describe("stores", () => {
     expect(got.updatedAt >= rec.updatedAt).toBe(true);
   });
 
-  it("sessions: fixupRunning corrects running to interrupted", () => {
-    const a = fixture({ status: "running" });
-    const b = fixture({ status: "idle" });
-    s.sessions.create(a);
-    s.sessions.create(b);
-    expect(s.sessions.fixupRunning()).toBe(1);
-    expect(s.sessions.get(a.id)?.status).toBe("interrupted");
-    expect(s.sessions.get(b.id)?.status).toBe("idle");
-  });
-
   it("sessions: list excludes archived and flips with archived=true", () => {
     const normal = fixture();
     const archived = fixture({ archivedAt: new Date().toISOString() });

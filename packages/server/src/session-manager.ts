@@ -1226,6 +1226,48 @@ export class SessionManager extends EventEmitter {
     return rec;
   }
 
+  /**
+   * Close the turns the previous tinyd process was driving. Nothing about them survives a restart,
+   * so each session still marked running (or left "interrupted" by an older tinyd, which changed the
+   * status without telling anyone) gets the closing event the phone has been waiting for since its
+   * turn_started — with the truth about what happened. Meant to run before anything listens for
+   * events, so a restart pushes nothing; the closing event reaches the phone as history
+   */
+  recoverAfterRestart(): number {
+    let n = 0;
+    for (const archived of [false, true]) {
+      for (const status of ["running", "interrupted"] as const) {
+        for (const s of this.deps.stores.sessions.list(status, archived)) {
+          if (this.hasOpenTurn(s.id)) {
+            if (this.deps.isCliLive?.(s) === true) {
+              // The agent's CLI holds the session, so this was a live join: the message was handed
+              // to that very process, which kept working through the restart. Only tinyd's watcher is
+              // gone. From here the CLI's work is imported like any turn of its own, and the list shows
+              // it running from the registry for as long as it is
+              this.emitEvent(s.id, "turn_completed", { costUsd: null, resultText: null });
+            } else {
+              // tinyd's own child died with it: the turn was cut short, exactly like a Stop
+              this.emitEvent(s.id, "turn_failed", { error: "interrupted" });
+            }
+          }
+          this.deps.stores.sessions.patch(s.id, { status: "idle" });
+          n++;
+        }
+      }
+    }
+    return n;
+  }
+
+  /** Whether the event log ends inside a turn (a turn_started with nothing closing it yet) */
+  private hasOpenTurn(id: string): boolean {
+    let open = false;
+    for (const ev of this.deps.stores.events.listSince(id, 0)) {
+      if (ev.type === "turn_started") open = true;
+      else if (ev.type === "turn_completed" || ev.type === "turn_failed" || ev.type === "auth_error") open = false;
+    }
+    return open;
+  }
+
   /** Resolves when nothing is running for this session any more — including anything queued behind it */
   async waitForIdle(id: string): Promise<void> {
     for (;;) {
