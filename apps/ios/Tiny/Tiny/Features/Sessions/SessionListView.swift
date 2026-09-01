@@ -11,6 +11,9 @@ struct SessionListView: View {
     @State private var showSettings = false
     @State private var showUsage = false
     @State private var path = NavigationPath()
+    // Selection mode: pick several rows, then archive them from the bottom bar
+    @State private var selecting = false
+    @State private var selection = SessionSelection()
     // Sheets do not inherit the parent's .preferredColorScheme, so apply it to each sheet individually
     @AppStorage("appearance") private var appearanceRaw = Appearance.system.rawValue
 
@@ -44,19 +47,36 @@ struct SessionListView: View {
                         SwipeActionCard(
                             icon: "archivebox",
                             tint: .tInkSub,
-                            // Disabled while running or attached to the CLI to prevent accidents (the server also returns 409)
-                            enabled: s.status != .running && s.status != .detached,
-                            action: { archive(s) }
+                            // Disabled while running or attached to the CLI to prevent accidents (the server
+                            // also returns 409), and while selecting (a tap picks the row instead)
+                            enabled: !selecting && s.canArchive,
+                            action: { archive([s.id]) }
                         ) {
                             ZStack {
                                 row(s)
                                     .padding(.vertical, 12)
                                     .padding(.horizontal, 14)
                                     .background(Color.tCard, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                    .contentShape(Rectangle())
+                                    // In selection mode a tap ticks the row. The mask keeps the gesture
+                                    // out of the way otherwise, so the row's navigation is untouched
+                                    .simultaneousGesture(TapGesture().onEnded { toggle(s) },
+                                                         including: selecting ? .all : .subviews)
                                 // Navigation goes through a transparent NavigationLink (no chevron,
-                                // keeping the card's look aligned with the reference apps)
-                                NavigationLink(value: s) { EmptyView() }.opacity(0)
+                                // keeping the card's look aligned with the reference apps). Absent while
+                                // selecting, so a tap cannot navigate away
+                                if !selecting {
+                                    NavigationLink(value: s) { EmptyView() }.opacity(0)
+                                }
                             }
+                            .contextMenu {
+                                if !selecting {
+                                    Button { beginSelecting(with: s) } label: {
+                                        Label("Select", systemImage: "checkmark.circle")
+                                    }
+                                }
+                            }
+                            .accessibilityAddTraits(selecting && selection.contains(s.id) ? .isSelected : [])
                         }
                         .listRowBackground(Color.clear)
                         .listRowSeparator(.hidden)
@@ -90,16 +110,46 @@ struct SessionListView: View {
                 ArchivedSessionsView()
             }
             .toolbar {
-                ToolbarItemGroup(placement: .topBarLeading) {
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
-                    Button { showUsage = true } label: { Image(systemName: "gauge.with.needle") }
-                        .accessibilityIdentifier("usageButton")
-                    Button { path.append(ArchivedRoute()) } label: { Image(systemName: "archivebox") }
-                        .accessibilityIdentifier("archivedButton")
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { showNew = true } label: { Image(systemName: "plus") }
-                        .accessibilityIdentifier("newSessionButton")
+                if selecting {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button(selection.allSelected(among: archivable) ? "Deselect All" : "Select All") {
+                            toggleSelectAll()
+                        }
+                        .disabled(archivable.isEmpty)
+                        .accessibilityIdentifier("selectAllButton")
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Done") { endSelecting() }
+                            .fontWeight(.semibold)
+                            .accessibilityIdentifier("doneSelectingButton")
+                    }
+                    ToolbarItemGroup(placement: .bottomBar) {
+                        Spacer()
+                        Button { archive(chosenIds) } label: {
+                            Label(BulkSessionAction.buttonTitle(verb: "Archive", count: chosenIds.count),
+                                  systemImage: "archivebox")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.tTint)
+                        .disabled(chosenIds.isEmpty)
+                        .accessibilityIdentifier("bulkArchiveButton")
+                        Spacer()
+                    }
+                } else {
+                    ToolbarItemGroup(placement: .topBarLeading) {
+                        Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                        Button { showUsage = true } label: { Image(systemName: "gauge.with.needle") }
+                            .accessibilityIdentifier("usageButton")
+                        Button { path.append(ArchivedRoute()) } label: { Image(systemName: "archivebox") }
+                            .accessibilityIdentifier("archivedButton")
+                    }
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        Button("Select") { beginSelecting() }
+                            .disabled(model.sessions.isEmpty)
+                            .accessibilityIdentifier("selectButton")
+                        Button { showNew = true } label: { Image(systemName: "plus") }
+                            .accessibilityIdentifier("newSessionButton")
+                    }
                 }
             }
             .sheet(isPresented: $showNew) {
@@ -144,27 +194,59 @@ struct SessionListView: View {
         }
     }
 
-    private func archive(_ s: SessionRecord) {
-        guard let backend = model.backend else { return }
-        // Without withAnimation the row vanishes instantly. Keep the default curve
+    /// Rows that selection mode can pick (the same rule as the swipe)
+    private var archivable: [SessionRecord] { model.sessions.filter(\.canArchive) }
+    /// What "Archive N Sessions" would act on right now
+    private var chosenIds: [String] { selection.chosen(from: model.sessions, where: \.canArchive) }
+
+    private func beginSelecting(with s: SessionRecord? = nil) {
+        selection.clear()
+        if let s, s.canArchive { selection.select(s.id) }
+        withAnimation(.tinyAppear) { selecting = true }
+    }
+
+    private func endSelecting() {
+        withAnimation(.tinyAppear) { selecting = false }
+        selection.clear()
+    }
+
+    private func toggle(_ s: SessionRecord) {
+        guard s.canArchive else { return }
+        selection.toggle(s.id)
+    }
+
+    private func toggleSelectAll() {
+        if selection.allSelected(among: archivable) { selection.clear() } else { selection.selectAll(archivable) }
+    }
+
+    /// One row from a swipe, or every ticked row from the bottom bar — the same path either way
+    private func archive(_ ids: [String]) {
+        guard let backend = model.backend, !ids.isEmpty else { return }
+        let gone = Set(ids)
+        // Without withAnimation the rows vanish instantly. Keep the default curve
         // (the system composes it with the destructive swipe's slide, so no explicit curve)
         _ = withAnimation {
-            model.sessions.removeAll { $0.id == s.id }
+            model.sessions.removeAll { gone.contains($0.id) }
         }
+        if selecting { endSelecting() }
         Task {
-            do {
-                _ = try await backend.setArchived(sessionId: s.id, archived: true)
-            } catch {
-                archiveError = error.localizedDescription
-                await reload()   // bring the row back
+            let failures = await BulkSessionAction.run(ids) {
+                _ = try await backend.setArchived(sessionId: $0, archived: true)
+            }
+            if !failures.isEmpty {
+                archiveError = BulkSessionAction.failureMessage(verb: "archive", failures: failures, total: ids.count)
+                await reload()   // bring the failed rows back (the others are archived for real)
             }
         }
     }
 
     private func row(_ s: SessionRecord) -> some View {
         HStack(spacing: 10) {
-            // Unread dot (the spinner wins while running — from either side)
-            if s.isBusy {
+            // Selection tick, otherwise the unread dot (the spinner wins while running — from either side)
+            if selecting {
+                SelectionMark(id: s.id, selected: selection.contains(s.id), enabled: s.canArchive)
+                    .transition(.scale.combined(with: .opacity))
+            } else if s.isBusy {
                 ProgressView().controlSize(.small)
             } else if ReadMarks.isUnread(s) {
                 Circle().fill(Color.tTint).frame(width: 9, height: 9)
