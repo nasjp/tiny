@@ -236,6 +236,18 @@ final class ToolActivityTests: XCTestCase {
         XCTAssertEqual(calls.map(\.output), ["42 passed", nil])
         XCTAssertEqual(calls.map(\.outputTruncated), [true, false])
         XCTAssertEqual(calls.map(\.isError), [false, true])
+        XCTAssertEqual(calls.map(\.finished), [true, true])
+    }
+
+    func testACallWithoutItsFinishIsStillRunning() {
+        let events = [
+            ev(1, "tool_started", .object(["toolName": .string("WebSearch"), "toolUseId": .string("t1"),
+                                           "input": .object(["query": .string("PTS ranking")])])),
+        ]
+        guard case .tools(_, let calls) = buildChatItems(events)[0] else { return XCTFail("no tool group") }
+        XCTAssertFalse(calls[0].finished)
+        XCTAssertNil(calls[0].output)
+        XCTAssertEqual(calls[0].inputFields, [ToolInputField(label: "Query", text: "PTS ranking")])
     }
 
     func testInputFieldsPutTheCommandFirstAndTheRestAfter() {
@@ -255,8 +267,8 @@ final class ToolActivityTests: XCTestCase {
                              input: .object(["url": .string("https://example.com"), "opts": .object(["raw": .bool(true)])]),
                              isError: false)
         XCTAssertEqual(other.inputFields, [
+            ToolInputField(label: "URL", text: "https://example.com"),
             ToolInputField(label: "opts", text: "{\n  \"raw\": true\n}"),
-            ToolInputField(label: "url", text: "https://example.com"),
         ])
         XCTAssertEqual(ToolCall(id: "t4", name: "X", input: .null, isError: false).inputFields, [])
     }

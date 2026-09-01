@@ -71,6 +71,12 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
                 ev(auth, "user_message", .object(["text": .string("Move the auth middleware into its own package.")])),
                 ev(auth, "turn_started", .object(["agentSessionId": .string("demo-agent-3")])),
                 ev(auth, "assistant_text", .object(["text": .string("Starting with the session store, since everything else imports it.")])),
+                // A failed command, so the tool detail's error state has something to show
+                ev(auth, "tool_started", .object(["toolName": .string("Bash"), "toolUseId": .string("t3"),
+                                                  "input": .object(["command": .string("pytest tests/auth"),
+                                                                    "description": .string("Run the auth tests")])])),
+                ev(auth, "tool_finished", .object(["toolUseId": .string("t3"), "isError": .bool(true),
+                                                   "output": .string("Exit code 1\nFAILED tests/auth/test_session.py::test_refresh - ImportError: cannot import name 'SessionStore' from 'api.auth'\n1 failed, 17 passed in 2.31s")])),
                 ev(auth, "turn_failed", .object(["error": .string("interrupted")])),
             ],
         ]

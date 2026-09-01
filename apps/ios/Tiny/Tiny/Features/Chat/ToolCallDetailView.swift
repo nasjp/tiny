@@ -8,17 +8,13 @@ struct ToolCallDetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                if call.isError {
-                    Label("Failed", systemImage: "exclamationmark.triangle.fill")
-                        .font(.tinyCaption2)
-                        .foregroundStyle(Color.tDetached)
-                }
                 ForEach(Array(call.inputFields.enumerated()), id: \.offset) { _, field in
                     section(field.label) {
                         codeBlock(field.text)
                     }
                 }
-                section("Output") {
+                // A failed call's text is its error (the official app titles it so, in its warning colour)
+                section(call.isError ? "Error" : "Output", tint: call.isError ? Color.tDetached : Color.tInkSub) {
                     if let output = call.output {
                         codeBlock(output)
                             .accessibilityIdentifier("toolOutput")
@@ -27,6 +23,14 @@ struct ToolCallDetailView: View {
                                 .font(.caption)
                                 .foregroundStyle(Color.tInkSub)
                         }
+                    } else if !call.finished {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Running…")
+                        }
+                        .font(.callout)
+                        .foregroundStyle(Color.tInkSub)
+                        .accessibilityIdentifier("toolOutputRunning")
                     } else {
                         Text("No output was recorded")
                             .font(.callout)
@@ -43,13 +47,13 @@ struct ToolCallDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+    private func section<Content: View>(_ title: String, tint: Color = Color.tInkSub, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
                 .font(.tinyCaption2)
                 .kerning(1.2)
                 .textCase(.uppercase)
-                .foregroundStyle(Color.tInkSub)
+                .foregroundStyle(tint)
             content()
         }
     }

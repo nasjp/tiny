@@ -13,10 +13,12 @@ struct ToolCall: Identifiable, Equatable {
     /// Server display hints (the ACP ToolKind vocabulary and a one-line summary). When present, they win over name matching
     var kindHint: String? = nil
     var summary: String? = nil
-    /// What the tool printed (tool_finished.output). nil = not recorded (older tinyd, or the call is still running)
+    /// What the tool printed (tool_finished.output). nil = not recorded (older tinyd), or the call is still running
     var output: String? = nil
     /// The server kept only the head of the output
     var outputTruncated: Bool = false
+    /// tool_finished has arrived (until then the detail screen says the call is still running)
+    var finished: Bool = false
 
     /// Leading verb (matches the Claude Code app's wording)
     var verb: String {
@@ -61,30 +63,30 @@ struct ToolCall: Identifiable, Equatable {
 
     enum Kind { case command, edit, read, send, other }
 
-    /// The input, laid out for the detail screen: the fields a person wants to read first (a command,
-    /// a file path, the text an edit replaces) and then everything else the call carried
+    /// The input keys a person wants to read first, in this order (a command, a query, a file, the
+    /// text an edit replaces); everything else follows in key order
+    static let leadingInputKeys = [
+        "command", "query", "url", "pattern", "file_path", "path", "notebook_path",
+        "prompt", "description", "old_string", "new_string", "content", "glob",
+    ]
+    /// Readable labels for the keys the built-in tools use; an unknown key is shown as itself
+    static let inputLabels: [String: String] = [
+        "command": "Command", "description": "Description", "query": "Query", "url": "URL",
+        "pattern": "Pattern", "file_path": "File", "path": "File", "notebook_path": "Notebook",
+        "prompt": "Prompt", "old_string": "Replace", "new_string": "With", "content": "Content", "glob": "Glob",
+    ]
+
+    /// The input, laid out for the detail screen
     var inputFields: [ToolInputField] {
         guard let obj = input.objectValue else {
             return input == .null ? [] : [ToolInputField(label: "Input", text: input.prettyText)]
         }
-        // Keys shown first, with their labels; the rest follow in key order
-        let preferred: [(key: String, label: String)] = switch kind {
-        case .command: [("command", "Command"), ("description", "Description")]
-        case .edit, .read: [("file_path", "File"), ("path", "File"), ("old_string", "Replace"), ("new_string", "With"), ("content", "Content")]
-        default: []
-        }
-        var fields: [ToolInputField] = []
-        var used = Set<String>()
-        for (key, label) in preferred {
-            guard let v = obj[key] else { continue }
-            used.insert(key)
-            fields.append(ToolInputField(label: label, text: v.stringValue ?? v.prettyText))
-        }
-        for key in obj.keys.sorted() where !used.contains(key) {
+        let order = Self.leadingInputKeys.filter { obj[$0] != nil }
+            + obj.keys.sorted().filter { !Self.leadingInputKeys.contains($0) }
+        return order.map { key in
             let v = obj[key]!
-            fields.append(ToolInputField(label: key, text: v.stringValue ?? v.prettyText))
+            return ToolInputField(label: Self.inputLabels[key] ?? key, text: v.stringValue ?? v.prettyText)
         }
-        return fields
     }
 
     var kind: Kind {
@@ -214,6 +216,7 @@ func buildChatItems(_ events: [EventRecord], answeringNow: String? = nil) -> [Ch
                 if isError { current[idx].isError = true }
                 current[idx].output = output
                 current[idx].outputTruncated = truncated
+                current[idx].finished = true
             }
         case .sessionStateChanged:
             flushTools()
