@@ -67,21 +67,57 @@ final class DemoBackendTests: XCTestCase {
     func testArchiveTogglesListMembership() async throws {
         let backend = DemoBackend()
         let initial = try await backend.sessions()
-        XCTAssertEqual(initial.count, 1)
+        XCTAssertEqual(initial.count, 3)
         var archived = try await backend.archivedSessions()
         XCTAssertEqual(archived.count, 0)
 
         _ = try await backend.setArchived(sessionId: initial[0].id, archived: true)
         var active = try await backend.sessions()
-        XCTAssertEqual(active.count, 0)
+        XCTAssertEqual(active.count, 2)
         archived = try await backend.archivedSessions()
         XCTAssertEqual(archived.count, 1)
 
         _ = try await backend.setArchived(sessionId: initial[0].id, archived: false)
         active = try await backend.sessions()
-        XCTAssertEqual(active.count, 1)
+        XCTAssertEqual(active.count, 3)
         archived = try await backend.archivedSessions()
         XCTAssertEqual(archived.count, 0)
+    }
+
+    func testHasThreeSessionsWithTheirOwnHistories() async throws {
+        let demo = DemoBackend()
+        let sessions = try await demo.sessions()
+        XCTAssertEqual(sessions.count, 3)
+        XCTAssertEqual(sessions.map(\.status), [.idle, .idle, .interrupted])
+        let first = try await demo.events(sessionId: sessions[0].id, since: 0)
+        let second = try await demo.events(sessionId: sessions[1].id, since: 0)
+        XCTAssertFalse(second.isEmpty)
+        XCTAssertNotEqual(first.map(\.type), second.map(\.type))
+        XCTAssertTrue(second.allSatisfy { $0.sessionId == sessions[1].id })
+    }
+
+    func testArchivingSeveralSessionsMovesThemTogether() async throws {
+        let demo = DemoBackend()
+        let ids = try await demo.sessions().map(\.id)
+        _ = try await demo.setArchived(sessionId: ids[1], archived: true)
+        _ = try await demo.setArchived(sessionId: ids[2], archived: true)
+        let active = try await demo.sessions().map(\.id)
+        XCTAssertEqual(active, [ids[0]])
+        let archived = try await demo.archivedSessions().map(\.id)
+        XCTAssertEqual(archived, [ids[1], ids[2]])
+    }
+
+    /// A turn sent in one session must not show up in another's stream
+    func testTurnEventsStayInTheirSession() async throws {
+        let demo = DemoBackend()
+        let sessions = try await demo.sessions()
+        let before = try await demo.events(sessionId: sessions[0].id, since: 0)
+        try await demo.sendTurn(sessionId: sessions[1].id, prompt: "hello", images: [])
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+        let firstAfter = try await demo.events(sessionId: sessions[0].id, since: 0)
+        XCTAssertEqual(firstAfter.count, before.count)
+        let second = try await demo.events(sessionId: sessions[1].id, since: 0)
+        XCTAssertTrue(second.contains { $0.type == "user_message" && $0.payload.objectValue?["text"]?.stringValue == "hello" })
     }
 
     /// cwd history survives archiving (New Session candidates don't disappear)
@@ -89,11 +125,11 @@ final class DemoBackendTests: XCTestCase {
         let backend = DemoBackend()
         let initial = try await backend.sessions()
         let before = try await backend.recentCwds()
-        XCTAssertEqual(before, [initial[0].cwd])
+        XCTAssertEqual(before, initial.map(\.cwd))
 
         _ = try await backend.setArchived(sessionId: initial[0].id, archived: true)
         let after = try await backend.recentCwds()
-        XCTAssertEqual(after, [initial[0].cwd])
+        XCTAssertEqual(after, initial.map(\.cwd))
     }
 
     func testFileData() async throws {

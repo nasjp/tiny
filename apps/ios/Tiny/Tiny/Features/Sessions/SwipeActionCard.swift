@@ -53,6 +53,10 @@ struct SwipeActionCard<Content: View>: View {
                 .offset(x: x)
                 .gesture(drag)
         }
+        // Selection mode turns swiping off; a card left open (button showing) must close with it
+        .onChange(of: enabled) { _, isEnabled in
+            if !isEnabled, baseX != 0 { snap(to: 0) }
+        }
     }
 
     private var actionButton: some View {
