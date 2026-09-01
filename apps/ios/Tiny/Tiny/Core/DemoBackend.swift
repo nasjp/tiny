@@ -9,57 +9,88 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
     let isDemo = true
     static let demoFileId = "demo-file-1"
 
-    private let sessionId = "demo-session-1"
     private var nextEventId: Int
-    private var storedEvents: [EventRecord]
+    /// History per session id
+    private var storedEvents: [String: [EventRecord]]
     private var pending: [PendingPermission] = []
-    private var continuations: [UUID: AsyncStream<EventRecord>.Continuation] = [:]
-    private var session: SessionRecord
+    /// Open streams per session id
+    private var continuations: [String: [UUID: AsyncStream<EventRecord>.Continuation]] = [:]
+    /// List order. The first one is the interactive session the walkthrough (and the UI tests) use;
+    /// the other two are quieter, so the list, multi-select and archive have something to show
+    private var sessions: [SessionRecord]
     private var archivedIds: Set<String> = []
     private let queue = DispatchQueue(label: "demo-backend")
 
     init() {
-        let now = ISO8601DateFormatter().string(from: Date())
-        session = SessionRecord(
-            id: sessionId, agentSessionId: "demo-agent", agent: "claude", profile: "demo",
+        func iso(_ offset: TimeInterval = 0) -> String {
+            ISO8601DateFormatter().string(from: Date().addingTimeInterval(offset))
+        }
+        let now = iso()
+        let fix = SessionRecord(
+            id: "demo-session-1", agentSessionId: "demo-agent", agent: "claude", profile: "demo",
             cwd: "/Users/you/src/my-app", permissionMode: .default, model: nil, effort: nil,
             title: "Demo: fix a bug", status: .idle, createdAt: now, updatedAt: now)
+        let notes = SessionRecord(
+            id: "demo-session-2", agentSessionId: "demo-agent-2", agent: "claude", profile: "demo",
+            cwd: "/Users/you/src/website", permissionMode: .default, model: nil, effort: nil,
+            title: "Demo: write release notes", status: .idle,
+            createdAt: iso(-7200), updatedAt: iso(-7200))
+        let auth = SessionRecord(
+            id: "demo-session-3", agentSessionId: "demo-agent-3", agent: "claude", profile: "demo",
+            cwd: "/Users/you/src/api", permissionMode: .default, model: nil, effort: nil,
+            title: "Demo: refactor auth", status: .interrupted,
+            createdAt: iso(-86_400), updatedAt: iso(-86_400))
+        sessions = [fix, notes, auth]
         var id = 0
-        func ev(_ type: String, _ payload: JSONValue) -> EventRecord {
+        func ev(_ session: SessionRecord, _ type: String, _ payload: JSONValue) -> EventRecord {
             id += 1
-            return EventRecord(id: id, sessionId: "demo-session-1", type: type,
-                               payload: payload, createdAt: now)
+            return EventRecord(id: id, sessionId: session.id, type: type,
+                               payload: payload, createdAt: session.updatedAt)
         }
         storedEvents = [
-            ev("turn_started", .object(["agentSessionId": .string("demo-agent")])),
-            ev("assistant_text", .object(["text": .string("I'll look into the failing test in my-app. Let me run the tests first to find where it's failing.")])),
-            ev("tool_started", .object(["toolName": .string("Bash"), "toolUseId": .string("t1"),
-                                        "input": .object(["command": .string("npm test")])])),
-            ev("tool_finished", .object(["toolUseId": .string("t1"), "isError": .bool(false)])),
-            ev("assistant_text", .object(["text": .string("It was a boundary condition in date-utils.ts. I fixed it and confirmed the tests pass. Sending you a report.")])),
-            ev("file_sent", .object(["fileId": .string(Self.demoFileId), "mime": .string("text/html"),
-                                     "caption": .string("Fix report"),
-                                     "name": .string("/Users/you/src/my-app/report.html")])),
-            ev("turn_completed", .object(["costUsd": .number(0.12), "resultText": .string("Fixed: corrected a boundary condition in date-utils.ts"), "contextTokens": .number(48_000)])),
+            fix.id: [
+                ev(fix, "turn_started", .object(["agentSessionId": .string("demo-agent")])),
+                ev(fix, "assistant_text", .object(["text": .string("I'll look into the failing test in my-app. Let me run the tests first to find where it's failing.")])),
+                ev(fix, "tool_started", .object(["toolName": .string("Bash"), "toolUseId": .string("t1"),
+                                                 "input": .object(["command": .string("npm test")])])),
+                ev(fix, "tool_finished", .object(["toolUseId": .string("t1"), "isError": .bool(false)])),
+                ev(fix, "assistant_text", .object(["text": .string("It was a boundary condition in date-utils.ts. I fixed it and confirmed the tests pass. Sending you a report.")])),
+                ev(fix, "file_sent", .object(["fileId": .string(Self.demoFileId), "mime": .string("text/html"),
+                                              "caption": .string("Fix report"),
+                                              "name": .string("/Users/you/src/my-app/report.html")])),
+                ev(fix, "turn_completed", .object(["costUsd": .number(0.12), "resultText": .string("Fixed: corrected a boundary condition in date-utils.ts"), "contextTokens": .number(48_000)])),
+            ],
+            notes.id: [
+                ev(notes, "user_message", .object(["text": .string("Draft the release notes for 2.4 from the merged PRs.")])),
+                ev(notes, "turn_started", .object(["agentSessionId": .string("demo-agent-2")])),
+                ev(notes, "assistant_text", .object(["text": .string("Here's a draft grouped by area — three features, five fixes, and one deprecation. I kept the wording close to the PR titles so it's easy to check.")])),
+                ev(notes, "turn_completed", .object(["costUsd": .number(0.04), "resultText": .string("Drafted release notes for 2.4"), "contextTokens": .number(21_000)])),
+            ],
+            auth.id: [
+                ev(auth, "user_message", .object(["text": .string("Move the auth middleware into its own package.")])),
+                ev(auth, "turn_started", .object(["agentSessionId": .string("demo-agent-3")])),
+                ev(auth, "assistant_text", .object(["text": .string("Starting with the session store, since everything else imports it.")])),
+                ev(auth, "turn_failed", .object(["error": .string("interrupted")])),
+            ],
         ]
         nextEventId = id
     }
 
-    private func emit(_ type: String, _ payload: JSONValue) {
+    private func emit(_ sessionId: String, _ type: String, _ payload: JSONValue) {
         queue.sync {
             nextEventId += 1
             let ev = EventRecord(id: nextEventId, sessionId: sessionId, type: type, payload: payload,
                                  createdAt: ISO8601DateFormatter().string(from: Date()))
-            storedEvents.append(ev)
+            storedEvents[sessionId, default: []].append(ev)
             // A consumer that leaves `for await` via break sometimes never fires
             // onTermination, so check yield's return value and sweep the dictionary ourselves.
             var terminatedKeys: [UUID] = []
-            for (key, c) in continuations {
+            for (key, c) in continuations[sessionId] ?? [:] {
                 if case .terminated = c.yield(ev) {
                     terminatedKeys.append(key)
                 }
             }
-            for key in terminatedKeys { continuations.removeValue(forKey: key) }
+            for key in terminatedKeys { continuations[sessionId]?.removeValue(forKey: key) }
         }
     }
 
@@ -84,16 +115,22 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
         ]
     }
     func sessions() async throws -> [SessionRecord] {
-        queue.sync { archivedIds.contains(session.id) ? [] : [session] }
+        queue.sync { sessions.filter { !archivedIds.contains($0.id) } }
     }
     func archivedSessions() async throws -> [SessionRecord] {
-        queue.sync { archivedIds.contains(session.id) ? [session] : [] }
+        queue.sync { sessions.filter { archivedIds.contains($0.id) } }
     }
-    func recentCwds() async throws -> [String] { [session.cwd] }
+    /// Every session's cwd, archived or not (like the server's history), deduplicated in list order
+    func recentCwds() async throws -> [String] {
+        queue.sync {
+            var seen = Set<String>()
+            return sessions.compactMap { seen.insert($0.cwd).inserted ? $0.cwd : nil }
+        }
+    }
     func setArchived(sessionId: String, archived: Bool) async throws -> SessionRecord {
         queue.sync {
             if archived { archivedIds.insert(sessionId) } else { archivedIds.remove(sessionId) }
-            return session
+            return sessions.first { $0.id == sessionId } ?? sessions[0]
         }
     }
     func profileUsage(name: String) async throws -> ProfileUsage {
@@ -105,17 +142,17 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
         ], fetchedAt: ISO8601DateFormatter().string(from: Date()))
     }
     func createSession(profile: String, cwd: String, permissionMode: PermissionMode, model: String?, effort: String?) async throws -> SessionRecord {
-        session   // demo returns the existing session (the UI explains that creating one needs a Mac)
+        queue.sync { sessions[0] }   // demo returns the existing session (the UI explains that creating one needs a Mac)
     }
     func events(sessionId: String, since: Int) async throws -> [EventRecord] {
-        queue.sync { storedEvents.filter { $0.id > since } }
+        queue.sync { (storedEvents[sessionId] ?? []).filter { $0.id > since } }
     }
 
     func sendTurn(sessionId: String, prompt: String, images: [TurnImageAttachment]) async throws {
         var payload: [String: JSONValue] = ["text": .string(prompt)]
         if !images.isEmpty { payload["imageCount"] = .number(Double(images.count)) }
-        emit("user_message", .object(payload))
-        emit("turn_started", .object(["agentSessionId": .string("demo-agent")]))
+        emit(sessionId, "user_message", .object(payload))
+        emit(sessionId, "turn_started", .object(["agentSessionId": .string("demo-agent")]))
         Task {
             try? await Task.sleep(nanoseconds: 800_000_000)
             // Prompts containing "build" reproduce the permission flow
@@ -123,11 +160,11 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
                 let reqId = UUID().uuidString
                 self.queue.sync {
                     self.pending = [PendingPermission(
-                        id: reqId, sessionId: self.sessionId, toolName: "Bash",
+                        id: reqId, sessionId: sessionId, toolName: "Bash",
                         input: .object(["command": .string("npm run build")]),
                         requestedAt: ISO8601DateFormatter().string(from: Date()))]
                 }
-                self.emit("permission_requested", .object([
+                self.emit(sessionId, "permission_requested", .object([
                     "reqId": .string(reqId), "toolName": .string("Bash"),
                     "input": .object(["command": .string("npm run build")])]))
             } else if prompt.lowercased().contains("questions") {
@@ -165,11 +202,11 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
                 ])])
                 self.queue.sync {
                     self.pending = [PendingPermission(
-                        id: reqId, sessionId: self.sessionId, toolName: "AskUserQuestion",
+                        id: reqId, sessionId: sessionId, toolName: "AskUserQuestion",
                         input: input,
                         requestedAt: ISO8601DateFormatter().string(from: Date()))]
                 }
-                self.emit("permission_requested", .object([
+                self.emit(sessionId, "permission_requested", .object([
                     "reqId": .string(reqId), "toolName": .string("AskUserQuestion"), "input": input]))
             } else if prompt.lowercased().contains("question") {
                 // Prompts containing "question" reproduce AskUserQuestion (a multiple-choice question)
@@ -189,30 +226,30 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
                 ])
                 self.queue.sync {
                     self.pending = [PendingPermission(
-                        id: reqId, sessionId: self.sessionId, toolName: "AskUserQuestion",
+                        id: reqId, sessionId: sessionId, toolName: "AskUserQuestion",
                         input: input,
                         requestedAt: ISO8601DateFormatter().string(from: Date()))]
                 }
-                self.emit("permission_requested", .object([
+                self.emit(sessionId, "permission_requested", .object([
                     "reqId": .string(reqId), "toolName": .string("AskUserQuestion"), "input": input]))
             } else {
-                self.emit("assistant_text", .object(["text": .string("(Demo) Got your message: \"\(prompt)\". In the real app, Claude Code on your Mac would do the work here.")]))
+                self.emit(sessionId, "assistant_text", .object(["text": .string("(Demo) Got your message: \"\(prompt)\". In the real app, Claude Code on your Mac would do the work here.")]))
                 try? await Task.sleep(nanoseconds: 600_000_000)
-                self.emit("turn_completed", .object(["costUsd": .number(0.05), "resultText": .string("Demo turn completed"), "contextTokens": .number(52_000)]))
+                self.emit(sessionId, "turn_completed", .object(["costUsd": .number(0.05), "resultText": .string("Demo turn completed"), "contextTokens": .number(52_000)]))
             }
         }
     }
 
     func interrupt(sessionId: String) async throws {
-        emit("turn_failed", .object(["error": .string("interrupted")]))
+        emit(sessionId, "turn_failed", .object(["error": .string("interrupted")]))
     }
 
     func updateSession(sessionId: String, model: String?, permissionMode: PermissionMode?, effort: String?, title: String?) async throws -> SessionRecord {
-        session   // unchanged in demo
+        queue.sync { sessions.first { $0.id == sessionId } ?? sessions[0] }   // unchanged in demo
     }
 
     func setDetached(sessionId: String, detached: Bool) async throws {
-        emit("session_state_changed", .object(["status": .string(detached ? "detached" : "idle")]))
+        emit(sessionId, "session_state_changed", .object(["status": .string(detached ? "detached" : "idle")]))
     }
 
     func pendingPermissions(sessionId: String) async throws -> [PendingPermission] {
@@ -220,13 +257,13 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
     }
 
     func answerCliQuestion(sessionId: String, toolUseId: String, answers: [String: String]) async throws {
-        emit("cli_question_answered", .object([
+        emit(sessionId, "cli_question_answered", .object([
             "toolUseId": .string(toolUseId),
             "answers": .object(answers.mapValues { .string($0) }),
         ]))
         let chosen = answers.values.sorted().joined(separator: ", ")
-        emit("assistant_text", .object(["text": .string("(Demo) Got it — you chose: \(chosen).")]))
-        emit("turn_completed", .object(["costUsd": .number(0.01), "resultText": .string("Demo question answered")]))
+        emit(sessionId, "assistant_text", .object(["text": .string("(Demo) Got it — you chose: \(chosen).")]))
+        emit(sessionId, "turn_completed", .object(["costUsd": .number(0.01), "resultText": .string("Demo question answered")]))
     }
 
     func respondPermission(reqId: String, allow: Bool, message: String?, updatedInput: JSONValue?) async throws {
@@ -235,32 +272,33 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
             pending.removeAll { $0.id == reqId }
             return p
         }
+        let sessionId = resolved?.sessionId ?? queue.sync { sessions[0].id }
         var resolvedPayload: [String: JSONValue] = ["reqId": .string(reqId),
                                                     "behavior": .string(allow ? "allow" : "deny")]
         if allow, let answers = updatedInput?.objectValue?["answers"] {
             resolvedPayload["answers"] = answers   // like the real server, answers go into the history event
         }
-        emit("permission_resolved", .object(resolvedPayload))
+        emit(sessionId, "permission_resolved", .object(resolvedPayload))
         if resolved?.toolName == "AskUserQuestion" {
             // Echo the chosen answer and close the turn
             let answers = updatedInput?.objectValue?["answers"]?.objectValue ?? [:]
             let chosen = answers.values.compactMap(\.stringValue).joined(separator: ", ")
-            emit("assistant_text", .object(["text": .string(
+            emit(sessionId, "assistant_text", .object(["text": .string(
                 allow ? "(Demo) Got it — you chose: \(chosen.isEmpty ? "(no answer)" : chosen)."
                       : "(Demo) No problem, I'll decide on my own.")]))
-            emit("turn_completed", .object(["costUsd": .number(0.01),
+            emit(sessionId, "turn_completed", .object(["costUsd": .number(0.01),
                                             "resultText": .string("Demo question answered")]))
         } else if allow {
             Task {
-                self.emit("tool_started", .object(["toolName": .string("Bash"), "toolUseId": .string("t9"),
+                self.emit(sessionId, "tool_started", .object(["toolName": .string("Bash"), "toolUseId": .string("t9"),
                                                    "input": .object(["command": .string("npm run build")])]))
                 try? await Task.sleep(nanoseconds: 900_000_000)
-                self.emit("tool_finished", .object(["toolUseId": .string("t9"), "isError": .bool(false)]))
-                self.emit("turn_completed", .object(["costUsd": .number(0.08),
+                self.emit(sessionId, "tool_finished", .object(["toolUseId": .string("t9"), "isError": .bool(false)]))
+                self.emit(sessionId, "turn_completed", .object(["costUsd": .number(0.08),
                                                      "resultText": .string("Build succeeded")]))
             }
         } else {
-            emit("turn_completed", .object(["costUsd": .null, "resultText": .string("Stopped because permission was denied")]))
+            emit(sessionId, "turn_completed", .object(["costUsd": .null, "resultText": .string("Stopped because permission was denied")]))
         }
     }
 
@@ -280,11 +318,11 @@ final class DemoBackend: TinyBackend, @unchecked Sendable {
         AsyncStream { continuation in
             let key = UUID()
             queue.sync {
-                for ev in storedEvents where ev.id > since { continuation.yield(ev) }
-                continuations[key] = continuation
+                for ev in storedEvents[sessionId] ?? [] where ev.id > since { continuation.yield(ev) }
+                continuations[sessionId, default: [:]][key] = continuation
             }
             continuation.onTermination = { [weak self] _ in
-                self?.queue.sync { _ = self?.continuations.removeValue(forKey: key) }
+                self?.queue.sync { _ = self?.continuations[sessionId]?.removeValue(forKey: key) }
             }
         }
     }
