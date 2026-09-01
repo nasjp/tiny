@@ -1518,6 +1518,58 @@ describe("SessionManager", () => {
         expect(seen.filter((e) => e.type === "cli_question_answered")).toHaveLength(1);
       });
 
+      it("does not show the cancelled prompt as a dismissal when the import races the answer", async () => {
+        // Device report: all three answers came out as "Dismissed in the CLI". The CLI writes its
+        // rejection the instant the frame lands, and the chat's own 1.5s sync imported it before
+        // the answer was recorded — so the claim has to be staked before the send, not after
+        let manager!: SessionManager;
+        let file = "";
+        let sessionId = "";
+        const frames: PeerFrame[] = [];
+        const { peer, setStatus } = fakePeer({
+          send: async (_s, _t, frame) => {
+            frames.push(frame);
+            fs.appendFileSync(file, jsonl([rejectedRecord("tu-race")]));
+            manager.syncTranscript(sessionId);   // the phone has the chat open
+          },
+        });
+        const made = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+        manager = made.manager;
+        const live = liveSession(manager, made.home, "agent-race-q");
+        file = live.file;
+        sessionId = live.session.id;
+        fs.writeFileSync(file, jsonl(questionRecords("tu-race")));
+        manager.syncTranscript(sessionId);
+        const seen: EventRecord[] = [];
+        manager.on("event", (e) => seen.push(e));
+
+        await manager.answerCliQuestion(sessionId, "tu-race", { "Which goal?": "staging" });
+        await until(() => frames.length === 1);
+        const answers = seen.filter((e) => e.type === "cli_question_answered");
+        expect(answers).toHaveLength(1);
+        expect(answers[0]!.payload).toEqual({ toolUseId: "tu-race", answers: { "Which goal?": "staging" } });
+        setStatus({ status: "idle", waitingFor: null });
+      });
+
+      it("keeps a real dismissal visible when the answer never reached the CLI", async () => {
+        const { peer } = fakePeer({ send: async () => { throw new Error("socket gone"); } });
+        const { manager, home } = makeManager(okAdapter, { deps: { isCliLive: () => true, peer, liveTiming: FAST_LIVE } });
+        const { session, file } = liveSession(manager, home, "agent-send-fail");
+        fs.writeFileSync(file, jsonl(questionRecords("tu-fail")));
+        manager.syncTranscript(session.id);
+        const seen: EventRecord[] = [];
+        manager.on("event", (e) => seen.push(e));
+
+        await manager.answerCliQuestion(session.id, "tu-fail", { "Which goal?": "staging" });
+        await until(() => seen.some((e) => e.type === "turn_failed"));
+        // the person then dismisses the question in the terminal: that is theirs, and must show
+        fs.appendFileSync(file, jsonl([rejectedRecord("tu-fail")]));
+        manager.syncTranscript(session.id);
+        const answers = seen.filter((e) => e.type === "cli_question_answered");
+        expect(answers).toHaveLength(1);
+        expect(answers[0]!.payload).toEqual({ toolUseId: "tu-fail", answers: {}, rejected: true });
+      });
+
       it("takes the question from the hook and does not repeat it when the transcript catches up", async () => {
         // Claude Code writes an AskUserQuestion to the transcript only once it is answered, so the
         // PreToolUse hook is what puts the question on the phone while it is still on screen
