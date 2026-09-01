@@ -115,8 +115,8 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
 - **Any code that spawns child processes must strip `ANTHROPIC_API_KEY` from the env**
   (leaving it set bills the API pay-as-you-go instead of the subscription; every
   existing spawn path already strips it)
-- Read test counts, not just pass/fail (currently server 651 / relay 37 / iOS unit 197
-  + 4 demo-UI + 3 live E2E [need a real tinyd — see HANDOFF]). **`xcodebuild test |
+- Read test counts, not just pass/fail (currently server 656 / relay 37 / iOS unit 200
+  + 5 demo-UI + 3 live E2E [need a real tinyd — see HANDOFF]). **`xcodebuild test |
   tail` exits 0 even on failure** — always check for the literal
   `** TEST FAILED **` / `** TEST SUCCEEDED **` strings
 - **Usage comes through the Agent SDK's `Query.usage_EXPERIMENTAL_…()`** (`usage.ts`).
