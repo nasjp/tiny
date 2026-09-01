@@ -76,7 +76,8 @@ struct ChatView: View {
                         }
                         if model.inner?.isBusy == true {
                             ActivityRow(since: model.inner?.busySince,
-                                        outputTokens: model.inner?.busyOutputTokens) {
+                                        outputTokens: model.inner?.busyOutputTokens,
+                                        reason: model.inner?.activity?.reason) {
                                 Task { await model.inner?.interrupt() }
                             }
                             .transition(appearTransition(isNew: true))

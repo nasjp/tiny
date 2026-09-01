@@ -65,6 +65,12 @@ export interface SessionActivity {
   since: string | null;
   /** Output tokens the agent has produced so far in this turn. null when unknown */
   outputTokens: number | null;
+  /**
+   * "background": the CLI's own turn has ended, but a shell task it started in the background is
+   * still running and it will pick up again when that finishes (registry status "shell"). Absent
+   * for an ordinary turn
+   */
+  reason?: "background";
 }
 
 /** What the API returns for a session: the record plus runtime-only fields */

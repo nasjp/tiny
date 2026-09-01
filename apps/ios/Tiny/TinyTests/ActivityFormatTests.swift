@@ -26,4 +26,13 @@ final class ActivityFormatTests: XCTestCase {
                        "zero tokens right after a prompt is not worth a word")
         XCTAssertEqual(ActivityFormat.line(since: nil, outputTokens: nil, now: now), "Running…")
     }
+
+    func testLineSaysWhenTheCLIIsWaitingOnABackgroundTask() {
+        let now = Date(timeIntervalSince1970: 1_000_100)
+        let since = Date(timeIntervalSince1970: 1_000_000)
+        XCTAssertEqual(ActivityFormat.line(since: since, outputTokens: nil, now: now, reason: "background"),
+                       "Waiting for a background task… · 1m 40s")
+        XCTAssertEqual(ActivityFormat.line(since: since, outputTokens: 500, now: now, reason: nil),
+                       "Running… · 1m 40s · ↓ 500 tokens")
+    }
 }

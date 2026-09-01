@@ -18,9 +18,10 @@ enum ActivityFormat {
         return String(format: "%.1fM tokens", Double(n) / 1_000_000)
     }
 
-    /// "Running… · 5m 58s · ↓ 16.4k tokens". Pieces the server does not know are left out
-    static func line(since: Date?, outputTokens: Int?, now: Date) -> String {
-        var parts = ["Running…"]
+    /// "Running… · 5m 58s · ↓ 16.4k tokens". Pieces the server does not know are left out.
+    /// A wait on a background task says so instead of "Running…"
+    static func line(since: Date?, outputTokens: Int?, now: Date, reason: String? = nil) -> String {
+        var parts = [reason == "background" ? "Waiting for a background task…" : "Running…"]
         if let since { parts.append(elapsed(now.timeIntervalSince(since))) }
         if let outputTokens, outputTokens > 0 { parts.append("↓ " + tokens(outputTokens)) }
         return parts.joined(separator: " · ")
@@ -32,13 +33,14 @@ enum ActivityFormat {
 struct ActivityRow: View {
     let since: Date?
     let outputTokens: Int?
+    var reason: String? = nil
     let onStop: () -> Void
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             HStack(spacing: 8) {
                 ProgressView()
-                Text(ActivityFormat.line(since: since, outputTokens: outputTokens, now: context.date))
+                Text(ActivityFormat.line(since: since, outputTokens: outputTokens, now: context.date, reason: reason))
                     .font(.caption)
                     .foregroundStyle(Color.tInkSub)
                     .monospacedDigit()

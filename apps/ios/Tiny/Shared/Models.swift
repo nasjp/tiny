@@ -95,6 +95,9 @@ struct SessionActivity: Codable, Hashable {
     var since: String? = nil
     /// Output tokens the agent has produced so far in this turn. nil = unknown
     var outputTokens: Int? = nil
+    /// "background" = the CLI's turn ended but a background shell task it started is still running
+    /// (it picks up again when that finishes). nil for an ordinary turn, and on older servers
+    var reason: String? = nil
 }
 
 struct SessionRecord: Codable, Identifiable, Hashable {
