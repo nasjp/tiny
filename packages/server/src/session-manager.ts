@@ -69,6 +69,9 @@ export interface LiveTiming {
 // process itself) is what says when it is not. Every way a turn can end is evidence-based
 const DEFAULT_LIVE_TIMING: LiveTiming = { pollMs: 1000, deliveryTimeoutMs: 60_000, idleSettleMs: 5000 };
 
+/** The SDK's child `claude` stays in the registry a moment after the result arrives */
+const OWN_PROCESS_GRACE_MS = 10_000;
+
 export interface SessionManagerDeps {
   stores: Stores;
   profilesDir: string;
@@ -104,6 +107,11 @@ export interface SessionManagerDeps {
   peer?: PeerBridge;
   /** Watcher timings. Tests shorten them; production uses the defaults */
   liveTiming?: LiveTiming;
+  /**
+   * How long after tiny's own SDK turn ends its child process may still show in the registry.
+   * Tests shorten it; production uses OWN_PROCESS_GRACE_MS
+   */
+  ownProcessGraceMs?: number;
 }
 
 interface RunningTurn {
@@ -210,6 +218,12 @@ export class SessionManager extends EventEmitter {
    */
   private cliSeenPid = new Map<string, number>();
   private cliClosedPid = new Map<string, number>();
+  /**
+   * tiny's own SDK turns per session: their child `claude` registers like any CLI (measured on
+   * 2.1.258), so a registry entry started after one of these — while it runs or shortly after —
+   * is ours and says nothing about the person's terminal
+   */
+  private ownSdkTurn = new Map<string, { startedAt: number; endedAt: number | null }>();
 
   constructor(private deps: SessionManagerDeps) {
     super();
@@ -666,6 +680,9 @@ export class SessionManager extends EventEmitter {
     if (s.status !== "running") {
       this.syncTranscript(s.id);
       if (this.deps.stores.events.count(s.id) === 0 && this.deps.stores.sessions.delete(s.id)) {
+        // The row is gone: leave nothing behind that a later session could inherit
+        this.cliSeenPid.delete(s.id);
+        this.cliClosedPid.delete(s.id);
         return { discarded: true, closed: false };
       }
     }
@@ -879,6 +896,47 @@ export class SessionManager extends EventEmitter {
     return true;
   }
 
+  /**
+   * Registry-side fallback for "the CLI closed this session": a process that was seen holding it
+   * and is now gone. The SessionEnd hook is the primary signal (immediate, and it names the
+   * session); this catches a terminal that was killed, and a config dir without `tiny live on`.
+   * Called per row on every list / get, so it is cheap and never throws. Returns the record as it
+   * stands afterwards
+   */
+  observeCli(s: SessionRecord): SessionRecord {
+    if (s.agent !== "claude" || !s.agentSessionId) return s;
+    const live = this.deps.isCliLive?.(s);
+    if (live !== true && live !== false) return s; // cannot tell: no evidence either way
+    if (live) {
+      const entry = this.deps.cliState?.(s);
+      if (!entry || this.isOwnProcess(s.id, entry)) return s;
+      this.cliSeenPid.set(s.id, entry.pid);
+      // The hook fires before the process exits, so the pid that closed the session can still be
+      // there for a moment; only a different process means the person opened it again
+      if (s.cliClosedAt === null || this.cliClosedPid.get(s.id) === entry.pid) return s;
+      this.clearCliClosed(s.id);
+      return this.getSession(s.id);
+    }
+    const seen = this.cliSeenPid.get(s.id);
+    if (seen === undefined) return s; // never seen it open (or tinyd restarted since): the hook's job
+    this.cliSeenPid.delete(s.id);
+    this.cliClosedPid.set(s.id, seen);
+    if (s.cliClosedAt !== null) return s;
+    this.deps.stores.sessions.setCliClosedAt(s.id, new Date().toISOString());
+    return this.getSession(s.id);
+  }
+
+  /** Whether a registry entry is the child of tiny's own SDK turn on this session (running, or just ended) */
+  private isOwnProcess(id: string, entry: LiveSessionEntry): boolean {
+    const own = this.ownSdkTurn.get(id);
+    if (!own) return false;
+    const grace = this.deps.ownProcessGraceMs ?? OWN_PROCESS_GRACE_MS;
+    if (own.endedAt !== null && Date.now() - own.endedAt >= grace) return false;
+    const started = entry.startedAt === null ? NaN : Date.parse(entry.startedAt);
+    // An entry that does not say when it started, inside our window: do not guess
+    return Number.isNaN(started) || started >= own.startedAt;
+  }
+
   /** Whether a turn sent now would run inside the user's CLI (live join) rather than be refused */
   canJoin(s: SessionRecord): boolean {
     return this.joinTarget(s) !== null;
@@ -945,6 +1003,8 @@ export class SessionManager extends EventEmitter {
     const finish = (): void => {
       this.running.delete(id);
       this.turnProgress.delete(id);
+      const own = this.ownSdkTurn.get(id);
+      if (own && own.endedAt === null) own.endedAt = Date.now();
       this.startNextQueued(id);
     };
     // In the map BEFORE anything can run: an SDK turn trips the agent's SessionStart hook while
@@ -960,6 +1020,7 @@ export class SessionManager extends EventEmitter {
       return;
     }
     if (!saved) this.persistUserMessage(id, prompt, images);
+    this.ownSdkTurn.set(id, { startedAt: Date.now(), endedAt: null });
     entry.done = this.runTurn(s, prompt, images, abort.signal).finally(finish);
   }
 

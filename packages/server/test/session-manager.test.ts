@@ -10,6 +10,7 @@ import { FileOutbox } from "../src/outbox.js";
 import { ConflictError, NotFoundError, SessionManager, type PeerBridge, type SessionManagerDeps } from "../src/session-manager.js";
 import type { AgentAdapter, RunTurnParams } from "../src/adapter.js";
 import { PEER_STOP, type PeerFrame, type PeerStatus, type PeerTarget } from "../src/claude-peer.js";
+import type { LiveSessionEntry } from "../src/claude-live.js";
 import type { EventRecord } from "../src/types.js";
 
 /** Fake session-token issuer for tests (stands in for AuthService.issueSessionToken / revokeSessionTokens) */
@@ -1784,6 +1785,105 @@ describe("SessionManager", () => {
       const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
       expect(live.manager.canJoin(live.manager.createSession({ profile: "oc", cwd }))).toBe(false); // opencode
       expect(live.manager.canJoin(live.manager.createSession({ profile: "work", cwd }))).toBe(false); // no agentSessionId yet
+    });
+  });
+
+  describe("observeCli (the registry as a fallback for a CLI that closed)", () => {
+    const proc = (pid: number, startedAt: string | null = "2026-09-02T04:00:00.000Z"): LiveSessionEntry =>
+      ({ pid, status: "idle", statusUpdatedAt: null, startedAt });
+
+    function closable(deps: Partial<SessionManagerDeps> = {}, adapter: AgentAdapter = okAdapter) {
+      let live: boolean | null = null;
+      let entry: LiveSessionEntry | null = null;
+      const { manager, stores, home } = makeManager(adapter, {
+        deps: { isCliLive: () => live, cliState: () => entry, ...deps },
+      });
+      const configDir = path.join(home, "external-claude");
+      fs.mkdirSync(configDir, { recursive: true });
+      const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+      addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+      const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-o" });
+      stores.events.append(session.id, "user_message", { text: "hi" });
+      const registry = (l: boolean | null, e: LiveSessionEntry | null = null): void => { live = l; entry = e; };
+      const observe = () => manager.observeCli(manager.getSession(session.id));
+      return { manager, stores, session, registry, observe };
+    }
+
+    it("closes a session whose CLI process was seen and is now gone", () => {
+      const { registry, observe } = closable();
+      registry(true, proc(100));
+      expect(observe().cliClosedAt).toBeNull();
+      registry(false);
+      expect(observe().cliClosedAt).not.toBeNull();
+    });
+
+    it("does nothing for a session it never saw open, or while the registry cannot be read", () => {
+      const { registry, observe } = closable();
+      registry(false);
+      expect(observe().cliClosedAt).toBeNull();   // e.g. right after a tinyd restart: the hook's job
+      registry(true, proc(100));
+      observe();
+      registry(null);
+      expect(observe().cliClosedAt).toBeNull();   // unreadable is not "gone"
+      registry(false);
+      expect(observe().cliClosedAt).not.toBeNull(); // the earlier sighting still counts
+    });
+
+    it("keeps the mark while the closing process is still shutting down, clears it for a new one", () => {
+      const { manager, registry, observe } = closable();
+      registry(true, proc(100));
+      observe();
+      manager.cliSessionEnded("agent-o");          // SessionEnd hook: the process is still there
+      expect(observe().cliClosedAt).not.toBeNull(); // same pid = not a reopen
+      registry(true, proc(101));                    // `claude --resume` in a new terminal
+      expect(observe().cliClosedAt).toBeNull();
+      registry(false);
+      expect(observe().cliClosedAt).not.toBeNull(); // and that one closing counts again
+    });
+
+    it("ignores tiny's own SDK child, which registers like a CLI, during the turn and just after", async () => {
+      const { adapter, releaseAll } = gatedAdapter();
+      const { manager, session, registry, observe } = closable({}, adapter);
+      manager.startTurn(session.id, "from the phone");
+      // the child started after the turn did (measured: `claude -p` writes a registry entry too)
+      registry(true, proc(200, new Date(Date.now() + 5).toISOString()));
+      observe();
+      releaseAll();
+      await manager.waitForIdle(session.id);
+      observe();                                     // still there for a moment after the turn
+      registry(false);
+      expect(observe().cliClosedAt).toBeNull();      // its going away is just the turn ending
+    });
+
+    it("does not guess about an entry without a start time while its own turn runs", async () => {
+      const { adapter, releaseAll } = gatedAdapter();
+      const { manager, session, registry, observe } = closable({}, adapter);
+      manager.startTurn(session.id, "from the phone");
+      registry(true, proc(200, null));
+      observe();
+      releaseAll();
+      await manager.waitForIdle(session.id);
+      registry(false);
+      expect(observe().cliClosedAt).toBeNull();
+    });
+
+    it("after its own turn is over, a process that appears is the person's terminal", async () => {
+      const { manager, session, registry, observe } = closable({ ownProcessGraceMs: 0 });
+      manager.startTurn(session.id, "from the phone");
+      await manager.waitForIdle(session.id);
+      registry(true, proc(400, new Date().toISOString()));
+      observe();
+      registry(false);
+      expect(observe().cliClosedAt).not.toBeNull();
+    });
+
+    it("leaves codex / opencode and sessions without an agent id alone", () => {
+      const { manager } = makeManager(okAdapter, { deps: { isCliLive: () => false } });
+      const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+      const fresh = manager.createSession({ profile: "work", cwd });   // no agentSessionId yet
+      expect(manager.observeCli(fresh)).toEqual(fresh);
+      const oc = manager.createSession({ profile: "oc", cwd });
+      expect(manager.observeCli(oc)).toEqual(oc);
     });
   });
 });
