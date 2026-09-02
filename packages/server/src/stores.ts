@@ -4,6 +4,7 @@ import type { ApnsEnv, DeviceRecord, EventRecord, FileRecord, SessionRecord, Ses
 interface SessionRow {
   id: string; agent_session_id: string | null; agent: string; profile: string;
   cwd: string; permission_mode: string; model: string | null; effort: string | null; title: string | null; status: string; archived_at: string | null; source_cursor: string | null;
+  cli_closed_at: string | null;
   created_at: string; updated_at: string;
 }
 
@@ -21,6 +22,7 @@ function rowToSession(r: SessionRow): SessionRecord {
     status: r.status as SessionStatus,
     archivedAt: r.archived_at,
     sourceCursor: r.source_cursor,
+    cliClosedAt: r.cli_closed_at,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -41,8 +43,8 @@ export function createStores(db: Database.Database) {
   const sessions = {
     create(rec: SessionRecord): void {
       db.prepare(
-        `INSERT INTO sessions (id, agent_session_id, agent, profile, cwd, permission_mode, model, effort, title, status, archived_at, source_cursor, created_at, updated_at)
-         VALUES (@id, @agentSessionId, @agent, @profile, @cwd, @permissionMode, @model, @effort, @title, @status, @archivedAt, @sourceCursor, @createdAt, @updatedAt)`,
+        `INSERT INTO sessions (id, agent_session_id, agent, profile, cwd, permission_mode, model, effort, title, status, archived_at, source_cursor, cli_closed_at, created_at, updated_at)
+         VALUES (@id, @agentSessionId, @agent, @profile, @cwd, @permissionMode, @model, @effort, @title, @status, @archivedAt, @sourceCursor, @cliClosedAt, @createdAt, @updatedAt)`,
       ).run(rec);
     },
     get(id: string): SessionRecord | null {
@@ -81,6 +83,14 @@ export function createStores(db: Database.Database) {
         new Date().toISOString(),
         id,
       );
+    },
+    /**
+     * The "closed in the CLI" mark. Leaves updated_at alone: closing is not conversation activity,
+     * so the list keeps its order and the unread dot stays off (same reasoning as renameProfile)
+     */
+    setCliClosedAt(id: string, at: string | null): void {
+      const r = db.prepare(`UPDATE sessions SET cli_closed_at = ? WHERE id = ?`).run(at, id);
+      if (r.changes === 0) throw new Error(`session not found: ${id}`);
     },
     // For profile rename. Leaves updated_at alone (a rename is not session activity,
     // so the list order should not move)

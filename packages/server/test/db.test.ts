@@ -45,4 +45,18 @@ describe("openDb", () => {
     const cols = (db.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>).map((c) => c.name);
     expect(cols).toContain("source_cursor");
   });
+
+  it("adds cli_closed_at to an existing sessions table", () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tiny-db-")), "old.db");
+    const raw = new Database(file);
+    raw.exec(`CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, agent_session_id TEXT, agent TEXT NOT NULL, profile TEXT NOT NULL,
+      cwd TEXT NOT NULL, permission_mode TEXT NOT NULL, model TEXT, effort TEXT, title TEXT,
+      status TEXT NOT NULL, archived_at TEXT, source_cursor TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+    raw.close();
+    const db = openDb(file);
+    const cols = (db.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).toContain("cli_closed_at");
+    db.close();
+  });
 });

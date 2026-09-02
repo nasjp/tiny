@@ -274,6 +274,7 @@ export class SessionManager extends EventEmitter {
       status: "idle",
       archivedAt: null,
       sourceCursor: null,
+      cliClosedAt: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -334,6 +335,7 @@ export class SessionManager extends EventEmitter {
       status: "idle",
       archivedAt: null,
       sourceCursor: null,
+      cliClosedAt: null,
       createdAt: now,
       updatedAt: now,
     };

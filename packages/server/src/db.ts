@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   status TEXT NOT NULL,
   archived_at TEXT,
   source_cursor TEXT,
+  cli_closed_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -75,6 +76,7 @@ function migrate(db: Database.Database): void {
   addColumnIfMissing(db, "sessions", "effort", "TEXT");
   addColumnIfMissing(db, "sessions", "archived_at", "TEXT");
   addColumnIfMissing(db, "sessions", "source_cursor", "TEXT");
+  addColumnIfMissing(db, "sessions", "cli_closed_at", "TEXT");
 }
 
 function addColumnIfMissing(db: Database.Database, table: string, column: string, ddl: string): void {
