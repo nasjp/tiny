@@ -208,7 +208,7 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
   // SessionEnd path: drop a handoff session that never got a single event
   app.post("/v1/sessions/discard-empty", async (c) => {
     const body = discardEmptySchema.parse(await c.req.json());
-    return c.json({ discarded: deps.manager.discardIfEmpty(body.agentSessionId) });
+    return c.json(deps.manager.cliSessionEnded(body.agentSessionId));
   });
 
   app.get("/v1/sessions/:id", (c) => c.json(withLive(deps.manager.getSession(c.req.param("id")))));

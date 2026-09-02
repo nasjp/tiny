@@ -203,6 +203,13 @@ export class SessionManager extends EventEmitter {
    * one of the two may become an event
    */
   private seenQuestions = new Map<string, Set<string>>();
+  /**
+   * Registry-side evidence for "the CLI closed this session". seen = the pid last observed holding
+   * the session; closed = the pid that closed it, so a process still shutting down after the
+   * SessionEnd hook fired is not taken for a reopen. Memory only: after a restart the hook is the signal
+   */
+  private cliSeenPid = new Map<string, number>();
+  private cliClosedPid = new Map<string, number>();
 
   constructor(private deps: SessionManagerDeps) {
     super();
@@ -318,6 +325,8 @@ export class SessionManager extends EventEmitter {
     const { driver, caps } = this.resolveProfile(input);
     const existing = this.deps.stores.sessions.byAgentSessionId(input.agentSessionId);
     if (existing) {
+      // The CLI opened it again (SessionStart fires on resume): no longer closed
+      if (existing.cliClosedAt !== null) this.clearCliClosed(existing.id);
       this.importOrSeed(existing.id);
       return { session: this.getSession(existing.id), adopted: false };
     }
@@ -640,22 +649,40 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
-   * SessionEnd path: drop a handoff session that never got a single event.
+   * The CLI closed this session (SessionEnd hook, or `tiny attach` exiting). A handoff session
+   * that never got a single event is dropped; any other is marked closed, which the list shows
+   * until the phone sends or the CLI resumes it.
    *
-   * Import the transcript before judging. The SessionStart hook adopts a session before the user
-   * has typed anything, so the backfill at adoption time imports nothing; if nothing syncs in
-   * between, a session that ran a whole conversation still looks empty here and would be deleted.
-   * After the import, "empty" means again what it was meant to mean: nothing ever happened.
+   * Import the transcript before judging emptiness. The SessionStart hook adopts a session before
+   * the user has typed anything, so the backfill at adoption time imports nothing; if nothing
+   * syncs in between, a session that ran a whole conversation still looks empty here and would be
+   * deleted. syncTranscript declines to import while a turn is running, and deleting on the
+   * strength of a look we did not take would be the same bug in a new place — so a running
+   * session is never dropped, only closed (its live turn ends on its own watcher)
    */
-  discardIfEmpty(agentSessionId: string): boolean {
+  cliSessionEnded(agentSessionId: string): { discarded: boolean; closed: boolean } {
     const s = this.deps.stores.sessions.byAgentSessionId(agentSessionId);
-    if (!s) return false;
-    // syncTranscript declines to import while a turn is running. Deleting on the strength of a
-    // look we did not take would be the same bug in a new place, so keep the session instead
-    if (s.status === "running") return false;
-    this.syncTranscript(s.id);
-    if (this.deps.stores.events.count(s.id) > 0) return false;
-    return this.deps.stores.sessions.delete(s.id);
+    if (!s) return { discarded: false, closed: false };
+    if (s.status !== "running") {
+      this.syncTranscript(s.id);
+      if (this.deps.stores.events.count(s.id) === 0 && this.deps.stores.sessions.delete(s.id)) {
+        return { discarded: true, closed: false };
+      }
+    }
+    // The hook runs before the process exits, so its registry entry may still be there for a
+    // moment: remember which pid closed, and observeCli will not take that pid for a reopen
+    const pid = this.deps.cliState?.(s)?.pid ?? this.cliSeenPid.get(s.id);
+    if (pid === undefined) this.cliClosedPid.delete(s.id);
+    else this.cliClosedPid.set(s.id, pid);
+    this.cliSeenPid.delete(s.id);
+    this.deps.stores.sessions.setCliClosedAt(s.id, new Date().toISOString());
+    return { discarded: false, closed: true };
+  }
+
+  /** The session is in use again (phone / resume / attach): the "closed" mark no longer applies */
+  private clearCliClosed(id: string): void {
+    this.cliClosedPid.delete(id);
+    this.deps.stores.sessions.setCliClosedAt(id, null);
   }
 
   /** Mid-session change of model / permission mode / archived. Does not affect a running turn; takes effect from the next turn */
@@ -865,6 +892,8 @@ export class SessionManager extends EventEmitter {
   startTurn(id: string, prompt: string, images?: TurnImage[]): { queued: boolean } {
     const s = this.getSession(id);
     if (s.status === "detached") throw new ConflictError("session is attached from CLI");
+    // Sent from the phone: whatever the CLI did with this session, it is tiny's again
+    if (s.cliClosedAt !== null) this.clearCliClosed(id);
     if (s.status === "running") {
       if (this.running.has(id)) {
         const q = this.queued.get(id) ?? [];
@@ -1365,6 +1394,7 @@ export class SessionManager extends EventEmitter {
   setDetached(id: string, detached: boolean): SessionRecord {
     const s = this.getSession(id);
     if (detached && s.status === "running") throw new ConflictError("turn running");
+    if (detached && s.cliClosedAt !== null) this.clearCliClosed(id);
     this.deps.stores.sessions.patch(id, { status: detached ? "detached" : "idle" });
     this.emitEvent(id, "session_state_changed", { status: detached ? "detached" : "idle" });
     return this.getSession(id);

@@ -715,7 +715,7 @@ describe("REST API", () => {
       method: "POST", headers: H(), body: JSON.stringify({ agentSessionId: "agent-empty" }),
     });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ discarded: true });
+    expect(await res.json()).toEqual({ discarded: true, closed: false });
   });
 
   // The guard lives in SessionManager, so it only works if the daemon hands the SAME resolver to

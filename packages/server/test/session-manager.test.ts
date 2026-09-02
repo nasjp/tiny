@@ -542,7 +542,7 @@ describe("SessionManager", () => {
     expect(manager.syncTranscript(session.id)).toBe(0);
   });
 
-  it("discardIfEmpty imports the transcript before judging the session empty", () => {
+  it("cliSessionEnded imports the transcript before judging the session empty", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
@@ -561,8 +561,8 @@ describe("SessionManager", () => {
       JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "it drives agents" }] } }),
     ].join("\n") + "\n");
 
-    // SessionEnd must not throw away a session that held a real exchange
-    expect(manager.discardIfEmpty("agent-late")).toBe(false);
+    // SessionEnd must not throw away a session that held a real exchange; it is closed instead
+    expect(manager.cliSessionEnded("agent-late")).toEqual({ discarded: false, closed: true });
     expect(stores.sessions.get(session.id)).not.toBeNull();
     expect(stores.events.listSince(session.id, 0).map((e) => e.type))
       .toEqual(["user_message", "assistant_text"]);
@@ -570,7 +570,7 @@ describe("SessionManager", () => {
     expect(manager.getSession(session.id).title).toBe("what does this repo do");
   });
 
-  it("discardIfEmpty keeps a session whose import was skipped because it is running", () => {
+  it("cliSessionEnded keeps (and closes) a session whose import was skipped because it is running", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
@@ -585,11 +585,12 @@ describe("SessionManager", () => {
 
     // syncTranscript declines to import mid-turn; deleting on the strength of a look we did not
     // take would be the same bug in a new place
-    expect(manager.discardIfEmpty("agent-busy")).toBe(false);
+    expect(manager.cliSessionEnded("agent-busy")).toEqual({ discarded: false, closed: true });
     expect(stores.sessions.get(session.id)).not.toBeNull();
+    expect(stores.sessions.get(session.id)!.cliClosedAt).not.toBeNull();
   });
 
-  it("discardIfEmpty removes a session with no events and keeps one with events", () => {
+  it("cliSessionEnded removes a session with no events", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");
     fs.mkdirSync(configDir, { recursive: true });
@@ -597,10 +598,58 @@ describe("SessionManager", () => {
     addProfile(path.join(home, "profiles"), "local", "claude", configDir);
     const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-empty" });
     expect(stores.events.count(session.id)).toBe(0);
-    expect(manager.discardIfEmpty("agent-empty")).toBe(true);
+    expect(manager.cliSessionEnded("agent-empty")).toEqual({ discarded: true, closed: false });
     expect(stores.sessions.get(session.id)).toBeNull();
     // unknown id is a no-op
-    expect(manager.discardIfEmpty("agent-empty")).toBe(false);
+    expect(manager.cliSessionEnded("agent-empty")).toEqual({ discarded: false, closed: false });
+  });
+
+  it("cliSessionEnded marks a kept session closed without moving it in the list", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-kept" });
+    stores.events.append(session.id, "user_message", { text: "hi" });
+    const before = stores.sessions.get(session.id)!.updatedAt;
+
+    expect(manager.cliSessionEnded("agent-kept")).toEqual({ discarded: false, closed: true });
+    const after = stores.sessions.get(session.id)!;
+    expect(after.cliClosedAt).not.toBeNull();
+    expect(after.status).toBe("idle");
+    expect(after.updatedAt).toBe(before);
+  });
+
+  it("the Closed mark goes away when attach starts, the CLI resumes, or the phone sends", async () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-r" });
+    stores.events.append(session.id, "user_message", { text: "hi" });
+    const closedAt = () => stores.sessions.get(session.id)!.cliClosedAt;
+
+    // `tiny attach` takes it into a terminal again
+    manager.cliSessionEnded("agent-r");
+    expect(closedAt()).not.toBeNull();
+    manager.setDetached(session.id, true);
+    expect(closedAt()).toBeNull();
+    manager.setDetached(session.id, false);
+
+    // `claude --resume` on the Mac: the SessionStart hook adopts the same session again
+    manager.cliSessionEnded("agent-r");
+    manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-r" });
+    expect(closedAt()).toBeNull();
+
+    // a message from the phone: the session is tiny's again (last — the adapter renames agentSessionId)
+    manager.cliSessionEnded("agent-r");
+    expect(closedAt()).not.toBeNull();
+    manager.startTurn(session.id, "again");
+    expect(closedAt()).toBeNull();
+    await manager.waitForIdle(session.id);
+    expect(closedAt()).toBeNull();
   });
 
   it("on startTurn completion: agentSessionId, title, back to idle, and events persisted", async () => {
