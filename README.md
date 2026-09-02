@@ -142,6 +142,12 @@ with the elapsed time and the output so far, the way Claude Code's own status li
 with the model's progress notes and the tools it ran, and Stop works on them just the same. Who
 started a turn makes no difference to what you can do with it.
 
+When you close that terminal session, its row in the list shows **Closed**, so you can tell at a
+glance which sessions the Mac still has open. The mark goes away as soon as you send from the
+phone or resume the session in the CLI. tinyd learns about it from the SessionEnd hook that
+`tiny live on` installs, and from Claude Code's own session registry, so a terminal that was
+killed is caught too on the next refresh.
+
 One thing stays in the terminal's hands: permission prompts. While Claude Code waits for an
 answer there, the phone shows "Waiting in the terminal". Closing the terminal hands the session
 back to tinyd for the next message.
