@@ -61,6 +61,7 @@
 		B2C98EDDD6647FCC5CD7C313 /* ChatViewWidthTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2037EA61E2C5C7EB524D943 /* ChatViewWidthTests.swift */; };
 		C2A23FF5ED3BCF35EB4A6E1F /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B11078F35F48A669A6F133A /* AppModel.swift */; };
 		C2F5E0B2429631D4DCBFDACC /* TinyNSE.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = E0EBE647A5A0F8CC96C7C1E0 /* TinyNSE.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		C44C0758DB25F49AEB862D30 /* SessionListBadgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8078FF262D2AC04410D762C5 /* SessionListBadgeTests.swift */; };
 		C53D29ADDB3E2620C752981C /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 641D55E60406FDC3E8EC79B5 /* Assets.xcassets */; };
 		C63A229364C573FF84882F34 /* EventStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47DE8DD782FD884CF0633C42 /* EventStream.swift */; };
 		C9DA023658D05B084BF63B99 /* ToolActivityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44471149F4309C3F0EAE8503 /* ToolActivityTests.swift */; };
@@ -178,6 +179,7 @@
 		80395DB03CC29C398413BA3E /* BulkArchiveUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BulkArchiveUITests.swift; sourceTree = "<group>"; };
 		80681FE26187071771FA4EAE /* PushCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushCrypto.swift; sourceTree = "<group>"; };
 		8075B9C9BB0213449C23B3DC /* QuestionCarouselTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuestionCarouselTests.swift; sourceTree = "<group>"; };
+		8078FF262D2AC04410D762C5 /* SessionListBadgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionListBadgeTests.swift; sourceTree = "<group>"; };
 		825FB5D4A11434EE6064C548 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		8B11078F35F48A669A6F133A /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		8B99BB40B42A005338884113 /* MessageCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageCopyTests.swift; sourceTree = "<group>"; };
@@ -324,6 +326,7 @@
 				35B0321A3D2C90E0EE2B8F54 /* PairingViewTests.swift */,
 				E9F57F68D7FC615F6A9BE3A6 /* PushCryptoTests.swift */,
 				8075B9C9BB0213449C23B3DC /* QuestionCarouselTests.swift */,
+				8078FF262D2AC04410D762C5 /* SessionListBadgeTests.swift */,
 				4B220C81288D68CA10A71D70 /* SessionSelectionTests.swift */,
 				D78870A3A7ADD799D0AD9E94 /* SharedKeychainTests.swift */,
 				E8C0289B83F48948A7DEF728 /* ThemeTests.swift */,
@@ -635,6 +638,7 @@
 				1380B7491878207380581B6C /* PairingViewTests.swift in Sources */,
 				EB3B097B2CD18D7160203B47 /* PushCryptoTests.swift in Sources */,
 				392EF6E1B25F1D4414F7D018 /* QuestionCarouselTests.swift in Sources */,
+				C44C0758DB25F49AEB862D30 /* SessionListBadgeTests.swift in Sources */,
 				15A42605CCEDE71553146C9D /* SessionSelectionTests.swift in Sources */,
 				E1A460A17D9C99F959977A23 /* SharedKeychainTests.swift in Sources */,
 				904AD44CBBFE078BF1007F9D /* ThemeTests.swift in Sources */,
@@ -741,7 +745,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = TS295VKGNA;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -835,7 +839,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = TS295VKGNA;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

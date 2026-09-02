@@ -56,6 +56,11 @@ enum SessionStatus: String, Codable {
     case idle, running, detached, interrupted
 }
 
+/// What the session list's status capsule shows. One place for the priority, so the row and the tests agree
+enum ListBadge {
+    case running, inCLI, interrupted, closed, idle
+}
+
 /// Permission mode. A closed enum would make the whole session-list decode fail the moment
 /// the server (future Codex / OpenCode etc.) returns an unknown value, so this is
 /// 3 known values + raw string. On the wire it stays a plain string ("default" etc.).
@@ -133,6 +138,19 @@ struct SessionRecord: Codable, Identifiable, Hashable {
     /// Something is running on this session — a turn tiny runs (status) or one the CLI is running
     /// on its own (activity). Who started it makes no difference to how it is shown
     var isBusy: Bool { status == .running || activity != nil }
+
+    /// When the agent's own CLI closed this session (ISO). nil = not closed, or used again since
+    /// (a turn from the phone, a resume in the CLI). Older servers omit the key.
+    var cliClosedAt: String? = nil
+
+    var listBadge: ListBadge {
+        if isBusy { return .running }
+        switch status {
+        case .detached: return .inCLI
+        case .interrupted: return .interrupted
+        case .running, .idle: return cliClosedAt != nil ? .closed : .idle
+        }
+    }
 
     var displayTitle: String { title ?? (cwd as NSString).lastPathComponent }
 }
