@@ -832,7 +832,7 @@ describe("REST API", () => {
 
     // The person typed a prompt into the terminal: only the registry knows
     cliLive = true;
-    cliState = { pid: 4242, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.000Z" };
+    cliState = { pid: 4242, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.000Z", startedAt: null };
     list = (await (await app.request("/v1/sessions", { headers: H() })).json()) as typeof list;
     expect(list.sessions.find((s) => s.id === id)!.activity).toEqual({ since: "2026-08-31T12:06:55.000Z", outputTokens: null });
     const one = (await (await app.request(`/v1/sessions/${id}`, { headers: H() })).json()) as Record<string, unknown>;
@@ -847,7 +847,7 @@ describe("REST API", () => {
     // adoptSession is what gives a CLI session its agent id; a session created here has none until a turn runs
     stores.sessions.patch(id, { agentSessionId: "agent-cli" });
     cliLive = true;
-    cliState = { pid: 4242, status: "busy", statusUpdatedAt: null };
+    cliState = { pid: 4242, status: "busy", statusUpdatedAt: null, startedAt: null };
 
     const unreachable = await app.request(`/v1/sessions/${id}/interrupt`, { method: "POST", headers: H() });
     expect(unreachable.status).toBe(409);

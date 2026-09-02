@@ -1851,7 +1851,7 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
     // Measured: after a turn that started a Bash task in the background, the registry reads "shell"
     // until the task exits and the CLI picks up again. The official app shows this as a running task
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "shell", statusUpdatedAt: "2026-09-01T15:09:17.919Z" }) },
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "shell", statusUpdatedAt: "2026-09-01T15:09:17.919Z", startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-bg-task");
     expect(manager.activity(manager.getSession(session.id))).toEqual({
@@ -1861,7 +1861,7 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
 
   it("reports a turn typed into the CLI from the registry, and its tokens once the transcript is synced", () => {
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.000Z" }) },
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.000Z", startedAt: null }) },
     });
     const { session, file } = liveSession(manager, home, "agent-cli-turn");
     // Nothing synced yet: the registry alone says when it started, and nothing says how far it is
@@ -1879,7 +1879,7 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
   it("never shows a previous turn's tokens against a turn the transcript has not been read for", () => {
     let statusUpdatedAt = "2026-08-31T12:06:55.000Z";
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt }) },
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt, startedAt: null }) },
     });
     const { session, file } = liveSession(manager, home, "agent-cli-stale");
     fs.writeFileSync(file, jsonl([
@@ -1895,7 +1895,7 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
   it("counts a permission prompt as still running, and an idle or unknown CLI as nothing", () => {
     let status: "busy" | "idle" | "waiting" | "shell" | "unknown" = "idle";
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status, statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status, statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-states");
     const s = manager.getSession(session.id);
@@ -1927,7 +1927,7 @@ describe("SessionManager Stop on a turn the CLI started", () => {
   it("sends the CLI the same stop message a live turn gets, at 'now' priority", async () => {
     const { peer, sent } = fakePeer();
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-stop");
     await manager.interrupt(session.id);
@@ -1940,7 +1940,7 @@ describe("SessionManager Stop on a turn the CLI started", () => {
   it("sends nothing when the CLI is idle", async () => {
     const { peer, sent } = fakePeer();
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "idle", statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "idle", statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-idle");
     await manager.interrupt(session.id);
@@ -1950,7 +1950,7 @@ describe("SessionManager Stop on a turn the CLI started", () => {
   it("fails visibly when the CLI is busy but cannot be reached", async () => {
     const { peer } = fakePeer({ resolve: () => null });
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-unreachable");
     await expect(manager.interrupt(session.id)).rejects.toThrow(ConflictError);
@@ -1959,7 +1959,7 @@ describe("SessionManager Stop on a turn the CLI started", () => {
   it("surfaces a socket failure instead of swallowing it", async () => {
     const { peer } = fakePeer({ send: async () => { throw new Error("connect ENOENT /srv/cc-socks/4242.sock"); } });
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-socket");
     await expect(manager.interrupt(session.id)).rejects.toThrow(/ENOENT/);
