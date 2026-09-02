@@ -21,6 +21,7 @@ function fixture(over: Partial<SessionRecord> = {}): SessionRecord {
     status: "idle",
     archivedAt: null,
     sourceCursor: null,
+    cliClosedAt: null,
     createdAt: now,
     updatedAt: now,
     ...over,
@@ -125,7 +126,7 @@ describe("stores", () => {
     const rec = {
       id: "s1", agentSessionId: "agent-1", agent: "claude", profile: "work",
       cwd: "/tmp", permissionMode: "default", model: null, effort: null, title: null,
-      status: "idle" as const, archivedAt: null, sourceCursor: null,
+      status: "idle" as const, archivedAt: null, sourceCursor: null, cliClosedAt: null,
       createdAt: "2026-08-31T00:00:00.000Z", updatedAt: "2026-08-31T00:00:00.000Z",
     };
     s.sessions.create(rec);
@@ -140,7 +141,7 @@ describe("stores", () => {
     const rec = {
       id: "s2", agentSessionId: null, agent: "claude", profile: "work",
       cwd: "/tmp", permissionMode: "default", model: null, effort: null, title: null,
-      status: "idle" as const, archivedAt: null, sourceCursor: null,
+      status: "idle" as const, archivedAt: null, sourceCursor: null, cliClosedAt: null,
       createdAt: "2026-08-31T00:00:00.000Z", updatedAt: "2026-08-31T00:00:00.000Z",
     };
     s.sessions.create(rec);
@@ -154,6 +155,26 @@ describe("stores", () => {
     s.events.append("s3", "user_message", { text: "hi" });
     s.events.append("s3", "assistant_text", { text: "yo" });
     expect(s.events.count("s3")).toBe(2);
+  });
+
+  it("setCliClosedAt writes the mark without touching updated_at, and patch keeps it", () => {
+    const rec = fixture({ updatedAt: "2026-09-02T10:00:00.000Z" });
+    s.sessions.create(rec);
+    expect(s.sessions.get(rec.id)?.cliClosedAt).toBeNull();
+
+    s.sessions.setCliClosedAt(rec.id, "2026-09-02T12:00:00.000Z");
+    const closed = s.sessions.get(rec.id)!;
+    expect(closed.cliClosedAt).toBe("2026-09-02T12:00:00.000Z");
+    // Closing is not conversation activity: the list must not reorder, the unread dot must stay off
+    expect(closed.updatedAt).toBe("2026-09-02T10:00:00.000Z");
+
+    // An unrelated patch (title / model / status) leaves the mark alone
+    s.sessions.patch(rec.id, { title: "renamed" });
+    expect(s.sessions.get(rec.id)?.cliClosedAt).toBe("2026-09-02T12:00:00.000Z");
+
+    s.sessions.setCliClosedAt(rec.id, null);
+    expect(s.sessions.get(rec.id)?.cliClosedAt).toBeNull();
+    expect(() => s.sessions.setCliClosedAt("missing", null)).toThrow(/not found/);
   });
 });
 

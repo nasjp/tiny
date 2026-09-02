@@ -270,8 +270,9 @@ struct SessionListView: View {
                             .padding(.vertical, 2)
                             .background(Color.secondary.opacity(0.15), in: Capsule())
                     }
-                    // A turn the CLI is running on its own is "Running" all the same
-                    statusBadge(s.isBusy ? .running : s.status)
+                    // A turn the CLI is running on its own is "Running" all the same; a CLI that
+                    // closed the session shows "Closed" until the phone sends or the CLI resumes
+                    statusBadge(s.listBadge)
                 }
                 HStack(spacing: 4) {
                     Text("\(s.profile) · \((s.cwd as NSString).lastPathComponent)")
@@ -299,12 +300,13 @@ struct SessionListView: View {
         return f.localizedString(for: date, relativeTo: Date())
     }
 
-    private func statusBadge(_ st: SessionStatus) -> some View {
-        let (text, color): (String, Color) = switch st {
+    private func statusBadge(_ badge: ListBadge) -> some View {
+        let (text, color): (String, Color) = switch badge {
         case .idle: ("Idle", .tInkSub)
         case .running: ("Running", .tRunning)
-        case .detached: ("In CLI", .tDetached)
+        case .inCLI: ("In CLI", .tDetached)
         case .interrupted: ("Interrupted", .tRuby)
+        case .closed: ("Closed", .tDetached)
         }
         return Text(text).font(.tinyCaption2).padding(.horizontal, 8).padding(.vertical, 2)
             .background(color.opacity(0.15)).foregroundStyle(color).clipShape(Capsule())

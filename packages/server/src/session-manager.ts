@@ -69,6 +69,9 @@ export interface LiveTiming {
 // process itself) is what says when it is not. Every way a turn can end is evidence-based
 const DEFAULT_LIVE_TIMING: LiveTiming = { pollMs: 1000, deliveryTimeoutMs: 60_000, idleSettleMs: 5000 };
 
+/** The SDK's child `claude` stays in the registry a moment after the result arrives */
+const OWN_PROCESS_GRACE_MS = 10_000;
+
 export interface SessionManagerDeps {
   stores: Stores;
   profilesDir: string;
@@ -104,6 +107,11 @@ export interface SessionManagerDeps {
   peer?: PeerBridge;
   /** Watcher timings. Tests shorten them; production uses the defaults */
   liveTiming?: LiveTiming;
+  /**
+   * How long after tiny's own SDK turn ends its child process may still show in the registry.
+   * Tests shorten it; production uses OWN_PROCESS_GRACE_MS
+   */
+  ownProcessGraceMs?: number;
 }
 
 interface RunningTurn {
@@ -203,6 +211,19 @@ export class SessionManager extends EventEmitter {
    * one of the two may become an event
    */
   private seenQuestions = new Map<string, Set<string>>();
+  /**
+   * Registry-side evidence for "the CLI closed this session". seen = the pid last observed holding
+   * the session; closed = the pid that closed it, so a process still shutting down after the
+   * SessionEnd hook fired is not taken for a reopen. Memory only: after a restart the hook is the signal
+   */
+  private cliSeenPid = new Map<string, number>();
+  private cliClosedPid = new Map<string, number>();
+  /**
+   * tiny's own SDK turns per session: their child `claude` registers like any CLI (measured on
+   * 2.1.258), so a registry entry started after one of these — while it runs or shortly after —
+   * is ours and says nothing about the person's terminal
+   */
+  private ownSdkTurn = new Map<string, { startedAt: number; endedAt: number | null }>();
 
   constructor(private deps: SessionManagerDeps) {
     super();
@@ -274,6 +295,7 @@ export class SessionManager extends EventEmitter {
       status: "idle",
       archivedAt: null,
       sourceCursor: null,
+      cliClosedAt: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -317,6 +339,8 @@ export class SessionManager extends EventEmitter {
     const { driver, caps } = this.resolveProfile(input);
     const existing = this.deps.stores.sessions.byAgentSessionId(input.agentSessionId);
     if (existing) {
+      // The CLI opened it again (SessionStart fires on resume): no longer closed
+      this.clearCliClosed(existing);
       this.importOrSeed(existing.id);
       return { session: this.getSession(existing.id), adopted: false };
     }
@@ -334,6 +358,7 @@ export class SessionManager extends EventEmitter {
       status: "idle",
       archivedAt: null,
       sourceCursor: null,
+      cliClosedAt: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -638,22 +663,51 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
-   * SessionEnd path: drop a handoff session that never got a single event.
+   * The CLI closed this session (SessionEnd hook, or `tiny attach` exiting). A handoff session
+   * that never got a single event is dropped; any other is marked closed, which the list shows
+   * until the phone sends or the CLI resumes it.
    *
-   * Import the transcript before judging. The SessionStart hook adopts a session before the user
-   * has typed anything, so the backfill at adoption time imports nothing; if nothing syncs in
-   * between, a session that ran a whole conversation still looks empty here and would be deleted.
-   * After the import, "empty" means again what it was meant to mean: nothing ever happened.
+   * Import the transcript before judging emptiness. The SessionStart hook adopts a session before
+   * the user has typed anything, so the backfill at adoption time imports nothing; if nothing
+   * syncs in between, a session that ran a whole conversation still looks empty here and would be
+   * deleted. syncTranscript declines to import while a turn is running, and deleting on the
+   * strength of a look we did not take would be the same bug in a new place — so a running
+   * session is never dropped, only closed (its live turn ends on its own watcher)
    */
-  discardIfEmpty(agentSessionId: string): boolean {
+  cliSessionEnded(agentSessionId: string): { discarded: boolean; closed: boolean } {
     const s = this.deps.stores.sessions.byAgentSessionId(agentSessionId);
-    if (!s) return false;
-    // syncTranscript declines to import while a turn is running. Deleting on the strength of a
-    // look we did not take would be the same bug in a new place, so keep the session instead
-    if (s.status === "running") return false;
-    this.syncTranscript(s.id);
-    if (this.deps.stores.events.count(s.id) > 0) return false;
-    return this.deps.stores.sessions.delete(s.id);
+    if (!s) return { discarded: false, closed: false };
+    if (s.status !== "running") {
+      this.syncTranscript(s.id);
+      if (this.deps.stores.events.count(s.id) === 0 && this.deps.stores.sessions.delete(s.id)) {
+        // The row is gone: leave nothing behind that a later session could inherit
+        this.cliSeenPid.delete(s.id);
+        this.cliClosedPid.delete(s.id);
+        this.ownSdkTurn.delete(s.id);
+        return { discarded: true, closed: false };
+      }
+    }
+    // The hook runs before the process exits, so its registry entry may still be there for a
+    // moment: remember which pid closed, and observeCli will not take that pid for a reopen
+    const pid = this.deps.cliState?.(s)?.pid ?? this.cliSeenPid.get(s.id);
+    if (pid === undefined) this.cliClosedPid.delete(s.id);
+    else this.cliClosedPid.set(s.id, pid);
+    this.cliSeenPid.delete(s.id);
+    this.deps.stores.sessions.setCliClosedAt(s.id, new Date().toISOString());
+    return { discarded: false, closed: true };
+  }
+
+  /**
+   * The session is in use again (phone / resume / attach): it forgets both the "closed" mark and
+   * the pid it was last seen under. The pid matters as much as the mark: an observation older than
+   * this turn must not close the session later — the terminal that was seen may already be gone
+   * (killed, with no SessionEnd hook), and the observer ignores tiny's own child, so nothing would
+   * replace that stale sighting before the next poll read it as "the CLI went away"
+   */
+  private clearCliClosed(s: SessionRecord): void {
+    this.cliSeenPid.delete(s.id);
+    this.cliClosedPid.delete(s.id);
+    if (s.cliClosedAt !== null) this.deps.stores.sessions.setCliClosedAt(s.id, null);
   }
 
   /** Mid-session change of model / permission mode / archived. Does not affect a running turn; takes effect from the next turn */
@@ -850,6 +904,59 @@ export class SessionManager extends EventEmitter {
     return true;
   }
 
+  /**
+   * Registry-side fallback for "the CLI closed this session": a process that was seen holding it
+   * and is now gone. The SessionEnd hook is the primary signal (immediate, and it names the
+   * session); this catches a terminal that was killed, and a config dir without `tiny live on`.
+   * Called per row on every list / get, so it is cheap and does not throw in normal operation; if
+   * the row vanished between the caller's read and this call, the store's "session not found"
+   * error surfaces, the same as any other write to a missing row. Returns the record as it stands
+   * afterwards
+   */
+  observeCli(s: SessionRecord): SessionRecord {
+    if (s.agent !== "claude" || !s.agentSessionId) return s;
+    const live = this.deps.isCliLive?.(s);
+    if (live !== true && live !== false) return s; // cannot tell: no evidence either way
+    if (live) {
+      const entry = this.deps.cliState?.(s);
+      if (!entry || this.isOwnProcess(s.id, entry)) return s;
+      // The hook fires before the process exits, so the pid that closed the session can still be
+      // there for a moment; only a different process means the person opened it again
+      const reopened = s.cliClosedAt !== null && this.cliClosedPid.get(s.id) !== entry.pid;
+      if (reopened) this.clearCliClosed(s); // forgets the seen pid too, so record this one after
+      this.cliSeenPid.set(s.id, entry.pid);
+      return reopened ? this.getSession(s.id) : s;
+    }
+    const seen = this.cliSeenPid.get(s.id);
+    if (seen === undefined) return s; // never seen it open (or tinyd restarted since): the hook's job
+    this.cliSeenPid.delete(s.id);
+    this.cliClosedPid.set(s.id, seen);
+    if (s.cliClosedAt !== null) return s;
+    this.deps.stores.sessions.setCliClosedAt(s.id, new Date().toISOString());
+    return this.getSession(s.id);
+  }
+
+  /**
+   * tiny's own SDK turn on this session while a child of it may still be registered: running, or
+   * ended within the grace window. The record itself, so callers can extend it
+   */
+  private ownTurnInWindow(id: string): { startedAt: number; endedAt: number | null } | null {
+    const own = this.ownSdkTurn.get(id);
+    if (!own) return null;
+    if (own.endedAt === null) return own;
+    const grace = this.deps.ownProcessGraceMs ?? OWN_PROCESS_GRACE_MS;
+    return Date.now() - own.endedAt < grace ? own : null;
+  }
+
+  /** Whether a registry entry is the child of tiny's own SDK turn on this session (running, or just ended) */
+  private isOwnProcess(id: string, entry: LiveSessionEntry): boolean {
+    const own = this.ownTurnInWindow(id);
+    if (!own) return false;
+    const started = entry.startedAt === null ? NaN : Date.parse(entry.startedAt);
+    // An entry that does not say when it started, inside our window: do not guess
+    return Number.isNaN(started) || started >= own.startedAt;
+  }
+
   /** Whether a turn sent now would run inside the user's CLI (live join) rather than be refused */
   canJoin(s: SessionRecord): boolean {
     return this.joinTarget(s) !== null;
@@ -863,6 +970,8 @@ export class SessionManager extends EventEmitter {
   startTurn(id: string, prompt: string, images?: TurnImage[]): { queued: boolean } {
     const s = this.getSession(id);
     if (s.status === "detached") throw new ConflictError("session is attached from CLI");
+    // Sent from the phone: whatever the CLI did with this session, it is tiny's again
+    this.clearCliClosed(s);
     if (s.status === "running") {
       if (this.running.has(id)) {
         const q = this.queued.get(id) ?? [];
@@ -914,6 +1023,8 @@ export class SessionManager extends EventEmitter {
     const finish = (): void => {
       this.running.delete(id);
       this.turnProgress.delete(id);
+      const own = this.ownSdkTurn.get(id);
+      if (own && own.endedAt === null) own.endedAt = Date.now();
       this.startNextQueued(id);
     };
     // In the map BEFORE anything can run: an SDK turn trips the agent's SessionStart hook while
@@ -929,6 +1040,13 @@ export class SessionManager extends EventEmitter {
       return;
     }
     if (!saved) this.persistUserMessage(id, prompt, images);
+    // Back-to-back turns (a queued message starts the next one the instant this one settles) extend
+    // the window instead of restarting it: the previous turn's child can still be the registry's
+    // entry for this session, and a window starting now would read that child as the person's
+    // terminal and close the session when it goes. A missed close is the safe way to be wrong here
+    const own = this.ownTurnInWindow(id);
+    if (own) own.endedAt = null;
+    else this.ownSdkTurn.set(id, { startedAt: Date.now(), endedAt: null });
     entry.done = this.runTurn(s, prompt, images, abort.signal).finally(finish);
   }
 
@@ -1363,6 +1481,7 @@ export class SessionManager extends EventEmitter {
   setDetached(id: string, detached: boolean): SessionRecord {
     const s = this.getSession(id);
     if (detached && s.status === "running") throw new ConflictError("turn running");
+    if (detached) this.clearCliClosed(s);
     this.deps.stores.sessions.patch(id, { status: detached ? "detached" : "idle" });
     this.emitEvent(id, "session_state_changed", { status: detached ? "detached" : "idle" });
     return this.getSession(id);

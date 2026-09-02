@@ -101,16 +101,26 @@ describe("claude-live registry status", () => {
     writeEntry(root, 111, { pid: 111, sessionId: SID, peerProtocol: 1, status: "busy", statusUpdatedAt: 1788178015525 });
     writeEntry(root, 222, { pid: 222, sessionId: "other", peerProtocol: 1, status: "idle", statusUpdatedAt: 1788178000000 });
     const entries = readLiveSessions(root, alwaysAlive);
-    expect(entries?.get(SID)).toEqual({ pid: 111, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.525Z" });
-    expect(entries?.get("other")).toEqual({ pid: 222, status: "idle", statusUpdatedAt: "2026-08-31T12:06:40.000Z" });
+    expect(entries?.get(SID)).toEqual({
+      pid: 111,
+      status: "busy",
+      statusUpdatedAt: "2026-08-31T12:06:55.525Z",
+      startedAt: null,
+    });
+    expect(entries?.get("other")).toEqual({
+      pid: 222,
+      status: "idle",
+      statusUpdatedAt: "2026-08-31T12:06:40.000Z",
+      startedAt: null,
+    });
   });
 
   it("reports an unreadable or unexpected status as unknown, never as idle", () => {
     writeEntry(root, 111, { pid: 111, sessionId: SID, peerProtocol: 1 });
     writeEntry(root, 222, { pid: 222, sessionId: "other", peerProtocol: 1, status: "dancing", statusUpdatedAt: "soon" });
     const entries = readLiveSessions(root, alwaysAlive);
-    expect(entries?.get(SID)).toEqual({ pid: 111, status: "unknown", statusUpdatedAt: null });
-    expect(entries?.get("other")).toEqual({ pid: 222, status: "unknown", statusUpdatedAt: null });
+    expect(entries?.get(SID)).toEqual({ pid: 111, status: "unknown", statusUpdatedAt: null, startedAt: null });
+    expect(entries?.get("other")).toEqual({ pid: 222, status: "unknown", statusUpdatedAt: null, startedAt: null });
   });
 
   it("leaves out sessions whose process is gone and agrees with readLiveSessionIds", () => {
@@ -124,5 +134,14 @@ describe("claude-live registry status", () => {
 
   it("is null when the registry cannot be read", () => {
     expect(readLiveSessions(root, alwaysAlive)).toBeNull();
+  });
+
+  it("carries when the process started, null when the entry does not say", () => {
+    // Measured on Claude Code 2.1.258: startedAt is a ms epoch, written for every process (the SDK's too)
+    writeEntry(root, 111, { pid: 111, sessionId: SID, peerProtocol: 1, startedAt: 1788357230729 });
+    writeEntry(root, 222, { pid: 222, sessionId: "other", peerProtocol: 1 });
+    const entries = readLiveSessions(root, alwaysAlive)!;
+    expect(entries.get(SID)?.startedAt).toBe("2026-09-02T13:53:50.729Z");
+    expect(entries.get("other")?.startedAt).toBeNull();
   });
 });

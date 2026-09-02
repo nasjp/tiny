@@ -10,6 +10,7 @@ import { FileOutbox } from "../src/outbox.js";
 import { ConflictError, NotFoundError, SessionManager, type PeerBridge, type SessionManagerDeps } from "../src/session-manager.js";
 import type { AgentAdapter, RunTurnParams } from "../src/adapter.js";
 import { PEER_STOP, type PeerFrame, type PeerStatus, type PeerTarget } from "../src/claude-peer.js";
+import type { LiveSessionEntry } from "../src/claude-live.js";
 import type { EventRecord } from "../src/types.js";
 
 /** Fake session-token issuer for tests (stands in for AuthService.issueSessionToken / revokeSessionTokens) */
@@ -542,7 +543,7 @@ describe("SessionManager", () => {
     expect(manager.syncTranscript(session.id)).toBe(0);
   });
 
-  it("discardIfEmpty imports the transcript before judging the session empty", () => {
+  it("cliSessionEnded imports the transcript before judging the session empty", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
@@ -561,8 +562,8 @@ describe("SessionManager", () => {
       JSON.stringify({ type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "it drives agents" }] } }),
     ].join("\n") + "\n");
 
-    // SessionEnd must not throw away a session that held a real exchange
-    expect(manager.discardIfEmpty("agent-late")).toBe(false);
+    // SessionEnd must not throw away a session that held a real exchange; it is closed instead
+    expect(manager.cliSessionEnded("agent-late")).toEqual({ discarded: false, closed: true });
     expect(stores.sessions.get(session.id)).not.toBeNull();
     expect(stores.events.listSince(session.id, 0).map((e) => e.type))
       .toEqual(["user_message", "assistant_text"]);
@@ -570,7 +571,7 @@ describe("SessionManager", () => {
     expect(manager.getSession(session.id).title).toBe("what does this repo do");
   });
 
-  it("discardIfEmpty keeps a session whose import was skipped because it is running", () => {
+  it("cliSessionEnded keeps (and closes) a session whose import was skipped because it is running", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
@@ -585,11 +586,12 @@ describe("SessionManager", () => {
 
     // syncTranscript declines to import mid-turn; deleting on the strength of a look we did not
     // take would be the same bug in a new place
-    expect(manager.discardIfEmpty("agent-busy")).toBe(false);
+    expect(manager.cliSessionEnded("agent-busy")).toEqual({ discarded: false, closed: true });
     expect(stores.sessions.get(session.id)).not.toBeNull();
+    expect(stores.sessions.get(session.id)!.cliClosedAt).not.toBeNull();
   });
 
-  it("discardIfEmpty removes a session with no events and keeps one with events", () => {
+  it("cliSessionEnded removes a session with no events", () => {
     const { manager, stores, home } = makeManager(okAdapter);
     const configDir = path.join(home, "external-claude");
     fs.mkdirSync(configDir, { recursive: true });
@@ -597,10 +599,58 @@ describe("SessionManager", () => {
     addProfile(path.join(home, "profiles"), "local", "claude", configDir);
     const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-empty" });
     expect(stores.events.count(session.id)).toBe(0);
-    expect(manager.discardIfEmpty("agent-empty")).toBe(true);
+    expect(manager.cliSessionEnded("agent-empty")).toEqual({ discarded: true, closed: false });
     expect(stores.sessions.get(session.id)).toBeNull();
     // unknown id is a no-op
-    expect(manager.discardIfEmpty("agent-empty")).toBe(false);
+    expect(manager.cliSessionEnded("agent-empty")).toEqual({ discarded: false, closed: false });
+  });
+
+  it("cliSessionEnded marks a kept session closed without moving it in the list", () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-kept" });
+    stores.events.append(session.id, "user_message", { text: "hi" });
+    const before = stores.sessions.get(session.id)!.updatedAt;
+
+    expect(manager.cliSessionEnded("agent-kept")).toEqual({ discarded: false, closed: true });
+    const after = stores.sessions.get(session.id)!;
+    expect(after.cliClosedAt).not.toBeNull();
+    expect(after.status).toBe("idle");
+    expect(after.updatedAt).toBe(before);
+  });
+
+  it("the Closed mark goes away when attach starts, the CLI resumes, or the phone sends", async () => {
+    const { manager, stores, home } = makeManager(okAdapter);
+    const configDir = path.join(home, "external-claude");
+    fs.mkdirSync(configDir, { recursive: true });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+    const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-r" });
+    stores.events.append(session.id, "user_message", { text: "hi" });
+    const closedAt = () => stores.sessions.get(session.id)!.cliClosedAt;
+
+    // `tiny attach` takes it into a terminal again
+    manager.cliSessionEnded("agent-r");
+    expect(closedAt()).not.toBeNull();
+    manager.setDetached(session.id, true);
+    expect(closedAt()).toBeNull();
+    manager.setDetached(session.id, false);
+
+    // `claude --resume` on the Mac: the SessionStart hook adopts the same session again
+    manager.cliSessionEnded("agent-r");
+    manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-r" });
+    expect(closedAt()).toBeNull();
+
+    // a message from the phone: the session is tiny's again (last — the adapter renames agentSessionId)
+    manager.cliSessionEnded("agent-r");
+    expect(closedAt()).not.toBeNull();
+    manager.startTurn(session.id, "again");
+    expect(closedAt()).toBeNull();
+    await manager.waitForIdle(session.id);
+    expect(closedAt()).toBeNull();
   });
 
   it("on startTurn completion: agentSessionId, title, back to idle, and events persisted", async () => {
@@ -1737,6 +1787,154 @@ describe("SessionManager", () => {
       expect(live.manager.canJoin(live.manager.createSession({ profile: "work", cwd }))).toBe(false); // no agentSessionId yet
     });
   });
+
+  describe("observeCli (the registry as a fallback for a CLI that closed)", () => {
+    const proc = (pid: number, startedAt: string | null = "2026-09-02T04:00:00.000Z"): LiveSessionEntry =>
+      ({ pid, status: "idle", statusUpdatedAt: null, startedAt });
+
+    /**
+     * A session the registry deps can be driven around. `on` picks what is adopted: the default is
+     * a claude session with an agent session id; `agentSessionId: null` creates one without one
+     */
+    function closable(
+      deps: Partial<SessionManagerDeps> = {},
+      adapter: AgentAdapter = okAdapter,
+      on: { profile?: string; agentSessionId?: string | null } = {},
+    ) {
+      let live: boolean | null = null;
+      let entry: LiveSessionEntry | null = null;
+      const { manager, stores, home } = makeManager(adapter, {
+        deps: { isCliLive: () => live, cliState: () => entry, ...deps },
+      });
+      const configDir = path.join(home, "external-claude");
+      fs.mkdirSync(configDir, { recursive: true });
+      const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+      addProfile(path.join(home, "profiles"), "local", "claude", configDir);
+      const profile = on.profile ?? "local";
+      const agentSessionId = on.agentSessionId === undefined ? "agent-o" : on.agentSessionId;
+      const session = agentSessionId === null
+        ? manager.createSession({ profile, cwd })
+        : manager.adoptSession({ profile, cwd, agentSessionId }).session;
+      stores.events.append(session.id, "user_message", { text: "hi" });
+      const registry = (l: boolean | null, e: LiveSessionEntry | null = null): void => { live = l; entry = e; };
+      const observe = () => manager.observeCli(manager.getSession(session.id));
+      return { manager, stores, session, registry, observe };
+    }
+
+    it("closes a session whose CLI process was seen and is now gone", () => {
+      const { registry, observe } = closable();
+      registry(true, proc(100));
+      expect(observe().cliClosedAt).toBeNull();
+      registry(false);
+      expect(observe().cliClosedAt).not.toBeNull();
+    });
+
+    it("does nothing for a session it never saw open, or while the registry cannot be read", () => {
+      const { registry, observe } = closable();
+      registry(false);
+      expect(observe().cliClosedAt).toBeNull();   // e.g. right after a tinyd restart: the hook's job
+      registry(true, proc(100));
+      observe();
+      registry(null);
+      expect(observe().cliClosedAt).toBeNull();   // unreadable is not "gone"
+      registry(false);
+      expect(observe().cliClosedAt).not.toBeNull(); // the earlier sighting still counts
+    });
+
+    it("keeps the mark while the closing process is still shutting down, clears it for a new one", () => {
+      const { manager, registry, observe } = closable();
+      registry(true, proc(100));
+      observe();
+      manager.cliSessionEnded("agent-o");          // SessionEnd hook: the process is still there
+      expect(observe().cliClosedAt).not.toBeNull(); // same pid = not a reopen
+      registry(true, proc(101));                    // `claude --resume` in a new terminal
+      expect(observe().cliClosedAt).toBeNull();
+      registry(false);
+      expect(observe().cliClosedAt).not.toBeNull(); // and that one closing counts again
+    });
+
+    it("ignores tiny's own SDK child, which registers like a CLI, during the turn and just after", async () => {
+      const { adapter, releaseAll } = gatedAdapter();
+      const { manager, session, registry, observe } = closable({}, adapter);
+      manager.startTurn(session.id, "from the phone");
+      // the child started after the turn did (measured: `claude -p` writes a registry entry too)
+      registry(true, proc(200, new Date(Date.now() + 5).toISOString()));
+      observe();
+      releaseAll();
+      await manager.waitForIdle(session.id);
+      observe();                                     // still there for a moment after the turn
+      registry(false);
+      expect(observe().cliClosedAt).toBeNull();      // its going away is just the turn ending
+    });
+
+    it("does not guess about an entry without a start time while its own turn runs", async () => {
+      const { adapter, releaseAll } = gatedAdapter();
+      const { manager, session, registry, observe } = closable({}, adapter);
+      manager.startTurn(session.id, "from the phone");
+      registry(true, proc(200, null));
+      observe();
+      releaseAll();
+      await manager.waitForIdle(session.id);
+      registry(false);
+      expect(observe().cliClosedAt).toBeNull();
+    });
+
+    it("after its own turn is over, a process that appears is the person's terminal", async () => {
+      const { manager, session, registry, observe } = closable({ ownProcessGraceMs: 0 });
+      manager.startTurn(session.id, "from the phone");
+      await manager.waitForIdle(session.id);
+      registry(true, proc(400, new Date().toISOString()));
+      observe();
+      registry(false);
+      expect(observe().cliClosedAt).not.toBeNull();
+    });
+
+    it("a message from the phone forgets a terminal that was seen before it, so its going away later does not close the session", async () => {
+      const { adapter, releaseAll } = gatedAdapter();
+      const { manager, session, registry, observe } = closable({}, adapter);
+      registry(true, proc(500));
+      observe();                                     // the person's terminal, seen by a list poll
+      registry(false);                               // killed -9: no SessionEnd hook, and no poll since
+      manager.startTurn(session.id, "from the phone");
+      observe();                                     // a poll mid-turn: nothing is ours to close
+      releaseAll();
+      await manager.waitForIdle(session.id);
+      expect(observe().cliClosedAt).toBeNull();      // the sighting predates the turn: it proves nothing now
+    });
+
+    // A queued message starts its turn the instant the previous one settles, and tiny's previous
+    // child can still be the registry's entry for the session at that moment
+    it("keeps its own-process window across back-to-back SDK turns", async () => {
+      const { adapter, releaseAll } = gatedAdapter();
+      const { manager, session, registry, observe } = closable({}, adapter);
+      manager.startTurn(session.id, "first");
+      const t1 = Date.now();
+      await new Promise((r) => setTimeout(r, 5));   // so the two turns start at different times
+      expect(manager.startTurn(session.id, "second")).toEqual({ queued: true });
+      releaseAll();
+      await manager.waitForIdle(session.id);
+      // turn 1's child, started after turn 1 but before turn 2: still ours, not a terminal
+      registry(true, proc(200, new Date(t1 + 1).toISOString()));
+      observe();
+      registry(false);
+      expect(observe().cliClosedAt).toBeNull();
+    });
+
+    it("leaves codex / opencode and sessions without an agent id alone", () => {
+      // opencode: the registry it would be read against is Claude Code's, so it proves nothing here
+      const oc = closable({}, okAdapter, { profile: "oc", agentSessionId: "oc-1" });
+      oc.registry(true, proc(100));
+      oc.observe();
+      oc.registry(false);
+      expect(oc.observe().cliClosedAt).toBeNull();
+      // claude, but tiny has no agent session id for it yet: nothing a process could be holding
+      const fresh = closable({}, okAdapter, { agentSessionId: null });
+      fresh.registry(true, proc(100));
+      fresh.observe();
+      fresh.registry(false);
+      expect(fresh.observe().cliClosedAt).toBeNull();
+    });
+  });
 });
 
 /** Watcher timings short enough for tests: poll 10ms, give up on delivery after 200ms idle, 2s max */
@@ -1851,7 +2049,7 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
     // Measured: after a turn that started a Bash task in the background, the registry reads "shell"
     // until the task exits and the CLI picks up again. The official app shows this as a running task
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "shell", statusUpdatedAt: "2026-09-01T15:09:17.919Z" }) },
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "shell", statusUpdatedAt: "2026-09-01T15:09:17.919Z", startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-bg-task");
     expect(manager.activity(manager.getSession(session.id))).toEqual({
@@ -1861,7 +2059,7 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
 
   it("reports a turn typed into the CLI from the registry, and its tokens once the transcript is synced", () => {
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.000Z" }) },
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: "2026-08-31T12:06:55.000Z", startedAt: null }) },
     });
     const { session, file } = liveSession(manager, home, "agent-cli-turn");
     // Nothing synced yet: the registry alone says when it started, and nothing says how far it is
@@ -1879,7 +2077,7 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
   it("never shows a previous turn's tokens against a turn the transcript has not been read for", () => {
     let statusUpdatedAt = "2026-08-31T12:06:55.000Z";
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt }) },
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt, startedAt: null }) },
     });
     const { session, file } = liveSession(manager, home, "agent-cli-stale");
     fs.writeFileSync(file, jsonl([
@@ -1895,7 +2093,7 @@ describe("SessionManager activity (the turn in progress, from either side)", () 
   it("counts a permission prompt as still running, and an idle or unknown CLI as nothing", () => {
     let status: "busy" | "idle" | "waiting" | "shell" | "unknown" = "idle";
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status, statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, cliState: () => ({ pid: 4242, status, statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-states");
     const s = manager.getSession(session.id);
@@ -1927,7 +2125,7 @@ describe("SessionManager Stop on a turn the CLI started", () => {
   it("sends the CLI the same stop message a live turn gets, at 'now' priority", async () => {
     const { peer, sent } = fakePeer();
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-stop");
     await manager.interrupt(session.id);
@@ -1940,7 +2138,7 @@ describe("SessionManager Stop on a turn the CLI started", () => {
   it("sends nothing when the CLI is idle", async () => {
     const { peer, sent } = fakePeer();
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "idle", statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "idle", statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-idle");
     await manager.interrupt(session.id);
@@ -1950,7 +2148,7 @@ describe("SessionManager Stop on a turn the CLI started", () => {
   it("fails visibly when the CLI is busy but cannot be reached", async () => {
     const { peer } = fakePeer({ resolve: () => null });
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-unreachable");
     await expect(manager.interrupt(session.id)).rejects.toThrow(ConflictError);
@@ -1959,7 +2157,7 @@ describe("SessionManager Stop on a turn the CLI started", () => {
   it("surfaces a socket failure instead of swallowing it", async () => {
     const { peer } = fakePeer({ send: async () => { throw new Error("connect ENOENT /srv/cc-socks/4242.sock"); } });
     const { manager, home } = makeManager(okAdapter, {
-      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null }) },
+      deps: { isCliLive: () => true, peer, cliState: () => ({ pid: 4242, status: "busy", statusUpdatedAt: null, startedAt: null }) },
     });
     const { session } = liveSession(manager, home, "agent-cli-socket");
     await expect(manager.interrupt(session.id)).rejects.toThrow(/ENOENT/);

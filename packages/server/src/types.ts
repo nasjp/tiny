@@ -20,6 +20,12 @@ export interface SessionRecord {
   archivedAt: string | null;
   /** Last transcript record uuid imported from the agent's own history. null = nothing imported */
   sourceCursor: string | null;
+  /**
+   * When the agent's own CLI closed this session (ISO 8601): the SessionEnd hook fired, `tiny
+   * attach` exited, or the process holding it went away. null = not closed, or used again since
+   * (a turn from the phone, a resume in the CLI). The list shows it as "Closed"
+   */
+  cliClosedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }

@@ -9,7 +9,7 @@ import type { DeviceRecord, EventRecord, SessionRecord } from "../src/types.js";
 
 const session = (over: Partial<SessionRecord> = {}): SessionRecord => ({
   id: "sess-1", agentSessionId: "agent-1", agent: "claude", profile: "work",
-  cwd: "/Users/me/src/my-repo", permissionMode: "default", model: null, effort: null, title: null, status: "idle", archivedAt: null, sourceCursor: null,
+  cwd: "/Users/me/src/my-repo", permissionMode: "default", model: null, effort: null, title: null, status: "idle", archivedAt: null, sourceCursor: null, cliClosedAt: null,
   createdAt: "2026-08-27T00:00:00.000Z", updatedAt: "2026-08-27T00:00:00.000Z", ...over,
 });
 

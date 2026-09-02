@@ -35,6 +35,7 @@ function sess(over: Partial<SessionRecord>): SessionRecord {
     status: "idle",
     archivedAt: null,
     sourceCursor: null,
+    cliClosedAt: null,
     createdAt: "",
     updatedAt: "",
     ...over,

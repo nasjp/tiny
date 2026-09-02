@@ -28,6 +28,8 @@ export interface LiveSessionEntry {
   status: CliStatus;
   /** When `status` last changed (ISO 8601), null when the entry does not say */
   statusUpdatedAt: string | null;
+  /** When the process started (ISO 8601), null when the entry does not say */
+  startedAt: string | null;
 }
 
 /**
@@ -49,7 +51,14 @@ export function readLiveSessions(
   const entries = new Map<string, LiveSessionEntry>();
   let understood = 0;
   for (const name of names) {
-    let entry: { pid?: unknown; sessionId?: unknown; peerProtocol?: unknown; status?: unknown; statusUpdatedAt?: unknown };
+    let entry: {
+      pid?: unknown;
+      sessionId?: unknown;
+      peerProtocol?: unknown;
+      status?: unknown;
+      statusUpdatedAt?: unknown;
+      startedAt?: unknown;
+    };
     try {
       entry = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as typeof entry;
     } catch {
@@ -74,7 +83,11 @@ export function readLiveSessions(
       typeof entry.statusUpdatedAt === "number" && Number.isFinite(entry.statusUpdatedAt)
         ? new Date(entry.statusUpdatedAt).toISOString()
         : null;
-    entries.set(entry.sessionId, { pid: entry.pid, status, statusUpdatedAt });
+    const startedAt =
+      typeof entry.startedAt === "number" && Number.isFinite(entry.startedAt)
+        ? new Date(entry.startedAt).toISOString()
+        : null;
+    entries.set(entry.sessionId, { pid: entry.pid, status, statusUpdatedAt, startedAt });
   }
   // Understood nothing = we cannot tell. Understood something = absence means "not open"
   return understood > 0 ? entries : null;
