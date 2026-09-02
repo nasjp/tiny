@@ -900,8 +900,9 @@ export class SessionManager extends EventEmitter {
    * Registry-side fallback for "the CLI closed this session": a process that was seen holding it
    * and is now gone. The SessionEnd hook is the primary signal (immediate, and it names the
    * session); this catches a terminal that was killed, and a config dir without `tiny live on`.
-   * Called per row on every list / get, so it is cheap and never throws. Returns the record as it
-   * stands afterwards
+   * Called per row on every list / get, so it is cheap and does not throw in normal operation; a
+   * row deleted between the caller's read and this call surfaces as `NotFoundError`, the same as
+   * any other read. Returns the record as it stands afterwards
    */
   observeCli(s: SessionRecord): SessionRecord {
     if (s.agent !== "claude" || !s.agentSessionId) return s;
@@ -926,12 +927,22 @@ export class SessionManager extends EventEmitter {
     return this.getSession(s.id);
   }
 
+  /**
+   * tiny's own SDK turn on this session while a child of it may still be registered: running, or
+   * ended within the grace window. The record itself, so callers can extend it
+   */
+  private ownTurnInWindow(id: string): { startedAt: number; endedAt: number | null } | null {
+    const own = this.ownSdkTurn.get(id);
+    if (!own) return null;
+    if (own.endedAt === null) return own;
+    const grace = this.deps.ownProcessGraceMs ?? OWN_PROCESS_GRACE_MS;
+    return Date.now() - own.endedAt < grace ? own : null;
+  }
+
   /** Whether a registry entry is the child of tiny's own SDK turn on this session (running, or just ended) */
   private isOwnProcess(id: string, entry: LiveSessionEntry): boolean {
-    const own = this.ownSdkTurn.get(id);
+    const own = this.ownTurnInWindow(id);
     if (!own) return false;
-    const grace = this.deps.ownProcessGraceMs ?? OWN_PROCESS_GRACE_MS;
-    if (own.endedAt !== null && Date.now() - own.endedAt >= grace) return false;
     const started = entry.startedAt === null ? NaN : Date.parse(entry.startedAt);
     // An entry that does not say when it started, inside our window: do not guess
     return Number.isNaN(started) || started >= own.startedAt;
@@ -1020,7 +1031,13 @@ export class SessionManager extends EventEmitter {
       return;
     }
     if (!saved) this.persistUserMessage(id, prompt, images);
-    this.ownSdkTurn.set(id, { startedAt: Date.now(), endedAt: null });
+    // Back-to-back turns (a queued message starts the next one the instant this one settles) extend
+    // the window instead of restarting it: the previous turn's child can still be the registry's
+    // entry for this session, and a window starting now would read that child as the person's
+    // terminal and close the session when it goes. A missed close is the safe way to be wrong here
+    const own = this.ownTurnInWindow(id);
+    if (own) own.endedAt = null;
+    else this.ownSdkTurn.set(id, { startedAt: Date.now(), endedAt: null });
     entry.done = this.runTurn(s, prompt, images, abort.signal).finally(finish);
   }
 

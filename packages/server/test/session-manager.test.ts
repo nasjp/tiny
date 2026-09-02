@@ -1792,7 +1792,15 @@ describe("SessionManager", () => {
     const proc = (pid: number, startedAt: string | null = "2026-09-02T04:00:00.000Z"): LiveSessionEntry =>
       ({ pid, status: "idle", statusUpdatedAt: null, startedAt });
 
-    function closable(deps: Partial<SessionManagerDeps> = {}, adapter: AgentAdapter = okAdapter) {
+    /**
+     * A session the registry deps can be driven around. `on` picks what is adopted: the default is
+     * a claude session with an agent session id; `agentSessionId: null` creates one without one
+     */
+    function closable(
+      deps: Partial<SessionManagerDeps> = {},
+      adapter: AgentAdapter = okAdapter,
+      on: { profile?: string; agentSessionId?: string | null } = {},
+    ) {
       let live: boolean | null = null;
       let entry: LiveSessionEntry | null = null;
       const { manager, stores, home } = makeManager(adapter, {
@@ -1802,7 +1810,11 @@ describe("SessionManager", () => {
       fs.mkdirSync(configDir, { recursive: true });
       const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
       addProfile(path.join(home, "profiles"), "local", "claude", configDir);
-      const { session } = manager.adoptSession({ profile: "local", cwd, agentSessionId: "agent-o" });
+      const profile = on.profile ?? "local";
+      const agentSessionId = on.agentSessionId === undefined ? "agent-o" : on.agentSessionId;
+      const session = agentSessionId === null
+        ? manager.createSession({ profile, cwd })
+        : manager.adoptSession({ profile, cwd, agentSessionId }).session;
       stores.events.append(session.id, "user_message", { text: "hi" });
       const registry = (l: boolean | null, e: LiveSessionEntry | null = null): void => { live = l; entry = e; };
       const observe = () => manager.observeCli(manager.getSession(session.id));
@@ -1877,13 +1889,37 @@ describe("SessionManager", () => {
       expect(observe().cliClosedAt).not.toBeNull();
     });
 
+    // A queued message starts its turn the instant the previous one settles, and tiny's previous
+    // child can still be the registry's entry for the session at that moment
+    it("keeps its own-process window across back-to-back SDK turns", async () => {
+      const { adapter, releaseAll } = gatedAdapter();
+      const { manager, session, registry, observe } = closable({}, adapter);
+      manager.startTurn(session.id, "first");
+      const t1 = Date.now();
+      await new Promise((r) => setTimeout(r, 5));   // so the two turns start at different times
+      expect(manager.startTurn(session.id, "second")).toEqual({ queued: true });
+      releaseAll();
+      await manager.waitForIdle(session.id);
+      // turn 1's child, started after turn 1 but before turn 2: still ours, not a terminal
+      registry(true, proc(200, new Date(t1 + 1).toISOString()));
+      observe();
+      registry(false);
+      expect(observe().cliClosedAt).toBeNull();
+    });
+
     it("leaves codex / opencode and sessions without an agent id alone", () => {
-      const { manager } = makeManager(okAdapter, { deps: { isCliLive: () => false } });
-      const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
-      const fresh = manager.createSession({ profile: "work", cwd });   // no agentSessionId yet
-      expect(manager.observeCli(fresh)).toEqual(fresh);
-      const oc = manager.createSession({ profile: "oc", cwd });
-      expect(manager.observeCli(oc)).toEqual(oc);
+      // opencode: the registry it would be read against is Claude Code's, so it proves nothing here
+      const oc = closable({}, okAdapter, { profile: "oc", agentSessionId: "oc-1" });
+      oc.registry(true, proc(100));
+      oc.observe();
+      oc.registry(false);
+      expect(oc.observe().cliClosedAt).toBeNull();
+      // claude, but tiny has no agent session id for it yet: nothing a process could be holding
+      const fresh = closable({}, okAdapter, { agentSessionId: null });
+      fresh.registry(true, proc(100));
+      fresh.observe();
+      fresh.registry(false);
+      expect(fresh.observe().cliClosedAt).toBeNull();
     });
   });
 });
