@@ -444,6 +444,10 @@ program
       if (r.error) throw r.error;
     } finally {
       await api(`/v1/sessions/${id}/detach`, { method: "POST", body: JSON.stringify({ detached: false }) });
+      // The terminal is gone: the list says "Closed" until the phone sends or the CLI resumes
+      await api("/v1/sessions/cli-ended", {
+        method: "POST", body: JSON.stringify({ agentSessionId: session.agentSessionId }),
+      });
     }
   });
 
@@ -451,7 +455,7 @@ program
   .command("handoff")
   .description("hand the Claude Code session you are in over to tiny (the reverse of `tiny attach`)")
   .option("--auto", "hook mode: never fail the caller (always exits 0)")
-  .option("--ended", "session ended: drop it if it never got a single event")
+  .option("--ended", "session ended: mark it closed (drop it if it never got a single event)")
   .option("--profile <name>", "profile to adopt into (default: the one pointing at CLAUDE_CONFIG_DIR)")
   .option("--session <id>", "agent session id (default: $CLAUDE_CODE_SESSION_ID)")
   .option("--config-dir <dir>", "CLAUDE_CONFIG_DIR to adopt from (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
@@ -475,11 +479,11 @@ program
         throw new Error("no session id (run this inside Claude Code, or pass --session <id>)");
       }
       if (opts.ended) {
-        const r = (await api("/v1/sessions/discard-empty", {
+        const r = (await api("/v1/sessions/cli-ended", {
           method: "POST",
           body: JSON.stringify({ agentSessionId }),
-        })) as { discarded: boolean };
-        if (!opts.auto) console.log(r.discarded ? "Discarded (no activity)" : "Kept");
+        })) as { discarded: boolean; closed: boolean };
+        if (!opts.auto) console.log(r.discarded ? "Discarded (no activity)" : r.closed ? "Closed" : "Kept");
         return;
       }
       const profile = opts.profile ?? ensureHandoffProfile(tinyPaths().profilesDir, configDir);
