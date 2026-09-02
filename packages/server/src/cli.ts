@@ -443,11 +443,24 @@ program
       const r = spawnSync(cmd.bin, cmd.args, { cwd: cmd.cwd, env: cmd.env as NodeJS.ProcessEnv, stdio: "inherit" });
       if (r.error) throw r.error;
     } finally {
-      await api(`/v1/sessions/${id}/detach`, { method: "POST", body: JSON.stringify({ detached: false }) });
-      // The terminal is gone: the list says "Closed" until the phone sends or the CLI resumes
-      await api("/v1/sessions/cli-ended", {
-        method: "POST", body: JSON.stringify({ agentSessionId: session.agentSessionId }),
-      });
+      // The terminal is gone: hand the session back, then say so (the list shows "Closed" until
+      // the phone sends or the CLI resumes). Both are attempted even if one fails; the first
+      // failure is the one reported
+      const handBack = [
+        () => api(`/v1/sessions/${id}/detach`, { method: "POST", body: JSON.stringify({ detached: false }) }),
+        () => api("/v1/sessions/cli-ended", {
+          method: "POST", body: JSON.stringify({ agentSessionId: session.agentSessionId }),
+        }),
+      ];
+      let failure: unknown = null;
+      for (const step of handBack) {
+        try {
+          await step();
+        } catch (err) {
+          failure ??= err;
+        }
+      }
+      if (failure !== null) throw failure;
     }
   });
 
