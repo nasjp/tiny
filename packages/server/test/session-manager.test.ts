@@ -1889,6 +1889,19 @@ describe("SessionManager", () => {
       expect(observe().cliClosedAt).not.toBeNull();
     });
 
+    it("a message from the phone forgets a terminal that was seen before it, so its going away later does not close the session", async () => {
+      const { adapter, releaseAll } = gatedAdapter();
+      const { manager, session, registry, observe } = closable({}, adapter);
+      registry(true, proc(500));
+      observe();                                     // the person's terminal, seen by a list poll
+      registry(false);                               // killed -9: no SessionEnd hook, and no poll since
+      manager.startTurn(session.id, "from the phone");
+      observe();                                     // a poll mid-turn: nothing is ours to close
+      releaseAll();
+      await manager.waitForIdle(session.id);
+      expect(observe().cliClosedAt).toBeNull();      // the sighting predates the turn: it proves nothing now
+    });
+
     // A queued message starts its turn the instant the previous one settles, and tiny's previous
     // child can still be the registry's entry for the session at that moment
     it("keeps its own-process window across back-to-back SDK turns", async () => {

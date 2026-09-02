@@ -496,7 +496,7 @@ program
           method: "POST",
           body: JSON.stringify({ agentSessionId }),
         })) as { discarded: boolean; closed: boolean };
-        if (!opts.auto) console.log(r.discarded ? "Discarded (no activity)" : r.closed ? "Closed" : "Kept");
+        if (!opts.auto) console.log(r.discarded ? "Discarded (no activity)" : r.closed ? "Closed" : "Unknown session");
         return;
       }
       const profile = opts.profile ?? ensureHandoffProfile(tinyPaths().profilesDir, configDir);

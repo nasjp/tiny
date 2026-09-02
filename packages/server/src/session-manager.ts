@@ -340,7 +340,7 @@ export class SessionManager extends EventEmitter {
     const existing = this.deps.stores.sessions.byAgentSessionId(input.agentSessionId);
     if (existing) {
       // The CLI opened it again (SessionStart fires on resume): no longer closed
-      if (existing.cliClosedAt !== null) this.clearCliClosed(existing.id);
+      this.clearCliClosed(existing);
       this.importOrSeed(existing.id);
       return { session: this.getSession(existing.id), adopted: false };
     }
@@ -697,10 +697,17 @@ export class SessionManager extends EventEmitter {
     return { discarded: false, closed: true };
   }
 
-  /** The session is in use again (phone / resume / attach): the "closed" mark no longer applies */
-  private clearCliClosed(id: string): void {
-    this.cliClosedPid.delete(id);
-    this.deps.stores.sessions.setCliClosedAt(id, null);
+  /**
+   * The session is in use again (phone / resume / attach): it forgets both the "closed" mark and
+   * the pid it was last seen under. The pid matters as much as the mark: an observation older than
+   * this turn must not close the session later — the terminal that was seen may already be gone
+   * (killed, with no SessionEnd hook), and the observer ignores tiny's own child, so nothing would
+   * replace that stale sighting before the next poll read it as "the CLI went away"
+   */
+  private clearCliClosed(s: SessionRecord): void {
+    this.cliSeenPid.delete(s.id);
+    this.cliClosedPid.delete(s.id);
+    if (s.cliClosedAt !== null) this.deps.stores.sessions.setCliClosedAt(s.id, null);
   }
 
   /** Mid-session change of model / permission mode / archived. Does not affect a running turn; takes effect from the next turn */
@@ -901,9 +908,10 @@ export class SessionManager extends EventEmitter {
    * Registry-side fallback for "the CLI closed this session": a process that was seen holding it
    * and is now gone. The SessionEnd hook is the primary signal (immediate, and it names the
    * session); this catches a terminal that was killed, and a config dir without `tiny live on`.
-   * Called per row on every list / get, so it is cheap and does not throw in normal operation; a
-   * row deleted between the caller's read and this call surfaces as `NotFoundError`, the same as
-   * any other read. Returns the record as it stands afterwards
+   * Called per row on every list / get, so it is cheap and does not throw in normal operation; if
+   * the row vanished between the caller's read and this call, the store's "session not found"
+   * error surfaces, the same as any other write to a missing row. Returns the record as it stands
+   * afterwards
    */
   observeCli(s: SessionRecord): SessionRecord {
     if (s.agent !== "claude" || !s.agentSessionId) return s;
@@ -912,12 +920,12 @@ export class SessionManager extends EventEmitter {
     if (live) {
       const entry = this.deps.cliState?.(s);
       if (!entry || this.isOwnProcess(s.id, entry)) return s;
-      this.cliSeenPid.set(s.id, entry.pid);
       // The hook fires before the process exits, so the pid that closed the session can still be
       // there for a moment; only a different process means the person opened it again
-      if (s.cliClosedAt === null || this.cliClosedPid.get(s.id) === entry.pid) return s;
-      this.clearCliClosed(s.id);
-      return this.getSession(s.id);
+      const reopened = s.cliClosedAt !== null && this.cliClosedPid.get(s.id) !== entry.pid;
+      if (reopened) this.clearCliClosed(s); // forgets the seen pid too, so record this one after
+      this.cliSeenPid.set(s.id, entry.pid);
+      return reopened ? this.getSession(s.id) : s;
     }
     const seen = this.cliSeenPid.get(s.id);
     if (seen === undefined) return s; // never seen it open (or tinyd restarted since): the hook's job
@@ -963,7 +971,7 @@ export class SessionManager extends EventEmitter {
     const s = this.getSession(id);
     if (s.status === "detached") throw new ConflictError("session is attached from CLI");
     // Sent from the phone: whatever the CLI did with this session, it is tiny's again
-    if (s.cliClosedAt !== null) this.clearCliClosed(id);
+    this.clearCliClosed(s);
     if (s.status === "running") {
       if (this.running.has(id)) {
         const q = this.queued.get(id) ?? [];
@@ -1473,7 +1481,7 @@ export class SessionManager extends EventEmitter {
   setDetached(id: string, detached: boolean): SessionRecord {
     const s = this.getSession(id);
     if (detached && s.status === "running") throw new ConflictError("turn running");
-    if (detached && s.cliClosedAt !== null) this.clearCliClosed(id);
+    if (detached) this.clearCliClosed(s);
     this.deps.stores.sessions.patch(id, { status: detached ? "detached" : "idle" });
     this.emitEvent(id, "session_state_changed", { status: detached ? "detached" : "idle" });
     return this.getSession(id);
