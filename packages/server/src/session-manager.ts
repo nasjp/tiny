@@ -683,6 +683,7 @@ export class SessionManager extends EventEmitter {
         // The row is gone: leave nothing behind that a later session could inherit
         this.cliSeenPid.delete(s.id);
         this.cliClosedPid.delete(s.id);
+        this.ownSdkTurn.delete(s.id);
         return { discarded: true, closed: false };
       }
     }

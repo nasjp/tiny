@@ -718,6 +718,67 @@ describe("REST API", () => {
     expect(await res.json()).toEqual({ discarded: true, closed: false });
   });
 
+  it("marks a session closed when its CLI ends, and the list shows it without reordering", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(profilesDir, "local3", "claude", configDir);
+    const adopted = await app.request("/v1/sessions/adopt", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "local3", cwd, agentSessionId: "agent-c" }),
+    });
+    const { id, updatedAt } = (await adopted.json()) as { id: string; updatedAt: string };
+    stores.events.append(id, "user_message", { text: "hi" });
+
+    const res = await app.request("/v1/sessions/cli-ended", {
+      method: "POST", headers: H(), body: JSON.stringify({ agentSessionId: "agent-c" }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ discarded: false, closed: true });
+
+    const list = (await (await app.request("/v1/sessions", { headers: H() })).json()) as {
+      sessions: Array<{ id: string; cliClosedAt: string | null; updatedAt: string }>;
+    };
+    const row = list.sessions.find((s) => s.id === id)!;
+    expect(row.cliClosedAt).not.toBeNull();
+    expect(row.updatedAt).toBe(updatedAt);
+    const one = (await (await app.request(`/v1/sessions/${id}`, { headers: H() })).json()) as { cliClosedAt: string | null };
+    expect(one.cliClosedAt).toBe(row.cliClosedAt);
+  });
+
+  it("only the CLI token may report a CLI ending (both route names)", async () => {
+    const started = await (await app.request("/v1/pair/start", { method: "POST", headers: H() })).json();
+    const dev = await app.request("/v1/devices", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: started.code, name: "ph" }),
+    });
+    const D = { Authorization: `Bearer ${(await dev.json()).bearerToken}`, "Content-Type": "application/json" };
+    for (const route of ["/v1/sessions/cli-ended", "/v1/sessions/discard-empty"]) {
+      const res = await app.request(route, { method: "POST", headers: D, body: JSON.stringify({ agentSessionId: "x" }) });
+      expect(res.status).toBe(403);
+    }
+  });
+
+  it("the list itself notices a CLI that went away", async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-ext-"));
+    addProfile(profilesDir, "local4", "claude", configDir);
+    const adopted = await app.request("/v1/sessions/adopt", {
+      method: "POST", headers: H(), body: JSON.stringify({ profile: "local4", cwd, agentSessionId: "agent-d" }),
+    });
+    const { id } = (await adopted.json()) as { id: string };
+    stores.events.append(id, "user_message", { text: "hi" });
+    const closedAt = async () => {
+      const list = (await (await app.request("/v1/sessions", { headers: H() })).json()) as {
+        sessions: Array<{ id: string; cliClosedAt: string | null }>;
+      };
+      return list.sessions.find((s) => s.id === id)!.cliClosedAt;
+    };
+
+    cliLive = true;
+    cliState = { pid: 7, status: "idle", statusUpdatedAt: null, startedAt: null };
+    expect(await closedAt()).toBeNull();
+    cliLive = false;
+    cliState = null;
+    expect(await closedAt()).not.toBeNull();
+  });
+
   // The guard lives in SessionManager, so it only works if the daemon hands the SAME resolver to
   // the manager and to createApp. Exercised over HTTP because that is the path that regressed
   it("refuses a turn while the agent's own CLI holds the session, and allows it otherwise", async () => {

@@ -107,12 +107,17 @@ type HonoContext = Context<AppEnv>;
 export function createApp(deps: ApiDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
-  const withLive = (s: SessionRecord): SessionResponse => ({
-    ...s,
-    cliLive: deps.isCliLive(s),
-    cliJoin: deps.manager.canJoin(s),
-    activity: deps.manager.activity(s),
-  });
+  const withLive = (row: SessionRecord): SessionResponse => {
+    // Every read passes the row through the registry observer, so a CLI that went away is marked
+    // closed by the next poll even when no hook said so
+    const s = deps.manager.observeCli(row);
+    return {
+      ...s,
+      cliLive: deps.isCliLive(s),
+      cliJoin: deps.manager.canJoin(s),
+      activity: deps.manager.activity(s),
+    };
+  };
 
   app.onError((err, c) => {
     if (err instanceof NotFoundError) return c.json({ error: err.message }, 404);
@@ -168,6 +173,17 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
   const requireCliOrOwnSession = (c: HonoContext): Response | null =>
     c.get("principal") === "cli" || c.get("principal") === "session" ? null : c.json({ error: "forbidden (CLI only)" }, 403);
 
+  // SessionEnd hook / `tiny attach` exiting: the CLI closed the session. Drop it if nothing ever
+  // happened in it, mark it closed otherwise. `discard-empty` is the older name of the same thing
+  const cliEnded = async (c: HonoContext): Promise<Response> => {
+    const forbidden = requireCli(c);
+    if (forbidden) return forbidden;
+    const body = discardEmptySchema.parse(await c.req.json());
+    return c.json(deps.manager.cliSessionEnded(body.agentSessionId));
+  };
+  app.post("/v1/sessions/discard-empty", cliEnded);
+  app.post("/v1/sessions/cli-ended", cliEnded);
+
   app.get("/v1/profiles", (c) => c.json({ profiles: listProfiles(deps.profilesDir) }));
 
   // Registered agents (driver definitions). installed = whether the executable is on PATH
@@ -203,12 +219,6 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
     const body = adoptSessionSchema.parse(await c.req.json());
     const { session, adopted } = deps.manager.adoptSession(body);
     return c.json(withLive(session), adopted ? 201 : 200);
-  });
-
-  // SessionEnd path: drop a handoff session that never got a single event
-  app.post("/v1/sessions/discard-empty", async (c) => {
-    const body = discardEmptySchema.parse(await c.req.json());
-    return c.json(deps.manager.cliSessionEnded(body.agentSessionId));
   });
 
   app.get("/v1/sessions/:id", (c) => c.json(withLive(deps.manager.getSession(c.req.param("id")))));
