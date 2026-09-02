@@ -338,6 +338,11 @@ async function api(pathname: string, init: RequestInit = {}): Promise<unknown> {
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
+        // One connection per call. `tiny attach` blocks in spawnSync for as long as the CLI runs;
+        // by then tinyd has closed the idle keep-alive socket, and the first call after the CLI
+        // exits failed on that dead socket with "Cannot connect" (measured: detach was skipped,
+        // the next call went through on a fresh socket)
+        Connection: "close",
         ...(init.headers ?? {}),
       },
     });
