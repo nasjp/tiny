@@ -2396,4 +2396,33 @@ describe("SessionManager external sessions in an external CODEX_HOME", () => {
     expect(seen.map((e) => e.type)).toEqual(["user_message", "assistant_text"]);
     expect(manager.activity(manager.getSession(s.id))).toBeNull(); // the turn is complete
   });
+
+  it("titles an adopted session by its first message even when the backfill window starts later in the file", () => {
+    const { manager, home } = makeManager(okAdapter, { deps: { liveScanEnabled: (name) => name === "cxl" } });
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-codex-home-"));
+    addProfile(path.join(home, "profiles"), "cxl", "codex", codexHome);
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const now = new Date();
+    const p2 = (n: number) => String(n).padStart(2, "0");
+    const dir = path.join(codexHome, "sessions", String(now.getFullYear()), p2(now.getMonth() + 1), p2(now.getDate()));
+    fs.mkdirSync(dir, { recursive: true });
+    // A real 47MB rollout: the first message sits at the top, the import's 512KB backfill window
+    // begins far below it, at some later turn
+    const records = [
+      { type: "session_meta", payload: { id: TID, cwd, timestamp: "2026-09-06T07:28:57.979Z", cli_version: "0.153.4", source: "cli", thread_source: "user", history_mode: "paginated" } },
+      cxTaskStart,
+      pItem("UserMessage", { id: "u1", content: [{ type: "text", text: "first question" }] }),
+      pItem("CommandExecution", { id: "exec-1", command: ["/bin/zsh", "-lc", "cat big"], status: "completed", aggregated_output: "x".repeat(700 * 1024), exit_code: 0 }),
+      cxTaskEnd,
+      cxTaskStart,
+      pItem("UserMessage", { id: "u2", content: [{ type: "text", text: "later question" }] }),
+      pItem("AgentMessage", { id: "a2", content: [{ type: "Text", text: "later answer" }], phase: "final_answer" }),
+      cxTaskEnd,
+    ];
+    fs.writeFileSync(path.join(dir, `rollout-x-${TID}.jsonl`), records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+
+    expect(manager.scanExternalSessions()).toBe(1);
+    const s = manager.listSessions().find((x) => x.agentSessionId === TID)!;
+    expect(s.title).toBe("first question");
+  });
 });

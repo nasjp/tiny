@@ -652,7 +652,10 @@ export class SessionManager extends EventEmitter {
         if (this.deps.stores.sessions.byAgentSessionId(es.agentSessionId)) continue;
         if (!fs.existsSync(es.cwd)) continue; // a session whose cwd is gone cannot run turns anyway
         try {
-          this.adoptSession({ profile: p.name, cwd: es.cwd, agentSessionId: es.agentSessionId });
+          const { session } = this.adoptSession({ profile: p.name, cwd: es.cwd, agentSessionId: es.agentSessionId });
+          // The storage knows the first thing the person said. The import may have opened its
+          // backfill window far below that (a 47MB rollout) and titled the session by a later turn
+          if (session.title !== es.title) this.deps.stores.sessions.patch(session.id, { title: es.title });
           adopted++;
         } catch (err) {
           console.error(`[tinyd] could not adopt ${p.agent} session ${es.agentSessionId}:`, err);
