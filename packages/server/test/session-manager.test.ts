@@ -2357,3 +2357,43 @@ describe("SessionManager restart recovery", () => {
     expect(seen).toEqual([]);
   });
 });
+
+// The person's own codex writes to its own CODEX_HOME (~/.codex), not to a tiny profile. A profile
+// that points there (tiny-profile.json configDir, like Claude's `local`) is what `tiny live on`
+// scans — and since codex-cli 0.147 that storage is in the paginated (item_completed) format
+describe("SessionManager external sessions in an external CODEX_HOME", () => {
+  const TID = "01a0759e-d269-79a1-b34c-89f12cb606f0";
+  const pItem = (type: string, fields: Record<string, unknown>) => ({
+    type: "event_msg",
+    payload: { type: "item_completed", thread_id: TID, turn_id: "t1", item: { type, ...fields }, started_at_ms: 1, completed_at_ms: 2 },
+  });
+
+  it("adopts a paginated-format session from the profile's configDir and imports its conversation", () => {
+    const { manager, home } = makeManager(okAdapter, { deps: { liveScanEnabled: (name) => name === "cxl" } });
+    const profilesDir = path.join(home, "profiles");
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-codex-home-"));
+    addProfile(profilesDir, "cxl", "codex", codexHome);
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const now = new Date();
+    const p2 = (n: number) => String(n).padStart(2, "0");
+    const dir = path.join(codexHome, "sessions", String(now.getFullYear()), p2(now.getMonth() + 1), p2(now.getDate()));
+    fs.mkdirSync(dir, { recursive: true });
+    const records = [
+      { type: "session_meta", payload: { id: TID, cwd, timestamp: "2026-09-06T07:28:57.979Z", cli_version: "0.153.4", source: "cli", thread_source: "user", history_mode: "paginated" } },
+      cxTaskStart,
+      pItem("UserMessage", { id: "u1", content: [{ type: "text", text: "why does this win?" }] }),
+      pItem("AgentMessage", { id: "a1", content: [{ type: "Text", text: "It wins by luck." }], phase: "final_answer" }),
+      cxTokens(12),
+      cxTaskEnd,
+    ];
+    fs.writeFileSync(path.join(dir, `rollout-x-${TID}.jsonl`), records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const seen: EventRecord[] = [];
+    manager.on("event", (e) => seen.push(e));
+
+    expect(manager.scanExternalSessions()).toBe(1);
+    const s = manager.listSessions().find((x) => x.agentSessionId === TID)!;
+    expect(s).toMatchObject({ agent: "codex", profile: "cxl", cwd, title: "why does this win?" });
+    expect(seen.map((e) => e.type)).toEqual(["user_message", "assistant_text"]);
+    expect(manager.activity(manager.getSession(s.id))).toBeNull(); // the turn is complete
+  });
+});

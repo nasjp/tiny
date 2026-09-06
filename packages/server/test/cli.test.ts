@@ -18,6 +18,7 @@ import {
   resolveHandoffInput,
   resolveLiveConfigDir,
   resolveSessionId,
+  runProfileAdd,
   runProfileRename,
 } from "../src/cli.js";
 import { addProfile, listProfiles, readProfileConfigDir, type ProfileInfo } from "../src/profiles.js";
@@ -43,13 +44,31 @@ function sess(over: Partial<SessionRecord>): SessionRecord {
 }
 
 describe("cli helpers", () => {
+  function profilesRootWith(...profiles: Array<[name: string, agent?: string, configDir?: string]>): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-attach-"));
+    for (const [name, agent, configDir] of profiles) addProfile(root, name, agent, configDir);
+    return root;
+  }
+
   it("buildAttachCommand builds claude --resume", () => {
-    const cmd = buildAttachCommand(sess({}), "/home/u/.tiny/profiles");
+    const root = profilesRootWith(["work"]);
+    const cmd = buildAttachCommand(sess({}), root);
     expect(cmd.bin).toBe("claude");
     expect(cmd.args).toEqual(["--resume", "agent-xyz"]);
     expect(cmd.cwd).toBe("/tmp/repo");
-    expect(cmd.env.CLAUDE_CONFIG_DIR).toBe("/home/u/.tiny/profiles/work");
+    expect(cmd.env.CLAUDE_CONFIG_DIR).toBe(path.join(root, "work"));
     expect(cmd.env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("buildAttachCommand follows a profile's external configDir (handoff / codex-local profiles)", () => {
+    const claudeDir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-claude-"));
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-codex-"));
+    const root = profilesRootWith(["local", "claude", claudeDir], ["local-codex", "codex", codexHome]);
+    expect(buildAttachCommand(sess({ profile: "local" }), root).env.CLAUDE_CONFIG_DIR).toBe(claudeDir);
+    const cx = buildAttachCommand(sess({ agent: "codex", profile: "local-codex", agentSessionId: "thr_1" }), root);
+    expect(cx.bin).toBe("codex");
+    expect(cx.args).toEqual(["resume", "thr_1"]);
+    expect(cx.env.CODEX_HOME).toBe(codexHome);
   });
 
   it("throws when agentSessionId is missing", () => {
@@ -57,11 +76,12 @@ describe("cli helpers", () => {
   });
 
   it("buildAttachCommand builds opencode --session and points XDG under the profile", () => {
-    const cmd = buildAttachCommand(sess({ agent: "opencode", profile: "oc", agentSessionId: "ses_1" }), "/home/u/.tiny/profiles");
+    const root = profilesRootWith(["oc", "opencode"]);
+    const cmd = buildAttachCommand(sess({ agent: "opencode", profile: "oc", agentSessionId: "ses_1" }), root);
     expect(cmd.bin).toBe("opencode");
     expect(cmd.args).toEqual(["--session", "ses_1"]);
-    expect(cmd.env.XDG_DATA_HOME).toBe("/home/u/.tiny/profiles/oc/xdg/data");
-    expect(cmd.env.XDG_CONFIG_HOME).toBe("/home/u/.tiny/profiles/oc/xdg/config");
+    expect(cmd.env.XDG_DATA_HOME).toBe(path.join(root, "oc", "xdg", "data"));
+    expect(cmd.env.XDG_CONFIG_HOME).toBe(path.join(root, "oc", "xdg", "config"));
   });
 
   it("resolveSessionId matches by prefix and throws on ambiguity", () => {
@@ -413,5 +433,42 @@ describe("parseQuestionHook", () => {
     expect(parseQuestionHook('{"session_id":')).toBeNull();
     expect(parseQuestionHook(JSON.stringify({ ...payload, tool_use_id: "" }))).toBeNull();
     expect(parseQuestionHook(JSON.stringify({ ...payload, tool_input: "x" }))).toBeNull();
+  });
+});
+
+// `tiny profiles add <name> --agent codex --config-dir ~/.codex`: the profile whose storage is the
+// person's own codex (what `tiny live on --profile <name>` then scans). Only agents whose home
+// IS the directory (claude: CLAUDE_CONFIG_DIR, codex: CODEX_HOME) can point outside tiny
+describe("runProfileAdd", () => {
+  it("creates a codex profile that points at an external CODEX_HOME", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-padd-"));
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-codex-"));
+    const p = runProfileAdd(root, "local-codex", { agent: "codex", configDir: codexHome });
+    expect(p).toMatchObject({ name: "local-codex", agent: "codex", dir: codexHome, loggedIn: false });
+    expect(readProfileConfigDir(path.join(root, "local-codex"))).toBe(codexHome);
+    fs.writeFileSync(path.join(codexHome, "auth.json"), "{}");
+    expect(listProfiles(root).find((x) => x.name === "local-codex")!.loggedIn).toBe(true);
+  });
+
+  it("resolves a relative --config-dir against the cwd and rejects a missing one", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-padd-"));
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-codex-"));
+    const rel = path.relative(process.cwd(), codexHome);
+    expect(runProfileAdd(root, "cx-rel", { agent: "codex", configDir: rel }).dir).toBe(codexHome);
+    expect(() => runProfileAdd(root, "cx-missing", { agent: "codex", configDir: path.join(codexHome, "nope") })).toThrow(/not found/);
+    expect(fs.existsSync(path.join(root, "cx-missing"))).toBe(false);
+  });
+
+  it("refuses --config-dir for agents whose profile layout is not the directory itself", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-padd-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-oc-"));
+    expect(() => runProfileAdd(root, "oc-local", { agent: "opencode", configDir: dir })).toThrow(/--config-dir/);
+    expect(fs.existsSync(path.join(root, "oc-local"))).toBe(false);
+  });
+
+  it("without --config-dir behaves like addProfile", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-padd-"));
+    const p = runProfileAdd(root, "cx", { agent: "codex" });
+    expect(p.dir).toBe(path.join(root, "cx"));
   });
 });
