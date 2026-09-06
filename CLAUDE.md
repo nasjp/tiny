@@ -52,7 +52,9 @@ pnpm tiny handoff [--auto] [--ended] [--profile <name>] [--session <id>] [--conf
 #   ^ run it from inside the Claude Code session you want to hand over, typed as `!tiny handoff`.
 #     Asking the agent in prose misfires: `handoff` collides with a skill name and the skill runs instead.
 pnpm tiny live [on|off] [--profile <name> | --config-dir <dir>]  # auto-handoff of new sessions (default off; claude = hooks in the targeted config dir, codex/opencode = `--profile <name>` turns on the tinyd storage scan)
-pnpm tiny profiles ls | add <name> | rename <old> <new> | login <name>
+pnpm tiny profiles ls | add <name> [--agent <id>] [--config-dir <dir>] | rename <old> <new> | login <name>
+#   ^ --config-dir wraps an existing agent home (claude: CLAUDE_CONFIG_DIR / codex: CODEX_HOME, e.g. ~/.codex);
+#     with `tiny live on --profile <name>` that is how a codex started in a terminal reaches the phone
 pnpm tiny pair                        # show the pairing QR
 pnpm tiny devices                     # list paired devices
 pnpm tiny config                      # server URL embedded in the QR (mandatory over Tailscale)
@@ -115,7 +117,7 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
 - **Any code that spawns child processes must strip `ANTHROPIC_API_KEY` from the env**
   (leaving it set bills the API pay-as-you-go instead of the subscription; every
   existing spawn path already strips it)
-- Read test counts, not just pass/fail (currently server 674 / relay 37 / iOS unit 205
+- Read test counts, not just pass/fail (currently server 684 / relay 37 / iOS unit 205
   + 5 demo-UI + 3 live E2E [need a real tinyd — see HANDOFF]). **`xcodebuild test |
   tail` exits 0 even on failure** — always check for the literal
   `** TEST FAILED **` / `** TEST SUCCEEDED **` strings
@@ -146,6 +148,14 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
   Codex's rollout jsonl / thread-writer-locks live only in `src/codex-live.ts`, and
   OpenCode's opencode.db / locks only in `src/opencode-live.ts`** (both read-only,
   degrading to null/empty)
+- **Codex writes two rollout formats**, told apart by `session_meta.history_mode`: `legacy`
+  (conversation = `event_msg` `user_message` / `agent_message`, tools = the `response_item`
+  `custom_tool_call` pair) and `paginated` (everything = `event_msg` `item_completed` with
+  PascalCase items; the TUI since 0.147.0, `codex app-server` since 0.153.x). `src/codex-live.ts`
+  reads both and must keep doing so. **Measure new shapes on real files under
+  `~/.codex/sessions`, not on the app-server's notifications** — the 2026-09-01 E2E validated the
+  reader against tiny's own app-server sessions, which were still legacy while the terminal TUI
+  had been paginated for three weeks
 - **A CLI session's AskUserQuestion never reaches the transcript until it is answered**
   (measured on Claude Code 2.1.252: a question left on screen for 60s wrote nothing). The phone
   learns about it from the `PreToolUse` hook `tiny live on` installs (`tiny question --auto`, which

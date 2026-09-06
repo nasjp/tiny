@@ -82,6 +82,7 @@ tiny live on --profile <name>            #   ... for one tiny profile instead of
 
 tiny profiles ls                         # list profiles
 tiny profiles add <name> --agent <id>    # add one (then: tiny profiles login <name>)
+tiny profiles add <name> --agent codex --config-dir ~/.codex   # wrap the codex you already use in the terminal (claude / codex only)
 tiny profiles rename <old> <new>
 
 tiny daemon install                      # run under launchd (use tiny serve to run in the foreground)
@@ -116,10 +117,21 @@ again. Turn it off with `tiny live off`; it only adds two hooks to your agent's 
 `settings.json` and removes exactly those when you turn it off.
 
 Codex and OpenCode have no hooks, so for their profiles `tiny live on --profile <name>`
-makes tinyd watch the agent's own session storage instead: a session you start in the
-terminal shows up on the phone once you have said something in it, its history follows
-along, and while the terminal is working a turn the phone shows it running (sending
-waits until the terminal is idle).
+makes tinyd watch that profile's own session storage instead (its `CODEX_HOME`, or its
+XDG tree for OpenCode): a session you start in the terminal shows up on the phone once
+you have said something in it, its history follows along, and while the terminal is
+working a turn the phone shows it running (sending waits until the terminal is idle).
+Plain `codex` in a terminal writes to `~/.codex`, not to a tiny profile, so wrap that
+directory in a profile first and turn the scan on there:
+
+```bash
+tiny profiles add local-codex --agent codex --config-dir ~/.codex
+tiny live on --profile local-codex
+```
+
+Turns you send from the phone to such a session run under your own `~/.codex` settings
+(the same trade-off as the `local` profile Claude Code handoffs use). Sub-agent threads
+codex spawns for itself are never listed. OpenCode cannot wrap an external directory yet.
 
 That acts on the config directory your own shell uses (`$CLAUDE_CONFIG_DIR`, or `~/.claude`).
 Each tiny profile has its own, so name the profile to turn it on there:
