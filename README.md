@@ -120,18 +120,23 @@ Codex and OpenCode have no hooks, so for their profiles `tiny live on --profile 
 makes tinyd watch that profile's own session storage instead (its `CODEX_HOME`, or its
 XDG tree for OpenCode): a session you start in the terminal shows up on the phone once
 you have said something in it, its history follows along, and while the terminal is
-working a turn the phone shows it running (sending waits until the terminal is idle).
-Plain `codex` in a terminal writes to `~/.codex`, not to a tiny profile, so wrap that
-directory in a profile first and turn the scan on there:
+working a turn the phone shows it running. Plain `codex` in a terminal writes to
+`~/.codex`, not to a tiny profile, so wrap that directory in a profile first and turn the
+scan on there:
 
 ```bash
 tiny profiles add local-codex --agent codex --config-dir ~/.codex
 tiny live on --profile local-codex
 ```
 
-Turns you send from the phone to such a session run under your own `~/.codex` settings
-(the same trade-off as the `local` profile Claude Code handoffs use). Sub-agent threads
-codex spawns for itself are never listed. OpenCode cannot wrap an external directory yet.
+A message you send from the phone while the codex terminal has the thread open goes into
+that terminal's own message queue (what `codex queue` does), so the terminal runs it as its
+next turn and shows it on screen like something you typed there; if the terminal is busy,
+it waits its turn. Stop takes the message back as long as the terminal has not started on
+it; once it has, the turn is the terminal's to stop (Esc). When no terminal holds the
+thread, turns you send run under your own `~/.codex` settings (the same trade-off as the
+`local` profile Claude Code handoffs use). Sub-agent threads codex spawns for itself are
+never listed. OpenCode cannot wrap an external directory yet.
 
 That acts on the config directory your own shell uses (`$CLAUDE_CONFIG_DIR`, or `~/.claude`).
 Each tiny profile has its own, so name the profile to turn it on there:
@@ -164,8 +169,9 @@ One thing stays in the terminal's hands: permission prompts. While Claude Code w
 answer there, the phone shows "Waiting in the terminal". Closing the terminal hands the session
 back to tinyd for the next message.
 
-Claude Code only. Requires Claude Code ≥ 2.1.251 on the Mac; tinyd falls back to refusing the
-send ("open in the CLI") when it cannot reach the process.
+Claude Code (≥ 2.1.251) and Codex (≥ 0.153, through its message queue — see the profiles
+section above). tinyd falls back to refusing the send ("open in the CLI") when it cannot
+reach the process.
 
 tinyd tells Claude Code that the message comes from a session in the same permission mode as the
 terminal, so a `--dangerously-skip-permissions` session takes it right away instead of parking it

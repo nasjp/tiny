@@ -117,7 +117,7 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
 - **Any code that spawns child processes must strip `ANTHROPIC_API_KEY` from the env**
   (leaving it set bills the API pay-as-you-go instead of the subscription; every
   existing spawn path already strips it)
-- Read test counts, not just pass/fail (currently server 685 / relay 37 / iOS unit 205
+- Read test counts, not just pass/fail (currently server 697 / relay 37 / iOS unit 205
   + 5 demo-UI + 3 live E2E [need a real tinyd — see HANDOFF]). **`xcodebuild test |
   tail` exits 0 even on failure** — always check for the literal
   `** TEST FAILED **` / `** TEST SUCCEEDED **` strings
@@ -147,7 +147,11 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
   liveness) is the one pre-existing exception. **The same confinement holds per agent:
   Codex's rollout jsonl / thread-writer-locks live only in `src/codex-live.ts`, and
   OpenCode's opencode.db / locks only in `src/opencode-live.ts`** (both read-only,
-  degrading to null/empty)
+  degrading to null/empty). **The one place that writes into Codex's storage is
+  `src/codex-peer.ts`** (the app-server's `thread/queue/add` / `thread/queue/delete`, which
+  is how a phone message reaches a thread the codex TUI holds — the TUI keeps the writer
+  lock for the whole session, not just per turn, so the queue is the only way in). Failures
+  there throw and the manager falls back to the 409
 - **Codex writes two rollout formats**, told apart by `session_meta.history_mode`: `legacy`
   (conversation = `event_msg` `user_message` / `agent_message`, tools = the `response_item`
   `custom_tool_call` pair) and `paginated` (everything = `event_msg` `item_completed` with

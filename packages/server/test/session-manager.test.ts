@@ -7,8 +7,8 @@ import { createStores } from "../src/stores.js";
 import { addProfile } from "../src/profiles.js";
 import { PermissionBroker } from "../src/permission-broker.js";
 import { FileOutbox } from "../src/outbox.js";
-import { ConflictError, NotFoundError, SessionManager, type PeerBridge, type SessionManagerDeps } from "../src/session-manager.js";
-import type { AgentAdapter, RunTurnParams } from "../src/adapter.js";
+import { ConflictError, NotFoundError, SessionManager, type CodexPeerBridge, type PeerBridge, type SessionManagerDeps } from "../src/session-manager.js";
+import type { AgentAdapter, RunTurnParams, TurnImage } from "../src/adapter.js";
 import { PEER_STOP, type PeerFrame, type PeerStatus, type PeerTarget } from "../src/claude-peer.js";
 import type { LiveSessionEntry } from "../src/claude-live.js";
 import type { EventRecord } from "../src/types.js";
@@ -2424,5 +2424,158 @@ describe("SessionManager external sessions in an external CODEX_HOME", () => {
     expect(manager.scanExternalSessions()).toBe(1);
     const s = manager.listSessions().find((x) => x.agentSessionId === TID)!;
     expect(s.title).toBe("first question");
+  });
+});
+
+// Codex has no messaging socket; a message reaches the CLI holding a thread through the app-server's
+// thread/queue/add, and the rollout's UserMessage.client_id is the receipt (measured 0.153.4, spec 2026-09-09)
+describe("SessionManager codex live turns (the CLI holds the thread)", () => {
+  const TID = "01a08509-4d7c-78c1-8460-fd52c0e5a773";
+  const pMeta = (cwd: string) => ({ type: "session_meta", payload: { id: TID, cwd, timestamp: "2026-09-09T00:00:00.000Z", history_mode: "paginated" } });
+  const pItem = (type: string, fields: Record<string, unknown>) => ({ type: "event_msg", payload: { type: "item_completed", thread_id: TID, turn_id: "t1", item: { type, ...fields } } });
+  const pUser = (text: string, clientId?: string) => pItem("UserMessage", { id: "u", ...(clientId ? { client_id: clientId } : {}), content: [{ type: "text", text, text_elements: [] }] });
+  const pAnswer = (text: string) => pItem("AgentMessage", { id: "a", content: [{ type: "Text", text }], phase: "final_answer" });
+  const append = (file: string, records: Array<Record<string, unknown>>) => fs.appendFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+
+  function fakeCodexPeer(over: Partial<CodexPeerBridge> = {}) {
+    const queued: Array<{ sessionId: string; clientUserMessageId: string; text: string; images?: TurnImage[] }> = [];
+    const unqueued: string[] = [];
+    let n = 0;
+    const peer: CodexPeerBridge = {
+      queue: async (s, msg) => {
+        queued.push({ sessionId: s.id, ...msg });
+        return { queuedSubmissionId: `q-${++n}` };
+      },
+      unqueue: async (_s, id) => {
+        unqueued.push(id);
+        return true;
+      },
+      ...over,
+    };
+    return { peer, queued, unqueued };
+  }
+
+  /** An adopted codex session whose TUI is open (lock held), with the rollout it writes */
+  function heldSession(deps: Partial<SessionManagerDeps>, tail: Array<Record<string, unknown>> = [cxTaskStart, pUser("typed here"), pAnswer("sure"), cxTaskEnd]) {
+    const { manager, stores, home } = makeManager(okAdapter, { deps: { liveScanEnabled: () => true, liveTiming: FAST_LIVE, ...deps } });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const rollout = writeCodexRollout(path.join(home, "profiles"), TID, [pMeta(cwd), ...tail]);
+    manager.scanExternalSessions();
+    const s = manager.listSessions()[0]!;
+    const seen: EventRecord[] = [];
+    manager.on("event", (e) => seen.push(e));
+    return { manager, stores, s, rollout, seen, types: () => seen.map((e) => e.type) };
+  }
+
+  it("queues the message into the CLI and completes when the rollout shows it taken and answered", async () => {
+    const { peer, queued } = fakeCodexPeer();
+    const { manager, stores, s, rollout, seen, types } = heldSession({ isCliLive: () => true, externalBusy: () => true, codexPeer: peer });
+    expect(manager.canJoin(manager.getSession(s.id))).toBe(true);
+
+    expect(manager.startTurn(s.id, "from the phone", [{ mediaType: "image/png", data: "AAAA" }])).toEqual({ queued: false });
+    await until(() => queued.length === 1);
+    expect(queued[0]).toMatchObject({ sessionId: s.id, text: "from the phone", images: [{ mediaType: "image/png", data: "AAAA" }] });
+    const msgId = queued[0]!.clientUserMessageId;
+    await until(() => types().includes("turn_started"));
+    expect(types()).toEqual(["user_message", "turn_started"]);
+    expect(manager.getSession(s.id).status).toBe("running");
+
+    // The CLI takes it: its rollout records our message under our client id, then the reply
+    append(rollout, [cxTaskStart, pUser("from the phone", msgId), cxTokens(42)]);
+    await until(() => manager.activity(manager.getSession(s.id))?.outputTokens === 42);
+    append(rollout, [pAnswer("hi phone"), cxTaskEnd]);
+    await manager.waitForIdle(s.id);
+    expect(seen.at(-1)).toMatchObject({ type: "turn_completed", payload: { costUsd: null, resultText: "hi phone" } });
+    expect(types()).toEqual(["user_message", "turn_started", "assistant_text", "turn_completed"]);
+    // Our own message came back through the rollout but is not shown twice
+    const all = stores.events.listSince(s.id, 0);
+    expect(all.filter((e) => e.type === "user_message").map((e) => e.payload.text)).toEqual(["typed here", "from the phone"]);
+    expect(manager.getSession(s.id).status).toBe("idle");
+    // What the person types into the terminal afterwards still comes in
+    append(rollout, [cxTaskStart, pUser("typed later"), pAnswer("ok"), cxTaskEnd]);
+    manager.syncTranscript(s.id);
+    expect(stores.events.listSince(s.id, 0).filter((e) => e.type === "user_message").length).toBe(3);
+  });
+
+  it("waits behind the CLI's own turn for as long as it takes, then completes when its turn runs", async () => {
+    const { peer, queued } = fakeCodexPeer();
+    const { manager, s, rollout, types } = heldSession(
+      { isCliLive: () => true, externalBusy: () => true, codexPeer: peer },
+      [cxTaskStart, pUser("long job"), cxTokens(3)], // open in the terminal
+    );
+    manager.startTurn(s.id, "from the phone");
+    await until(() => queued.length === 1);
+    await new Promise((r) => setTimeout(r, FAST_LIVE.deliveryTimeoutMs * 3));
+    expect(types().filter((t) => t === "turn_failed")).toEqual([]);
+    expect(manager.getSession(s.id).status).toBe("running");
+    append(rollout, [pAnswer("done with the long job"), cxTaskEnd, cxTaskStart, pUser("from the phone", queued[0]!.clientUserMessageId), pAnswer("now yours"), cxTaskEnd]);
+    await manager.waitForIdle(s.id);
+    expect(types().at(-1)).toBe("turn_completed");
+    // The terminal's own reply was imported too, in order, before ours
+    expect(types()).toEqual(["user_message", "turn_started", "assistant_text", "assistant_text", "turn_completed"]);
+  });
+
+  it("takes the message back and fails the turn when the CLI goes away before taking it", async () => {
+    let busy: boolean | null = true;
+    const { peer, queued, unqueued } = fakeCodexPeer();
+    const { manager, s, seen } = heldSession({ isCliLive: () => busy === true, externalBusy: () => busy, codexPeer: peer });
+    manager.startTurn(s.id, "from the phone");
+    await until(() => queued.length === 1);
+    busy = false; // `/quit` in the terminal: nobody holds the lock any more
+    await manager.waitForIdle(s.id);
+    expect(seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "the CLI closed" } });
+    expect(unqueued).toEqual(["q-1"]); // or it would fire the next time anyone resumes the thread
+  });
+
+  it("gives up on an idle CLI that never takes the message, and takes it back", async () => {
+    const { peer, queued, unqueued } = fakeCodexPeer();
+    const { manager, s, seen } = heldSession({ isCliLive: () => true, externalBusy: () => true, codexPeer: peer });
+    manager.startTurn(s.id, "from the phone");
+    await until(() => queued.length === 1);
+    await manager.waitForIdle(s.id);
+    expect(seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: expect.stringMatching(/did not take the message/) } });
+    expect(unqueued).toEqual(["q-1"]);
+  });
+
+  it("reports a queue that cannot be reached as a failed turn", async () => {
+    const { peer } = fakeCodexPeer({ queue: async () => { throw new Error("no rollout found for thread id"); } });
+    const { manager, s, seen, types } = heldSession({ isCliLive: () => true, externalBusy: () => true, codexPeer: peer });
+    manager.startTurn(s.id, "from the phone");
+    await manager.waitForIdle(s.id);
+    expect(types()).toEqual(["user_message", "turn_failed"]);
+    expect(seen.at(-1)!.payload.error).toMatch(/could not reach the codex CLI: no rollout found/);
+    expect(manager.getSession(s.id).status).toBe("idle");
+  });
+
+  it("Stop takes an untaken message back; a taken one can only be stopped in the terminal", async () => {
+    const { peer, queued, unqueued } = fakeCodexPeer();
+    const { manager, s, rollout, seen } = heldSession({ isCliLive: () => true, externalBusy: () => true, codexPeer: peer });
+    manager.startTurn(s.id, "first");
+    await until(() => queued.length === 1);
+    await manager.interrupt(s.id);
+    await manager.waitForIdle(s.id);
+    expect(seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "interrupted" } });
+    expect(unqueued).toEqual(["q-1"]);
+
+    manager.startTurn(s.id, "second");
+    await until(() => queued.length === 2);
+    append(rollout, [cxTaskStart, pUser("second", queued[1]!.clientUserMessageId)]);
+    manager.syncTranscript(s.id); // the watcher would see the delivery on its next tick; interrupt() must too
+    await expect(manager.interrupt(s.id)).rejects.toThrow(ConflictError);
+    expect(unqueued).toEqual(["q-1"]);
+    append(rollout, [pAnswer("done"), cxTaskEnd]);
+    await manager.waitForIdle(s.id);
+    expect(seen.at(-1)).toMatchObject({ type: "turn_completed", payload: { resultText: "done" } });
+
+    // A turn the person typed into the terminal cannot be stopped from here either — and says so
+    append(rollout, [cxTaskStart, pUser("typed"), cxTokens(1)]);
+    manager.syncTranscript(s.id);
+    await expect(manager.interrupt(s.id)).rejects.toThrow(/stop it there/);
+  });
+
+  it("keeps the old refusal when there is no queue bridge to join through", () => {
+    const { manager, s } = heldSession({ isCliLive: () => true, externalBusy: () => true });
+    expect(manager.canJoin(manager.getSession(s.id))).toBe(false);
+    expect(() => manager.startTurn(s.id, "hi")).toThrow(/open in the CLI/);
   });
 });

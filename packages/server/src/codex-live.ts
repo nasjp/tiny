@@ -330,7 +330,14 @@ export function findCodexRollout(
  * response_item "message" records also carry role:user entries that nobody typed (AGENTS.md,
  * plugin notices), the same trap as Claude's isMeta records.
  */
-export function readCodexRollout(file: string, sinceCursor: string | null): ExternalRead | null {
+export function readCodexRollout(
+  file: string,
+  sinceCursor: string | null,
+  opts: {
+    /** client_ids of UserMessages tiny itself queued: reported in peerMsgIds but not emitted (they are already in the conversation) */
+    skipPeerMsgIds?: ReadonlySet<string>;
+  } = {},
+): ExternalRead | null {
   let size: number;
   try {
     size = fs.statSync(file).size;
@@ -360,7 +367,7 @@ export function readCodexRollout(file: string, sinceCursor: string | null): Exte
   // A mid-file start lands mid-line: drop up to the first newline
   if (from > 0 && !sinceCursor?.startsWith("b:")) {
     const nl = raw.indexOf("\n");
-    if (nl < 0) return { events: [], cursor: `b:${from}`, turn: null, title: null };
+    if (nl < 0) return { events: [], cursor: `b:${from}`, turn: null, title: null, peerMsgIds: [] };
     raw = raw.slice(nl + 1);
     from += nl + 1;
   }
@@ -374,6 +381,7 @@ export function readCodexRollout(file: string, sinceCursor: string | null): Exte
   const paginated = declared === "paginated" || records.some((r) => r.type === "event_msg" && r.payload?.type === "item_completed");
 
   const events: TranscriptEvent[] = [];
+  const peerMsgIds: string[] = [];
   let title: string | null = null;
   // Widened alias: TS narrows the switch-assigned literal to never inside later cases otherwise
   let turn = null as ExternalTurn | null;
@@ -399,7 +407,14 @@ export function readCodexRollout(file: string, sinceCursor: string | null): Exte
           const item = p.item && typeof p.item === "object" ? (p.item as Record<string, any>) : null;
           if (!item) break;
           const evs = eventsOfItem(item);
-          if (item.type === "UserMessage" && evs[0]) title ??= titleOf((evs[0].payload as { text: string }).text);
+          if (item.type === "UserMessage") {
+            if (evs[0]) title ??= titleOf((evs[0].payload as { text: string }).text);
+            // The id the sender attached (thread/queue/add's clientUserMessageId lands here verbatim)
+            if (typeof item.client_id === "string" && item.client_id !== "") {
+              peerMsgIds.push(item.client_id);
+              if (opts.skipPeerMsgIds?.has(item.client_id)) break; // tiny's own message coming back
+            }
+          }
           events.push(...evs);
           break;
         }
@@ -453,7 +468,7 @@ export function readCodexRollout(file: string, sinceCursor: string | null): Exte
     }
     // session_meta / world_state / turn_context / response_item message|reasoning are not conversation
   }
-  return { events, cursor: `b:${from + consumed}`, turn, title };
+  return { events, cursor: `b:${from + consumed}`, turn, title, peerMsgIds };
 }
 
 /** The current end-of-file cursor, for seeding without importing (never throws) */

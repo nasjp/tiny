@@ -32,4 +32,11 @@ export interface ExternalRead {
   cursor: string;
   turn: ExternalTurn | null;
   title: string | null;
+  /**
+   * Ids the storage attached to the user messages in this read (codex: the paginated UserMessage
+   * item's `client_id`, which is the `clientUserMessageId` a queued message was handed in with).
+   * The manager matches them against the messages tiny itself queued (live join). Absent when the
+   * storage keeps no such id (legacy codex rollouts, opencode)
+   */
+  peerMsgIds?: string[];
 }

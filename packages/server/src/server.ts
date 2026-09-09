@@ -6,6 +6,7 @@ import { createApp } from "./api.js";
 import { AuthService } from "./auth.js";
 import { readLiveSessions, type LiveSessionEntry } from "./claude-live.js";
 import { codexThreadHolders } from "./codex-live.js";
+import { deleteCodexQueued, queueCodexMessage } from "./codex-peer.js";
 import { opencodeInstancePids } from "./opencode-live.js";
 import { readCliMode, readPeerStatus, readPeerToken, readProcessMode, resolvePeerTarget, sendPeerMessage } from "./claude-peer.js";
 import { findTranscript } from "./claude-transcript.js";
@@ -15,7 +16,7 @@ import { PermissionBroker } from "./permission-broker.js";
 import { profileDir, readProfileLive } from "./profiles.js";
 import { PushClient } from "./push-client.js";
 import { SessionManager } from "./session-manager.js";
-import type { PeerBridge } from "./session-manager.js";
+import type { CodexPeerBridge, PeerBridge } from "./session-manager.js";
 import { loadSettings } from "./settings.js";
 import { makeMcpLaunch } from "./mcp-launch.js";
 import { createStores } from "./stores.js";
@@ -135,6 +136,21 @@ export async function startServer(env: Record<string, string | undefined> = proc
     },
   };
 
+  // Live join for Codex (Step 3 Wave 2): a message for a thread the CLI holds goes into that
+  // thread's queue through codex-peer.ts, the only module that knows how. Same profile dir = CODEX_HOME
+  const codexPeer: CodexPeerBridge = {
+    queue: (s, msg) => {
+      const dir = configDirOf(s);
+      if (!dir || !s.agentSessionId) return Promise.reject(new Error("no codex home for this session"));
+      return queueCodexMessage(dir, { threadId: s.agentSessionId, ...msg });
+    },
+    unqueue: (s, queuedSubmissionId) => {
+      const dir = configDirOf(s);
+      if (!dir || !s.agentSessionId) return Promise.reject(new Error("no codex home for this session"));
+      return deleteCodexQueued(dir, { threadId: s.agentSessionId, queuedSubmissionId });
+    },
+  };
+
   let port = paths.port;
   const manager = new SessionManager({
     stores,
@@ -148,6 +164,7 @@ export async function startServer(env: Record<string, string | undefined> = proc
     isCliLive,
     cliState,
     peer,
+    codexPeer,
     externalBusy,
     liveScanEnabled: (name) => readProfileLive(paths.profilesDir, name),
   });

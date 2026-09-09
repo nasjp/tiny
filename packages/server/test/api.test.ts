@@ -50,12 +50,14 @@ describe("REST API", () => {
   let cliState: LiveSessionEntry | null = null;
   let peerTarget: PeerTarget | null = null;
   let peerSent: PeerFrame[] = [];
+  let codexQueued: string[] = [];
 
   beforeEach(() => {
     cliLive = null;
     cliState = null;
     peerTarget = null;
     peerSent = [];
+    codexQueued = [];
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-api-"));
     profilesDir = path.join(home, "profiles");
     addProfile(profilesDir, "work");
@@ -71,8 +73,12 @@ describe("REST API", () => {
       send: async (_s, _t, frame) => { peerSent.push(frame); },
     };
     manager = new SessionManager({
-      stores, profilesDir, adapters: { claude: okAdapter }, broker: new PermissionBroker(1000), outbox,
+      stores, profilesDir, adapters: { claude: okAdapter, codex: okAdapter }, broker: new PermissionBroker(1000), outbox,
       isCliLive, cliState: () => cliState, peer, liveTiming: { pollMs: 10, deliveryTimeoutMs: 50, idleSettleMs: 30 },
+      codexPeer: {
+        queue: async (_s, msg) => { codexQueued.push(msg.clientUserMessageId); return { queuedSubmissionId: "q-1" }; },
+        unqueue: async () => true,
+      },
     });
     auth = new AuthService(stores, path.join(home, "secret"));
     token = auth.cliToken();
@@ -798,6 +804,28 @@ describe("REST API", () => {
       method: "POST", headers: H(), body: JSON.stringify({ prompt: "hi" }),
     });
     expect(ok.status).toBe(202);
+    await manager.waitForIdle(id);
+  });
+
+  // Codex: the lock holder makes the session cliLive, and the queue bridge makes it joinable, so the
+  // phone's composer stays open (iOS: isHeldByCLI = cliLive && cliJoin != true) and a send is queued
+  it("reports cliJoin for a codex thread the terminal holds, and queues the turn into it", async () => {
+    addProfile(profilesDir, "cx", "codex");
+    const res = await app.request("/v1/sessions/adopt", {
+      method: "POST", headers: H(),
+      body: JSON.stringify({ profile: "cx", cwd, agentSessionId: "01a08509-4d7c-78c1-8460-fd52c0e5a773" }),
+    });
+    expect(res.status).toBe(201);
+    const { id } = (await res.json()) as { id: string };
+    cliLive = true;
+    const list = (await (await app.request("/v1/sessions", { headers: H() })).json()) as { sessions: Array<{ id: string; cliLive: boolean | null; cliJoin: boolean }> };
+    expect(list.sessions.find((s) => s.id === id)).toMatchObject({ cliLive: true, cliJoin: true });
+    const sent = await app.request(`/v1/sessions/${id}/turns`, {
+      method: "POST", headers: H(), body: JSON.stringify({ prompt: "from the phone" }),
+    });
+    expect(sent.status).toBe(202);
+    expect(codexQueued).toHaveLength(1);
+    await manager.interrupt(id); // untaken: Stop takes it back
     await manager.waitForIdle(id);
   });
 
