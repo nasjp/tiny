@@ -8,6 +8,7 @@ import { listProfiles, profileDir, profileDriver } from "./profiles.js";
 import type { LiveSessionEntry } from "./claude-live.js";
 import type { ExternalTurn } from "./agent-storage.js";
 import { codexRolloutCursor, findCodexRollout, listCodexSessions, readCodexRollout } from "./codex-live.js";
+import type { CodexQueueMessage } from "./codex-peer.js";
 import { listOpencodeSessions, opencodeDbStat, opencodeSessionCursor, readOpencodeSession } from "./opencode-live.js";
 import { findTranscript, readTranscript, readTranscriptCursor, type TranscriptTurn } from "./claude-transcript.js";
 import { PEER_STOP, wrapForPeer, type CliMode, type PeerFrame, type PeerStatus, type PeerTarget } from "./claude-peer.js";
@@ -51,6 +52,18 @@ export interface PeerBridge {
   /** The CLI's current permission mode, asserted on the wrapper so a bypass session delivers instead of holding */
   mode: (s: SessionRecord, target: PeerTarget) => CliMode | null;
   send: (s: SessionRecord, target: PeerTarget, frame: PeerFrame) => Promise<void>;
+}
+
+/**
+ * How the manager hands a message to the Codex CLI holding a thread (Step 3 Wave 2 live join).
+ * Implemented by codex-peer.ts in server.ts; tests inject fakes. Absent = a turn sent while the CLI
+ * holds the thread is refused (409), as before
+ */
+export interface CodexPeerBridge {
+  /** Put the message in the thread's queue; the CLI runs it as its next turn. Throws when codex refuses */
+  queue: (s: SessionRecord, msg: Omit<CodexQueueMessage, "threadId">) => Promise<{ queuedSubmissionId: string }>;
+  /** Take an untaken message back. true = it was still queued. Throws when codex cannot be reached */
+  unqueue: (s: SessionRecord, queuedSubmissionId: string) => Promise<boolean>;
 }
 
 export interface LiveTiming {
@@ -105,6 +118,8 @@ export interface SessionManagerDeps {
   externalBusy?: (s: SessionRecord) => boolean | null;
   /** Live join into the CLI (Step 2). Absent = a turn sent while the CLI holds the session is refused (409) */
   peer?: PeerBridge;
+  /** Live join into the Codex CLI through its message queue (Step 3 Wave 2). Absent = 409 while the CLI holds the thread */
+  codexPeer?: CodexPeerBridge;
   /** Watcher timings. Tests shorten them; production uses the defaults */
   liveTiming?: LiveTiming;
   /**
@@ -145,6 +160,31 @@ interface LiveTurn {
 }
 
 /**
+ * A turn running inside the person's Codex CLI on tiny's behalf. Evidence comes from two places
+ * only: the rollout (our client id on a UserMessage = taken; task_complete after that = over) and
+ * the thread's writer lock (no holder = the CLI is gone)
+ */
+interface CodexLiveTurn {
+  /** The clientUserMessageId handed to thread/queue/add; comes back as UserMessage.client_id */
+  msgId: string;
+  /** codex's own id for the queued item, for taking it back. null until queued */
+  queuedId: string | null;
+  startedAt: number;
+  /** When the rollout first showed our client id */
+  deliveredAt: number | null;
+  /** The rollout closed a turn after our message was taken: the turn is over */
+  closedAfterDelivery: boolean;
+  /** Since when the CLI has sat idle without taking our message (null while it runs its own turn / delivered) */
+  idleUndeliveredSince: number | null;
+  /** Stop took the message back before the CLI did: the watcher ends the turn as interrupted */
+  unqueued: boolean;
+  /** Newest assistant text imported after delivery; goes out as turn_completed's resultText */
+  lastAssistantText: string | null;
+}
+
+const CODEX_STOP_IN_TERMINAL = "this turn is running in the codex CLI; stop it there (Esc)";
+
+/**
  * Registry statuses that mean "work is in progress over there": a turn (busy), a permission prompt
  * mid-turn (waiting), or a background shell task the CLI is waiting on after its turn ended (shell —
  * measured: a `!cmd` typed at the prompt reads busy, not shell). The CLI resumes when that task exits
@@ -179,6 +219,14 @@ export class SessionManager extends EventEmitter {
   private codexRollouts = new Map<string, string>();
   /** Turns currently running inside the user's CLI rather than tiny's own adapter, by session id */
   private liveTurns = new Map<string, LiveTurn>();
+  /** Same, for Codex: turns handed to the CLI holding the thread through its queue */
+  private codexLiveTurns = new Map<string, CodexLiveTurn>();
+  /**
+   * Every client id tiny ever queued into a codex thread, by session. The rollout echoes our message
+   * back as a UserMessage; tiny already wrote it into the conversation when it was sent, so the
+   * echo is dropped on import — for as long as this process lives, not just while the turn runs
+   */
+  private codexSentMsgIds = new Map<string, Set<string>>();
   /**
    * Messages that arrived while a turn was running, in order. Typing during a turn queues in
    * Claude Code's own CLI, so it queues here too — refusing them made the phone the odd one out.
@@ -477,8 +525,9 @@ export class SessionManager extends EventEmitter {
   private importTranscript(id: string): { imported: number; peerMsgIds: string[]; responded: boolean } {
     const s = this.getSession(id);
     if (s.agent === "codex" || s.agent === "opencode") {
-      // Same running guard as claude, minus live turns (those are claude-only)
-      if (this.running.has(id)) return SessionManager.noImport();
+      // Same running guard as claude: while tiny's own adapter appends to the storage nothing is
+      // imported; a live turn is the exception (the CLI is the only writer, importing is the point)
+      if (this.running.has(id) && !this.codexLiveTurns.has(id)) return SessionManager.noImport();
       try {
         return s.agent === "codex" ? this.importCodex(s) : this.importOpencode(s);
       } catch {
@@ -592,10 +641,23 @@ export class SessionManager extends EventEmitter {
     if (this.seedInsteadOfImport(s, () => codexRolloutCursor(file))) return SessionManager.noImport();
     const stat = this.transcriptChange(s.id, file);
     if (!stat) return SessionManager.noImport();
-    const read = readCodexRollout(file, s.sourceCursor);
+    const read = readCodexRollout(file, s.sourceCursor, { skipPeerMsgIds: this.codexSentMsgIds.get(s.id) });
     if (!read) return SessionManager.noImport();
     for (const ev of read.events) this.emitEvent(s.id, ev.type, ev.payload);
     this.recordExternalTurn(s.id, read.turn);
+    // Delivery / completion evidence lands on the live turn here, whoever triggered the read (the
+    // watcher tick or a phone poll), so neither can steal it from the other — same as Claude's path
+    const live = this.codexLiveTurns.get(s.id);
+    if (live) {
+      if (live.deliveredAt === null && (read.peerMsgIds ?? []).includes(live.msgId)) live.deliveredAt = Date.now();
+      if (live.deliveredAt !== null) {
+        // The rollout is ordered: a task_complete read after (or together with) our message is our turn ending
+        if (read.turn?.open === false) live.closedAfterDelivery = true;
+        for (const ev of read.events) {
+          if (ev.type === "assistant_text" && typeof ev.payload.text === "string") live.lastAssistantText = ev.payload.text;
+        }
+      }
+    }
     const patch: SessionPatch = {};
     if (read.cursor !== s.sourceCursor) patch.sourceCursor = read.cursor;
     if (read.title && !s.title) patch.title = read.title;
@@ -962,7 +1024,17 @@ export class SessionManager extends EventEmitter {
 
   /** Whether a turn sent now would run inside the user's CLI (live join) rather than be refused */
   canJoin(s: SessionRecord): boolean {
-    return this.joinTarget(s) !== null;
+    return this.joinTarget(s) !== null || this.codexJoinable(s);
+  }
+
+  /**
+   * Whether a message can be queued into the Codex CLI holding this thread: the bridge exists and
+   * somebody holds the thread's writer lock (isCliLive for codex). No holder = nobody would take
+   * the message, and tiny runs the turn in its own app-server instead
+   */
+  private codexJoinable(s: SessionRecord): boolean {
+    if (!this.deps.codexPeer || s.agent !== "codex" || !s.agentSessionId) return false;
+    return this.deps.isCliLive?.(s) === true;
   }
 
   /**
@@ -1009,8 +1081,24 @@ export class SessionManager extends EventEmitter {
     live?: LiveSend,
   ): void {
     const id = s.id;
+    // The Codex CLI holds the thread: hand the message to that process through its queue. Its own
+    // turn being in progress is no obstacle — the queue runs ours right after it
+    if (s.agent === "codex" && this.codexJoinable(s)) {
+      this.deps.stores.sessions.patch(id, { status: "running", title: s.title ?? prompt.slice(0, 60) });
+      const abort = new AbortController();
+      this.turnProgress.set(id, { since: new Date().toISOString(), outputTokens: null });
+      const entry: RunningTurn = { abort, done: Promise.resolve() };
+      this.running.set(id, entry);
+      if (!saved) this.persistUserMessage(id, prompt, images);
+      entry.done = this.runCodexLiveTurn(s, prompt, images, abort.signal).finally(() => {
+        this.running.delete(id);
+        this.turnProgress.delete(id);
+        this.startNextQueued(id);
+      });
+      return;
+    }
     // A turn the agent's own CLI is running (seen through its storage): a second writer on the
-    // same session is the one thing every agent forbids. codex / opencode have no live join (yet)
+    // same session is the one thing every agent forbids. opencode has no live join (yet)
     const ext = this.transcriptTurns.get(id);
     if ((s.agent === "codex" || s.agent === "opencode") && ext?.open === true && this.deps.externalBusy?.(s) !== false) {
       throw new ConflictError("a turn is running in the agent's own CLI");
@@ -1088,7 +1176,7 @@ export class SessionManager extends EventEmitter {
     const own = this.turnProgress.get(s.id);
     if (own) {
       // A live turn's output is written by the CLI, so the transcript is the only place it shows up
-      const fromTranscript = this.liveTurns.has(s.id) ? this.transcriptTurns.get(s.id)?.outputTokens ?? null : null;
+      const fromTranscript = this.liveTurns.has(s.id) || this.codexLiveTurns.has(s.id) ? this.transcriptTurns.get(s.id)?.outputTokens ?? null : null;
       return { since: own.since, outputTokens: own.outputTokens ?? fromTranscript };
     }
     if (s.agent === "codex" || s.agent === "opencode") {
@@ -1294,6 +1382,101 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  /**
+   * Run a turn inside the Codex CLI holding the thread: queue the message, then watch the rollout
+   * for the CLI taking it (our client id on a UserMessage) and finishing it (task_complete after
+   * that). The CLI's own turn in progress is waited out — the queue runs ours next — for as long as
+   * it takes. The turn fails when the CLI goes away (no lock holder), when an idle CLI never takes
+   * the message, or when tinyd itself stops; in each of those the queued item is taken back, or it
+   * would fire the next time anyone resumes the thread
+   */
+  private async runCodexLiveTurn(s: SessionRecord, prompt: string, images: TurnImage[] | undefined, signal: AbortSignal): Promise<void> {
+    const timing = this.deps.liveTiming ?? DEFAULT_LIVE_TIMING;
+    const live: CodexLiveTurn = {
+      msgId: crypto.randomUUID(), queuedId: null, startedAt: Date.now(), deliveredAt: null,
+      closedAfterDelivery: false, idleUndeliveredSince: null, unqueued: false, lastAssistantText: null,
+    };
+    this.codexLiveTurns.set(s.id, live);
+    let sent = this.codexSentMsgIds.get(s.id);
+    if (!sent) this.codexSentMsgIds.set(s.id, (sent = new Set()));
+    sent.add(live.msgId);
+    const takeBack = async (): Promise<void> => {
+      if (live.queuedId === null || live.deliveredAt !== null) return;
+      try {
+        await this.deps.codexPeer!.unqueue(s, live.queuedId);
+      } catch (err) {
+        console.error(`[tinyd] could not take a queued message back from the codex CLI: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+    try {
+      try {
+        const q = await this.deps.codexPeer!.queue(s, { clientUserMessageId: live.msgId, text: prompt, ...(images ? { images } : {}) });
+        live.queuedId = q.queuedSubmissionId;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        this.emitEvent(s.id, "turn_failed", { error: `could not reach the codex CLI: ${reason}` });
+        return;
+      }
+      this.emitEvent(s.id, "turn_started", { agentSessionId: s.agentSessionId });
+      for (;;) {
+        await new Promise((r) => setTimeout(r, timing.pollMs));
+        if (signal.aborted) {
+          await takeBack();
+          this.emitEvent(s.id, "turn_failed", { error: "interrupted" });
+          return;
+        }
+        // Evidence is recorded on `live` by importCodex itself, whichever caller runs the import
+        this.importTranscript(s.id);
+        if (live.unqueued) {
+          this.emitEvent(s.id, "turn_failed", { error: "interrupted" });
+          return;
+        }
+        if (live.deliveredAt !== null && live.closedAfterDelivery) {
+          this.emitEvent(s.id, "turn_completed", { costUsd: null, resultText: live.lastAssistantText });
+          return;
+        }
+        // Nobody holds the writer lock: the terminal closed the thread (or was killed). Untaken,
+        // our message must not lie in wait for the next resume; taken, the turn was cut short
+        if (this.deps.externalBusy?.(s) === false) {
+          await takeBack();
+          this.emitEvent(s.id, "turn_failed", { error: "the CLI closed" });
+          return;
+        }
+        if (live.deliveredAt === null) {
+          // The queue is drained between turns, so while the CLI runs its own turn no clock runs
+          // (a busy CLI is never given up on); an idle one that does not take the message within the
+          // delivery window is not going to
+          const cliBusy = this.transcriptTurns.get(s.id)?.open === true;
+          if (cliBusy) {
+            live.idleUndeliveredSince = null;
+          } else {
+            live.idleUndeliveredSince ??= Date.now();
+            if (Date.now() - live.idleUndeliveredSince > timing.deliveryTimeoutMs) {
+              await takeBack();
+              this.emitEvent(s.id, "turn_failed", { error: "the codex CLI did not take the message (is the thread still open in the terminal?)" });
+              return;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(`[tinyd] codex live turn crashed: ${reason}`);
+      try {
+        this.emitEvent(s.id, "turn_failed", { error: reason });
+      } catch (emitErr) {
+        console.error("[tinyd] could not record turn_failed for a crashed codex live turn:", emitErr);
+      }
+    } finally {
+      this.codexLiveTurns.delete(s.id);
+      try {
+        this.deps.stores.sessions.patch(s.id, { status: "idle" });
+      } catch {
+        // The session row may already be gone (deleted mid-turn) — nothing left to patch
+      }
+    }
+  }
+
   /** One watcher tick. Returns the terminal event when the turn is over, null to keep watching */
   private pollLiveTurn(
     s: SessionRecord,
@@ -1436,6 +1619,21 @@ export class SessionManager extends EventEmitter {
     const s = this.getSession(id);
     // Stop means stop: what was queued behind this turn goes too, as it does in the CLI
     this.queued.delete(id);
+    const codexLive = this.codexLiveTurns.get(id);
+    if (codexLive) {
+      // Untaken, the message can be taken back and the turn never happens. Taken, it is the CLI's
+      // turn now, and codex offers no way in from outside (measured): say so instead of pretending
+      if (codexLive.deliveredAt !== null || codexLive.queuedId === null) throw new ConflictError(CODEX_STOP_IN_TERMINAL);
+      let taken: boolean;
+      try {
+        taken = await this.deps.codexPeer!.unqueue(s, codexLive.queuedId);
+      } catch (err) {
+        throw new ConflictError(`could not take the message back from the codex CLI: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (!taken) throw new ConflictError(CODEX_STOP_IN_TERMINAL); // the CLI took it in the meantime
+      codexLive.unqueued = true; // the watcher ends the turn as interrupted
+      return;
+    }
     const live = this.liveTurns.get(id);
     if (!live) {
       const own = this.running.get(id);
@@ -1471,6 +1669,11 @@ export class SessionManager extends EventEmitter {
    * "now" message the CLI takes instead of continuing. Awaited so a socket failure reaches the tap
    */
   private async stopCliTurn(s: SessionRecord): Promise<void> {
+    if (s.agent === "codex") {
+      // A turn typed into the codex terminal shows as running from its rollout; nothing here can stop it
+      if (this.transcriptTurns.get(s.id)?.open === true && this.deps.externalBusy?.(s) !== false) throw new ConflictError(CODEX_STOP_IN_TERMINAL);
+      return;
+    }
     const st = this.deps.cliState?.(s);
     if (!st || !CLI_BUSY.has(st.status)) return; // nothing is running anywhere
     const target = this.joinTarget(s);

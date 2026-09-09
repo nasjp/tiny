@@ -161,6 +161,19 @@ describe("codex-live paginated rollouts (codex ≥ 0.147 TUI / ≥ 0.153 app-ser
     expect(listCodexSessions(root, { now: new Date("2026-09-06T20:00:00+09:00") })).toEqual([]);
   });
 
+  it("reports the client_id of every UserMessage item, so a message tiny queued can be recognised", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cx-"));
+    const queued = item("UserMessage", { id: "u2", client_id: "3f0c1c5e-6a4b-4c1d-9c2e-8d1a2b3c4d5e", content: [{ type: "text", text: "from the phone", text_elements: [] }] });
+    const file = writeRollout(root, [P.meta, P.taskStart, P.user, P.answer, P.taskEnd]);
+    const read1 = readCodexRollout(file, null)!;
+    expect(read1.peerMsgIds).toEqual([]); // the person's own message carries no client_id in this fixture
+    fs.appendFileSync(file, jsonl([P.taskStart, queued, P.answer, P.taskEnd]));
+    const read2 = readCodexRollout(file, read1.cursor)!;
+    expect(read2.peerMsgIds).toEqual(["3f0c1c5e-6a4b-4c1d-9c2e-8d1a2b3c4d5e"]);
+    expect(read2.events.map((e) => e.type)).toEqual(["user_message", "assistant_text"]);
+    expect(read2.turn).toMatchObject({ open: false });
+  });
+
   it("maps item_completed records to tiny events and ignores the unified-exec custom_tool_call pair", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cx-"));
     const file = writeRollout(root, [P.meta, P.taskStart, P.devNoise, P.user, P.jsCall, P.cmd, P.cmdFail, P.jsOut, P.tokens1, P.commentary, P.reasoningEmpty]);
