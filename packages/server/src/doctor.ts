@@ -1,7 +1,7 @@
 import type { AgentDriver } from "./agents/index.js";
 import type { InstalledDaemon } from "./daemon.js";
 import type { TinyEntry } from "./entry.js";
-import type { ProfileInfo } from "./profiles.js";
+import { loginState, type ProfileInfo } from "./profiles.js";
 import type { TinySettings } from "./settings.js";
 
 export type CheckStatus = "ok" | "warn" | "ng";
@@ -136,12 +136,17 @@ function checkAgent(d: DoctorDeps, driver: AgentDriver): DoctorCheck {
   const name = `agent ${driver.label}`;
   const bin = d.findOnPath(driver.bin);
   const profiles = d.profiles.filter((p) => p.agent === driver.id);
-  const list = profiles.map((p) => `${p.name} (${p.loggedIn ? "logged in" : "not logged in"})`).join(", ");
+  const list = profiles.map((p) => `${p.name} (${loginState(p)})`).join(", ");
   if (!bin) {
     return { status: "warn", name, detail: `not installed (\`${driver.bin}\` not on PATH)${profiles.length > 0 ? `; profiles: ${list}` : ""}` };
   }
   if (profiles.length === 0) {
     return { status: "warn", name, detail: `${bin}; no profile`, hint: `tiny profiles add <name> --agent ${driver.id} && tiny profiles login <name>` };
+  }
+  // A login that stopped working is always worth a warning (a profile nobody logged in to is not)
+  const expired = profiles.filter((p) => loginState(p) === "login expired");
+  if (expired.length > 0) {
+    return { status: "warn", name, detail: `${bin}; profiles: ${list}`, hint: `tiny profiles login ${expired[0]!.name}` };
   }
   const loggedOut = profiles.filter((p) => !p.loggedIn);
   if (loggedOut.length === profiles.length) {

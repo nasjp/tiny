@@ -117,10 +117,17 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
 - **Any code that spawns child processes must strip `ANTHROPIC_API_KEY` from the env**
   (leaving it set bills the API pay-as-you-go instead of the subscription; every
   existing spawn path already strips it)
-- Read test counts, not just pass/fail (currently server 697 / relay 37 / iOS unit 205
+- Read test counts, not just pass/fail (currently server 712 / relay 37 / iOS unit 205
   + 5 demo-UI + 3 live E2E [need a real tinyd — see HANDOFF]). **`xcodebuild test |
   tail` exits 0 even on failure** — always check for the literal
   `** TEST FAILED **` / `** TEST SUCCEEDED **` strings
+- **`listProfiles().loggedIn` only means a login once happened** (Claude: `oauthAccount` in
+  `.claude.json`). Claude Code empties the Keychain token when a refresh fails and leaves
+  `oauthAccount` behind — on 2026-09-25 three profiles kept showing "logged in" with dead tokens.
+  Anything that tells a person or the phone whether a profile can run goes through
+  `listProfilesVerified` / `verifyProfile` (the driver's `verifyLogin` = `claude auth status`,
+  which reads only the `loggedIn` flag; tiny still never touches the token). "email set +
+  loggedIn false" is shown as "login expired"
 - **Usage comes through the Agent SDK's `Query.usage_EXPERIMENTAL_…()`** (`usage.ts`).
   The code paths that read, refreshed, or wrote back the Keychain OAuth token were
   removed on 2026-08-29 (per Anthropic legal-and-compliance: "developers may not

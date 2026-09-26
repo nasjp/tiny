@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -82,9 +83,49 @@ export function readClaudeCachedUsage(dir: string): { raw: unknown; fetchedAt: s
   }
 }
 
-/** Whether logged in (never inspects token contents; never touches the Keychain) */
+/**
+ * Whether this dir has logged in (never inspects token contents; never touches the Keychain).
+ * Cheap, but it only proves a login happened once: Claude Code empties the stored token when a
+ * refresh fails, and leaves oauthAccount behind. claudeAuthStatus is the check that notices that
+ */
 export function claudeLoggedIn(dir: string): boolean {
   return fs.existsSync(path.join(dir, ".credentials.json")) || readClaudeOauthAccount(dir) != null;
+}
+
+/** Runs `claude auth status`. Resolves to its stdout (it exits 1 when logged out), null when it did not run */
+export type AuthStatusRunner = (env: NodeJS.ProcessEnv, timeoutMs: number) => Promise<string | null>;
+
+const defaultAuthStatusRunner: AuthStatusRunner = (env, timeoutMs) =>
+  new Promise((resolve) => {
+    execFile("claude", ["auth", "status", "--json"], { env, timeout: timeoutMs, encoding: "utf8" }, (_err, stdout) => {
+      resolve(stdout ? stdout : null);
+    });
+  });
+
+/**
+ * Asks Claude Code itself whether `dir` can still run: `claude auth status` answers from the
+ * credential it would actually use. tiny reads only the `loggedIn` flag — the token stays inside
+ * Claude Code. null = could not tell (claude missing, timed out, unreadable output)
+ */
+export async function claudeAuthStatus(
+  dir: string,
+  opts: { run?: AuthStatusRunner; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+): Promise<boolean | null> {
+  // The same env a session gets: an ANTHROPIC_API_KEY would report API-key auth as logged in, and
+  // the default dir must go without CLAUDE_CONFIG_DIR (see claudeConfigDirEnv)
+  const env: NodeJS.ProcessEnv = { ...(opts.env ?? process.env) };
+  delete env.ANTHROPIC_API_KEY;
+  const { CLAUDE_CONFIG_DIR } = claudeConfigDirEnv(dir);
+  if (CLAUDE_CONFIG_DIR === undefined) delete env.CLAUDE_CONFIG_DIR;
+  else env.CLAUDE_CONFIG_DIR = CLAUDE_CONFIG_DIR;
+  const out = await (opts.run ?? defaultAuthStatusRunner)(env, opts.timeoutMs ?? 5_000).catch(() => null);
+  if (out === null) return null;
+  try {
+    const loggedIn = (JSON.parse(out) as { loggedIn?: unknown }).loggedIn;
+    return typeof loggedIn === "boolean" ? loggedIn : null;
+  } catch {
+    return null;
+  }
 }
 
 // Models are pinned to full IDs (aliases would hide what actually ran). Add one line here when a new model ships
@@ -104,6 +145,7 @@ export const claudeDriver: AgentDriver = {
   // Leaving it bills API pay-as-you-go instead of the subscription
   stripEnv: ["ANTHROPIC_API_KEY"],
   isLoggedIn: claudeLoggedIn,
+  verifyLogin: (dir) => claudeAuthStatus(dir),
   login: () => ({ bin: "claude", args: ["/login"] }),
   attach: (s) => ({ bin: "claude", args: ["--resume", s.agentSessionId] }),
   capabilities: () => ({

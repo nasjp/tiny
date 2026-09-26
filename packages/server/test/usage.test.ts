@@ -181,6 +181,18 @@ describe("UsageService", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("waits for an async login check and shares it between concurrent requests", async () => {
+    const fetcher = vi.fn(async () => RATE_LIMITS);
+    const isLoggedIn = vi.fn(async () => true);
+    const usage = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn });
+    await Promise.all([usage.get("work"), usage.get("work")]);
+    expect(isLoggedIn).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    const dead = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn: async () => false });
+    expect(((await dead.get("work").catch((e: unknown) => e)) as UsageError).problem).toBe("signed_out");
+  });
+
   it("passes the profile's directory to the fetcher", async () => {
     const fetcher = vi.fn(async () => RATE_LIMITS);
     const usage = new UsageService(profilesDir, { fetcher, resolveDir, isLoggedIn: () => true });
@@ -356,6 +368,8 @@ describe("UsageService (per-agent fetchers)", () => {
       ['{"code":"token_invalidated"}', "signed_out"],
       ["Your authentication token has been invalidated. Please try signing in again.", "signed_out"],
       ["Not logged in. Run `codex login`", "signed_out"],
+      // what Claude Code answered on 2026-09-25 once it had emptied the token
+      ["Failed to authenticate: OAuth session expired and could not be refreshed", "signed_out"],
       ["usage request timed out after 20000ms", "failed"],
       ["ECONNREFUSED 127.0.0.1:1455", "failed"],
     ];

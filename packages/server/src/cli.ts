@@ -17,7 +17,7 @@ import { fetchAcpChoices } from "./acp-adapter.js";
 import { detectTailscaleIp } from "./tailscale.js";
 import { findOnPath } from "./which.js";
 import { migrateClaudeCredential, type KeychainMigration } from "./keychain.js";
-import { addProfile, listProfiles, profileDir, profileDriver, readProfileLive, renameProfile, setProfileLive, type ProfileInfo } from "./profiles.js";
+import { addProfile, listProfiles, listProfilesVerified, loginState, profileDir, profileDriver, readProfileLive, renameProfile, setProfileLive, verifyProfile, type ProfileInfo } from "./profiles.js";
 import { agentEnv, getDriver, listDrivers } from "./agents/index.js";
 import { defaultClaudeConfigDir } from "./agents/claude.js";
 import { runSetup } from "./setup.js";
@@ -262,7 +262,7 @@ export function resolveSessionId(sessions: SessionRecord[], prefix: string): str
 }
 
 export function formatProfileRow(prof: ProfileInfo): string {
-  const status = prof.loggedIn ? "logged in" : "not logged in";
+  const status = loginState(prof);
   return `${prof.name.padEnd(12)} ${status.padEnd(14)} ${prof.email ?? "-"}`;
 }
 
@@ -632,7 +632,7 @@ program
       tailscaleIp: detectTailscaleIp(),
       drivers: listDrivers(),
       findOnPath: (bin) => findOnPath(bin),
-      profiles: listProfiles(p.profilesDir),
+      profiles: await listProfilesVerified(p.profilesDir),
       fileExists: (f) => fs.existsSync(f),
       sameFile,
       alwaysHandoff: alwaysHandoffTargets(
@@ -659,7 +659,7 @@ program
         nodeVersion: process.version,
         drivers: listDrivers(),
         findOnPath: (bin) => findOnPath(bin),
-        profiles: () => listProfiles(p.profilesDir),
+        profiles: () => listProfilesVerified(p.profilesDir),
         addProfile: (name, agent) => {
           addProfile(p.profilesDir, name, agent);
         },
@@ -682,9 +682,9 @@ program
   });
 
 const profiles = program.command("profiles").description("manage agent account profiles");
-profiles.command("ls").action(() => {
+profiles.command("ls").action(async () => {
   const p = tinyPaths();
-  for (const prof of listProfiles(p.profilesDir)) {
+  for (const prof of await listProfilesVerified(p.profilesDir)) {
     console.log(formatProfileRow(prof));
   }
 });
@@ -695,14 +695,17 @@ profiles
     "--config-dir <dir>",
     "wrap an existing agent home instead of creating one (claude: CLAUDE_CONFIG_DIR, codex: CODEX_HOME — e.g. ~/.codex to watch the codex you run in the terminal)",
   )
-  .action((name: string, opts: { agent: string; configDir?: string }) => {
+  .action(async (name: string, opts: { agent: string; configDir?: string }) => {
     const p = tinyPaths();
-    const prof = runProfileAdd(p.profilesDir, name, opts);
+    // A wrapped home may carry a login that has since died; ask the agent before saying "logged in"
+    const prof = await verifyProfile(runProfileAdd(p.profilesDir, name, opts));
     if (opts.configDir === undefined) {
       console.log(`Created: ${prof.dir} (${prof.label})\nNext, log in with \`tiny profiles login ${name}\``);
       return;
     }
-    const login = prof.loggedIn ? "already logged in there" : `not logged in there yet — run \`tiny profiles login ${name}\``;
+    const login = prof.loggedIn
+      ? "already logged in there"
+      : `${loginState(prof) === "login expired" ? "its login there has expired" : "not logged in there yet"} — run \`tiny profiles login ${name}\``;
     const scan = prof.agent === "codex" ? `\nTo see sessions you start in the terminal, turn on the scan: \`tiny live on --profile ${name}\`` : "";
     console.log(`Added: ${name} → ${prof.dir} (${prof.label}, ${login})${scan}`);
   });

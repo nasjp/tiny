@@ -60,6 +60,15 @@ describe("runSetup", () => {
     expect(h.calls).toEqual(["installDaemon", "waitHealthy", "pair"]);
   });
 
+  it("logs in again when the profile's login has expired (profiles may answer asynchronously)", async () => {
+    const h = harness();
+    h.setProfiles([{ ...profile("work", "claude", false), email: "w@example.com" }]);
+    h.setServerUrl("http://100.1.1.1:7777");
+    const sync = h.deps.profiles;
+    await runSetup({ ...h.deps, profiles: async () => sync() }, { agent: "claude", profile: "work" });
+    expect(h.calls).toEqual(["login work", "installDaemon", "waitHealthy", "pair"]);
+  });
+
   it("without Tailscale, leaves serverUrl alone and only prints guidance", async () => {
     const lines: string[] = [];
     const h = harness({ tailscaleIp: () => null, log: (l) => lines.push(l) });

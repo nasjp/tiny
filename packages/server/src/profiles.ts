@@ -17,8 +17,20 @@ export interface ProfileInfo {
   defaultModel: string | null;
   /** effort from settings.json; null if unset (= CLI default) */
   defaultEffort: string | null;
-  /** email address of the logged-in account; null if logged out/unknown */
+  /**
+   * email address of the account this profile logged in as; null if never logged in/unknown.
+   * Stays set when that login has since stopped working (loggedIn false) — see loginState
+   */
   email: string | null;
+}
+
+/**
+ * How a person should read a profile's login. "login expired" = it did log in (the account is
+ * still on record) but the agent no longer accepts it, which only a re-login fixes
+ */
+export function loginState(p: Pick<ProfileInfo, "loggedIn" | "email">): "logged in" | "login expired" | "not logged in" {
+  if (p.loggedIn) return "logged in";
+  return p.email !== null ? "login expired" : "not logged in";
 }
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
@@ -130,6 +142,31 @@ function info(profilesDir: string, name: string): ProfileInfo {
   };
 }
 
+/** Asks the profile's agent whether its login still works. null = could not tell */
+export type LoginVerifier = (p: ProfileInfo) => Promise<boolean | null>;
+
+export const verifyWithDriver: LoginVerifier = async (p) => (await findDriver(p.agent)?.verifyLogin?.(p.dir)) ?? null;
+
+/**
+ * The profile with loggedIn confirmed by the agent itself. Only a cheap "yes" is worth checking:
+ * a profile that never logged in stays as it is, and "could not tell" keeps the cheap answer
+ */
+export async function verifyProfile(p: ProfileInfo, verify: LoginVerifier = verifyWithDriver): Promise<ProfileInfo> {
+  if (!p.loggedIn) return p;
+  const ok = await verify(p).catch(() => null);
+  return ok === false ? { ...p, loggedIn: false } : p;
+}
+
+/**
+ * listProfiles for anything that tells a person (or the phone) whether a profile can run.
+ * listProfiles' loggedIn only says a login once happened (the 2026-09-25 incident: three profiles
+ * whose tokens Claude Code had emptied kept showing "logged in"). Checks run in parallel
+ */
+export async function listProfilesVerified(profilesDir: string, verify: LoginVerifier = verifyWithDriver): Promise<ProfileInfo[]> {
+  return Promise.all(listProfiles(profilesDir).map((p) => verifyProfile(p, verify)));
+}
+
+/** Cheap listing (no agent is asked). loggedIn = a login once happened; see listProfilesVerified */
 export function listProfiles(profilesDir: string): ProfileInfo[] {
   if (!fs.existsSync(profilesDir)) return [];
   return fs

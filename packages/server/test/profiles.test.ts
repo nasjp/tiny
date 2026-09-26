@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { addProfile, listProfiles, profileDir, profileDriver, renameProfile, readProfileLive, setProfileLive, readProfileAgent } from "../src/profiles.js";
+import { addProfile, listProfiles, listProfilesVerified, loginState, profileDir, profileDriver, renameProfile, readProfileLive, setProfileLive, readProfileAgent, verifyProfile, type ProfileInfo } from "../src/profiles.js";
 import { EMPTY_CAPABILITIES, registerDriver } from "../src/agents/index.js";
 
 describe("profiles", () => {
@@ -219,5 +219,54 @@ describe("profile live flag (hookless agents)", () => {
     expect(readProfileLive(profilesDir, "cx")).toBe(false);
     expect(() => readProfileLive(profilesDir, "nope")).not.toThrow();
     expect(readProfileLive(profilesDir, "..")).toBe(false);
+  });
+});
+
+describe("verified logins", () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-verify-"));
+  });
+
+  function loggedInOnce(name: string, email: string): void {
+    const p = addProfile(root, name);
+    fs.writeFileSync(path.join(p.dir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: email } }));
+  }
+
+  it("a login the agent no longer accepts turns loggedIn false and keeps the account (= login expired)", async () => {
+    loggedInOnce("dead", "d@example.com");
+    loggedInOnce("alive", "a@example.com");
+    const list = await listProfilesVerified(root, async (p) => p.name === "alive");
+    const dead = list.find((x) => x.name === "dead")!;
+    expect(dead.loggedIn).toBe(false);
+    expect(dead.email).toBe("d@example.com");
+    expect(loginState(dead)).toBe("login expired");
+    expect(loginState(list.find((x) => x.name === "alive")!)).toBe("logged in");
+  });
+
+  it("never asks about a profile that never logged in", async () => {
+    addProfile(root, "fresh");
+    const asked: string[] = [];
+    const [p] = await listProfilesVerified(root, async (x) => { asked.push(x.name); return true; });
+    expect(asked).toEqual([]);
+    expect(loginState(p!)).toBe("not logged in");
+  });
+
+  it("keeps the cheap answer when the agent cannot tell or the check throws", async () => {
+    loggedInOnce("work", "w@example.com");
+    const [p] = listProfiles(root);
+    expect((await verifyProfile(p!, async () => null)).loggedIn).toBe(true);
+    expect((await verifyProfile(p!, async () => { throw new Error("spawn failed"); })).loggedIn).toBe(true);
+  });
+
+  it("does not ask agents without a verifier", async () => {
+    registerDriver({
+      id: "noverify", label: "NoVerify", bin: "noverify", adapter: "acp",
+      homeEnv: () => ({}), stripEnv: [], isLoggedIn: () => true,
+      login: () => ({ bin: "noverify", args: [] }), attach: () => ({ bin: "noverify", args: [] }),
+      capabilities: () => EMPTY_CAPABILITIES,
+    });
+    const p: ProfileInfo = { ...addProfile(root, "nv", "noverify"), loggedIn: true };
+    expect((await verifyProfile(p)).loggedIn).toBe(true);
   });
 });
