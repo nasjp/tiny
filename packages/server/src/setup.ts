@@ -13,7 +13,8 @@ export interface SetupDeps {
   nodeVersion: string;
   drivers: AgentDriver[];
   findOnPath: (bin: string) => string | null;
-  profiles: () => ProfileInfo[];
+  /** Logins confirmed by the agent (a login that once happened may be dead) */
+  profiles: () => ProfileInfo[] | Promise<ProfileInfo[]>;
   addProfile: (name: string, agent: string) => void;
   login: (name: string) => void;
   settings: () => TinySettings;
@@ -42,7 +43,7 @@ export async function runSetup(d: SetupDeps, opts: SetupOptions): Promise<void> 
   if (!bin) throw new Error(`${driver.label} CLI \`${driver.bin}\` not found on PATH. Install it and log in first, then re-run tiny setup`);
   d.log(`[1/5] ${driver.label}: ${bin}`);
 
-  let prof = d.profiles().find((p) => p.name === opts.profile);
+  let prof = (await d.profiles()).find((p) => p.name === opts.profile);
   if (prof && prof.agent !== driver.id) {
     throw new Error(`profile ${opts.profile} runs ${prof.agent}, not ${driver.id} (pick another name with --profile)`);
   }
@@ -52,7 +53,7 @@ export async function runSetup(d: SetupDeps, opts: SetupOptions): Promise<void> 
   } else {
     d.log(`[2/5] profile ${opts.profile} exists`);
   }
-  prof = d.profiles().find((p) => p.name === opts.profile);
+  prof = (await d.profiles()).find((p) => p.name === opts.profile);
   if (!prof?.loggedIn) {
     d.log(`[3/5] logging in to ${driver.label} (profile ${opts.profile}) — follow the prompts`);
     try {
@@ -61,7 +62,7 @@ export async function runSetup(d: SetupDeps, opts: SetupOptions): Promise<void> 
       const reason = err instanceof Error ? err.message : String(err);
       d.log(`      login failed: ${reason}; run \`tiny profiles login ${opts.profile}\` later`);
     }
-    prof = d.profiles().find((p) => p.name === opts.profile);
+    prof = (await d.profiles()).find((p) => p.name === opts.profile);
     if (!prof?.loggedIn) d.log(`      still not logged in; run \`tiny profiles login ${opts.profile}\` later`);
   } else {
     d.log(`[3/5] profile ${opts.profile} is logged in`);

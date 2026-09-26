@@ -8,7 +8,7 @@ import { agentEnv, getDriver, listDrivers } from "../src/agents/index.js";
 import { writeAcpChoices } from "../src/acp-choices.js";
 import { writeTinyMcpServer } from "../src/agents/codex.js";
 import { cursorLoggedIn } from "../src/agents/cursor.js";
-import { claudeLoggedIn, readClaudeOauthAccount } from "../src/agents/claude.js";
+import { claudeAuthStatus, claudeLoggedIn, readClaudeOauthAccount, type AuthStatusRunner } from "../src/agents/claude.js";
 
 describe("agent drivers", () => {
   it("claude driver: label, home env, stripped env", () => {
@@ -440,5 +440,50 @@ describe("ACP drivers mirror cached choices", () => {
     expect(caps.efforts).toEqual(["high", "max"]);
     // the rest of the catalog is untouched by the mirror
     expect(caps.permissionModes.map((m) => m.id)).toEqual(["ask", "auto"]);
+  });
+});
+
+// `claude auth status` is how tiny learns that a login which once happened has died (Claude Code
+// empties the token when a refresh fails but leaves oauthAccount in place)
+describe("claudeAuthStatus", () => {
+  function runner(out: string | null): { run: AuthStatusRunner; envs: NodeJS.ProcessEnv[] } {
+    const envs: NodeJS.ProcessEnv[] = [];
+    return { envs, run: async (env) => { envs.push(env); return out; } };
+  }
+
+  it("reads loggedIn from the JSON Claude Code prints", async () => {
+    expect(await claudeAuthStatus("/srv/p", { run: runner('{"loggedIn": true, "email": "a@b.c"}').run })).toBe(true);
+    expect(await claudeAuthStatus("/srv/p", { run: runner('{"loggedIn": false, "authMethod": "none"}').run })).toBe(false);
+  });
+
+  it("answers null when it cannot tell, so callers keep the cheap answer", async () => {
+    expect(await claudeAuthStatus("/srv/p", { run: runner(null).run })).toBeNull();
+    expect(await claudeAuthStatus("/srv/p", { run: runner("not json").run })).toBeNull();
+    expect(await claudeAuthStatus("/srv/p", { run: runner('{"loggedIn": "yes"}').run })).toBeNull();
+    expect(await claudeAuthStatus("/srv/p", { run: async () => { throw new Error("boom"); } })).toBeNull();
+  });
+
+  it("asks with the env a session gets: no API key, the profile's config dir", async () => {
+    const r = runner('{"loggedIn": true}');
+    await claudeAuthStatus("/srv/profiles/work", { run: r.run, env: { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x", CLAUDE_CONFIG_DIR: "/srv/stale" } });
+    expect(r.envs[0]).toStrictEqual({ PATH: "/usr/bin", CLAUDE_CONFIG_DIR: "/srv/profiles/work" });
+  });
+
+  it("drops CLAUDE_CONFIG_DIR for the default dir, like a session does", async () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tiny-home-")));
+    const prev = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const r = runner('{"loggedIn": true}');
+      await claudeAuthStatus(path.join(home, ".claude"), { run: r.run, env: { PATH: "/usr/bin", CLAUDE_CONFIG_DIR: "/srv/stale" } });
+      expect(Object.hasOwn(r.envs[0]!, "CLAUDE_CONFIG_DIR")).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.HOME;
+      else process.env.HOME = prev;
+    }
+  });
+
+  it("is the claude driver's verifyLogin", () => {
+    expect(getDriver("claude").verifyLogin).toBeTypeOf("function");
   });
 });

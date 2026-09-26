@@ -69,6 +69,11 @@ export interface AgentDriver {
   /** Env vars that MUST be stripped from child processes (leaving them causes pay-per-use API billing instead of the subscription, etc.) */
   stripEnv: string[];
   isLoggedIn(profileDir: string): boolean;
+  /**
+   * Asks the agent itself whether the login still works (may spawn its CLI). isLoggedIn is cheap
+   * but can only say a login once happened. null = could not tell; callers keep isLoggedIn's answer
+   */
+  verifyLogin?(profileDir: string): Promise<boolean | null>;
   /** methodId used for ACP `authenticate`. Falls back to `initialize.authMethods[0].id` when absent */
   authMethodId?: string;
   login(): AgentCommand;

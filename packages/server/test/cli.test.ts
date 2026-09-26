@@ -182,6 +182,12 @@ describe("formatProfileRow", () => {
     expect(row).toContain("y@example.com");
   });
 
+  it("says the login expired when the account is on record but the agent refuses it", () => {
+    const row = formatProfileRow({ ...base, name: "profile-2", loggedIn: false, email: "y@example.com" });
+    expect(row).toContain("login expired");
+    expect(row).toContain("y@example.com");
+  });
+
   it("shows a hyphen in the email column when not logged in", () => {
     const row = formatProfileRow({ ...base, name: "profile-1", loggedIn: false, email: null });
     expect(row).toContain("not logged in");

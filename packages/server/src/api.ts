@@ -6,7 +6,7 @@ import { z, ZodError } from "zod";
 import type { AuthService } from "./auth.js";
 import type { FileOutbox } from "./outbox.js";
 import { listDrivers } from "./agents/index.js";
-import { listProfiles } from "./profiles.js";
+import { listProfilesVerified, type ProfileInfo } from "./profiles.js";
 import type { PushClient } from "./push-client.js";
 import { ConflictError, NotFoundError, SessionManager, ValidationError } from "./session-manager.js";
 import { TINY_VERSION } from "./version.js";
@@ -26,6 +26,8 @@ export interface ApiDeps {
   usage: UsageService;
   /** Whether the agent's own CLI still holds a session. null = cannot tell */
   isCliLive: (s: SessionRecord) => boolean | null;
+  /** Profiles for the phone, logins confirmed by each agent. Defaults to listProfilesVerified */
+  listProfiles?: () => Promise<ProfileInfo[]>;
 }
 
 // The set of valid permissionMode / effort values is per-agent (driver capabilities),
@@ -184,7 +186,8 @@ export function createApp(deps: ApiDeps): Hono<AppEnv> {
   app.post("/v1/sessions/discard-empty", cliEnded);
   app.post("/v1/sessions/cli-ended", cliEnded);
 
-  app.get("/v1/profiles", (c) => c.json({ profiles: listProfiles(deps.profilesDir) }));
+  const profilesForPhone = deps.listProfiles ?? (() => listProfilesVerified(deps.profilesDir));
+  app.get("/v1/profiles", async (c) => c.json({ profiles: await profilesForPhone() }));
 
   // Registered agents (driver definitions). installed = whether the executable is on PATH
   app.get("/v1/agents", (c) =>

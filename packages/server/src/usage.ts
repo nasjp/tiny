@@ -67,7 +67,7 @@ export class UsageError extends Error {
 
 /** Login expired / invalidated / never happened, as reported by an agent that has no error codes for it */
 const SIGNED_OUT_RE =
-  /\b401\b|unauthorized|token[_ ]?(?:invalidated|expired)|invalid_grant|sign(?:ing)? in again|not logged in|login required|please log ?in/i;
+  /\b401\b|unauthorized|token[_ ]?(?:invalidated|expired)|invalid_grant|sign(?:ing)? in again|not logged in|login required|please log ?in|failed to authenticate|oauth session expired/i;
 
 /**
  * Turn whatever an agent threw into something the phone can show in two lines. The upstream text
@@ -329,7 +329,7 @@ export interface UsageServiceOptions {
   resolveDir?: (name: string) => string;
   /** Profile name → agent id. Default reads tiny-profile.json */
   resolveAgent?: (name: string) => string;
-  isLoggedIn?: (dir: string) => boolean;
+  isLoggedIn?: (dir: string) => boolean | Promise<boolean>;
 }
 
 export class UsageService {
@@ -340,7 +340,7 @@ export class UsageService {
   private ttlMs: number;
   private resolveDir: (name: string) => string;
   private resolveAgent: (name: string) => string;
-  private isLoggedIn: (dir: string, agent: string) => boolean;
+  private isLoggedIn: (dir: string, agent: string) => boolean | Promise<boolean>;
 
   constructor(profilesDir: string, opts: UsageServiceOptions = {}) {
     this.fetchers = { claude: createSdkUsageFetcher(), codex: createCodexUsageFetcher(), ...(opts.fetchers ?? {}) };
@@ -348,8 +348,13 @@ export class UsageService {
     this.ttlMs = opts.ttlMs ?? 60_000;
     this.resolveDir = opts.resolveDir ?? ((name) => profileDir(profilesDir, name));
     this.resolveAgent = opts.resolveAgent ?? ((name) => readProfileAgent(this.resolveDir(name)));
-    // Login detection is per agent (claude = .credentials.json / codex = auth.json ...)
-    this.isLoggedIn = opts.isLoggedIn ?? ((dir, agent) => findDriver(agent)?.isLoggedIn(dir) ?? false);
+    // Login detection is per agent (claude = .credentials.json / codex = auth.json ...), then
+    // confirmed by the agent itself where it can tell (a login that once happened may be dead)
+    this.isLoggedIn = opts.isLoggedIn ?? (async (dir, agent) => {
+      const driver = findDriver(agent);
+      if (!driver?.isLoggedIn(dir)) return false;
+      return (await driver.verifyLogin?.(dir).catch(() => null)) !== false;
+    });
   }
 
   async get(profileName: string): Promise<ProfileUsage> {
@@ -363,11 +368,13 @@ export class UsageService {
     const fetcher = this.fetchers[agent];
     const label = findDriver(agent)?.label ?? agent;
     if (!fetcher) throw new UsageError("unsupported", `Usage is not available for ${label}`);
-    if (!this.isLoggedIn(dir, agent)) {
-      throw new UsageError("signed_out", `${label} is signed out on your Mac`, `tiny profiles login ${profileName}`);
-    }
 
+    // The login check is inside the task: it may ask the agent (async), and concurrent requests
+    // must still share one lookup
     const task = (async () => {
+      if (!(await this.isLoggedIn(dir, agent))) {
+        throw new UsageError("signed_out", `${label} is signed out on your Mac`, `tiny profiles login ${profileName}`);
+      }
       const raw = await fetcher(dir).catch((err: unknown) => {
         throw classifyUsageError(err, agent, profileName);
       });

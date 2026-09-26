@@ -112,6 +112,15 @@ describe("collectDoctor", () => {
     expect(byName(out, "agent Claude").hint).toContain("tiny profiles login work");
   });
 
+  it("warns about an expired login even while another profile still works", async () => {
+    const r = await collectDoctor(deps({
+      profiles: [profile("local", "claude", true), { ...profile("profile-1", "claude", false), email: "a@example.com" }],
+    }));
+    expect(byName(r, "agent Claude").status).toBe("warn");
+    expect(byName(r, "agent Claude").detail).toContain("profile-1 (login expired)");
+    expect(byName(r, "agent Claude").hint).toBe("tiny profiles login profile-1");
+  });
+
   it("agents missing from the registry do not appear (droid / gemini)", async () => {
     const r = await collectDoctor(deps());
     expect(r.checks.map((c) => c.name)).not.toContain("agent Droid");

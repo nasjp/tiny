@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { openDb } from "../src/db.js";
 import { createStores, type Stores } from "../src/stores.js";
-import { addProfile } from "../src/profiles.js";
+import { addProfile, listProfilesVerified } from "../src/profiles.js";
 import { PermissionBroker } from "../src/permission-broker.js";
 import { FileOutbox } from "../src/outbox.js";
 import { SessionManager } from "../src/session-manager.js";
@@ -247,6 +247,18 @@ describe("REST API", () => {
 
   // The phone renders `problem` (not the wording), shows `hint` as the fix, and keeps `detail`
   // behind a disclosure — a 401 body used to land on screen as a wall of JSON
+  it("GET /v1/profiles reports a login the agent refuses as logged out (the phone's \"(not logged in)\")", async () => {
+    fs.writeFileSync(path.join(profilesDir, "work", ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "w@example.com" } }));
+    const one = createApp({
+      manager, auth, outbox, profilesDir, stores,
+      serverUrl: () => "http://mac:7777", push, usage,
+      isCliLive: () => cliLive,
+      listProfiles: () => listProfilesVerified(profilesDir, async () => false),
+    });
+    const { profiles } = await (await one.request("/v1/profiles", { headers: H() })).json();
+    expect(profiles[0]).toMatchObject({ name: "work", loggedIn: false, email: "w@example.com" });
+  });
+
   it("GET /v1/profiles/:name/usage answers a failed lookup in one line plus the raw detail", async () => {
     const raw = '401 Unauthorized; body={"error":{"code":"token_invalidated"}}';
     const failing = new UsageService(profilesDir, {
