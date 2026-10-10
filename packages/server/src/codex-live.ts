@@ -158,6 +158,15 @@ function firstUserText(records: RolloutRecord[]): string | null {
  * both sit at the top). A session with no user message yet has title null — not worth adopting;
  * sub-agent threads are left out altogether.
  */
+/** A rollout's mtime: codex appends to it on every turn, so it is the session's last activity */
+function mtimeIso(file: string): string | null {
+  try {
+    return fs.statSync(file).mtime.toISOString();
+  } catch {
+    return null;
+  }
+}
+
 export function listCodexSessions(
   codexHome: string,
   opts: { days?: number; now?: Date; headBytes?: number } = {},
@@ -177,7 +186,8 @@ export function listCodexSessions(
     for (const name of names) {
       const m = name.match(FILE_RE);
       if (!m) continue;
-      const head = readHead(path.join(dir, name), opts.headBytes ?? HEAD_BYTES);
+      const file = path.join(dir, name);
+      const head = readHead(file, opts.headBytes ?? HEAD_BYTES);
       if (head === null) continue;
       const { records } = parseLines(head);
       const meta = records.find((r) => r.type === "session_meta")?.payload;
@@ -188,6 +198,7 @@ export function listCodexSessions(
         agentSessionId: m[1]!,
         cwd: meta.cwd,
         startedAt: typeof meta.timestamp === "string" ? meta.timestamp : null,
+        lastActiveAt: mtimeIso(file),
         title: text === null ? null : titleOf(text),
       });
     }

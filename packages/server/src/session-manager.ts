@@ -368,6 +368,9 @@ export class SessionManager extends EventEmitter {
    */
   private static readonly BACKFILL_TURNS = 5;
 
+  /** How recently a session found by the storage scan must have started to be announced */
+  private static readonly SCAN_ANNOUNCE_WINDOW_MS = 10 * 60_000;
+
   /** A phone can send faster than turns finish; a queue nobody can see the end of is not a feature */
   static readonly MAX_QUEUED = 10;
 
@@ -383,7 +386,7 @@ export class SessionManager extends EventEmitter {
     model?: string;
     effort?: string;
     permissionMode?: PermissionModeValue;
-  }): { session: SessionRecord; adopted: boolean } {
+  }, opts: { announce?: boolean } = {}): { session: SessionRecord; adopted: boolean } {
     const { driver, caps } = this.resolveProfile(input);
     const existing = this.deps.stores.sessions.byAgentSessionId(input.agentSessionId);
     if (existing) {
@@ -412,9 +415,9 @@ export class SessionManager extends EventEmitter {
     };
     this.deps.stores.sessions.create(rec);
     this.importOrSeed(rec.id);
-    // Always from the Mac side (a hook or `tiny handoff`), and only the first time: the hook fires
-    // again on resume / fork / clear, which is not a new session
-    this.announce(rec);
+    // Always from the Mac side (a hook, `tiny handoff` or the storage scan), and only the first
+    // time: the hook fires again on resume / fork / clear, which is not a new session
+    if (opts.announce !== false) this.announce(rec);
     return { session: this.getSession(rec.id), adopted: true };
   }
 
@@ -714,10 +717,20 @@ export class SessionManager extends EventEmitter {
         if (this.deps.stores.sessions.byAgentSessionId(es.agentSessionId)) continue;
         if (!fs.existsSync(es.cwd)) continue; // a session whose cwd is gone cannot run turns anyway
         try {
-          const { session } = this.adoptSession({ profile: p.name, cwd: es.cwd, agentSessionId: es.agentSessionId });
+          // Only a session the person just started is news. The first look at a long-used agent finds
+          // its whole backlog, and each announcement is a push to the phone
+          const started = es.startedAt ? Date.parse(es.startedAt) : NaN;
+          const fresh = Date.now() - started < SessionManager.SCAN_ANNOUNCE_WINDOW_MS;
+          const { session } = this.adoptSession(
+            { profile: p.name, cwd: es.cwd, agentSessionId: es.agentSessionId },
+            { announce: fresh },
+          );
           // The storage knows the first thing the person said. The import may have opened its
           // backfill window far below that (a 47MB rollout) and titled the session by a later turn
           if (session.title !== es.title) this.deps.stores.sessions.patch(session.id, { title: es.title });
+          // File it where it belongs on the list: at its last activity, not at the moment of the scan
+          const lastActive = es.lastActiveAt ?? es.startedAt;
+          if (lastActive) this.deps.stores.sessions.setTimes(session.id, es.startedAt ?? lastActive, lastActive);
           adopted++;
         } catch (err) {
           console.error(`[tinyd] could not adopt ${p.agent} session ${es.agentSessionId}:`, err);

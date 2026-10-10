@@ -52,17 +52,19 @@ export function buildAttachCommand(session: SessionRecord, profilesDir: string):
 
 /** Agents whose profile directory IS the agent's home, so a profile may point at a directory tiny does not own */
 const EXTERNAL_DIR_AGENTS = new Set(["claude", "codex"]);
+/** Agents whose home is an XDG tree, so --config-dir names the XDG root (the home dir) instead */
+const XDG_ROOT_AGENTS = new Set(["opencode"]);
 
 /**
  * `tiny profiles add`. With --config-dir the profile wraps an existing agent home (claude:
- * CLAUDE_CONFIG_DIR, codex: CODEX_HOME — e.g. ~/.codex, so `tiny live on --profile <name>` scans
- * the codex the person runs in the terminal). Agents whose profile layout is not the directory
- * itself (opencode's XDG tree under the profile) are refused rather than silently misread
+ * CLAUDE_CONFIG_DIR, codex: CODEX_HOME — e.g. ~/.codex; opencode: the XDG root, i.e. ~ for the
+ * opencode run in the terminal), so `tiny live on --profile <name>` scans the sessions the person
+ * starts there. Other agents are refused rather than silently misread
  */
 export function runProfileAdd(profilesDir: string, name: string, opts: { agent: string; configDir?: string }): ProfileInfo {
   if (opts.configDir === undefined) return addProfile(profilesDir, name, opts.agent);
-  if (!EXTERNAL_DIR_AGENTS.has(opts.agent)) {
-    throw new Error(`--config-dir is only supported for claude and codex profiles (${opts.agent} keeps its own layout under the profile)`);
+  if (!EXTERNAL_DIR_AGENTS.has(opts.agent) && !XDG_ROOT_AGENTS.has(opts.agent)) {
+    throw new Error(`--config-dir is only supported for claude, codex and opencode profiles (${opts.agent} keeps its own layout under the profile)`);
   }
   const dir = path.resolve(opts.configDir);
   let isDir = false;
@@ -72,6 +74,7 @@ export function runProfileAdd(profilesDir: string, name: string, opts: { agent: 
     // reported below
   }
   if (!isDir) throw new Error(`config dir not found: ${dir}`);
+  if (XDG_ROOT_AGENTS.has(opts.agent)) return addProfile(profilesDir, name, opts.agent, undefined, dir);
   return addProfile(profilesDir, name, opts.agent, dir);
 }
 
@@ -693,7 +696,7 @@ profiles
   .option("--agent <id>", "agent to run in this profile (see `tiny agents`)", "claude")
   .option(
     "--config-dir <dir>",
-    "wrap an existing agent home instead of creating one (claude: CLAUDE_CONFIG_DIR, codex: CODEX_HOME — e.g. ~/.codex to watch the codex you run in the terminal)",
+    "wrap an existing agent home instead of creating one (claude: CLAUDE_CONFIG_DIR, codex: CODEX_HOME — e.g. ~/.codex to watch the codex you run in the terminal; opencode: the XDG root — ~ for the opencode you run in the terminal)",
   )
   .action(async (name: string, opts: { agent: string; configDir?: string }) => {
     const p = tinyPaths();
@@ -706,7 +709,7 @@ profiles
     const login = prof.loggedIn
       ? "already logged in there"
       : `${loginState(prof) === "login expired" ? "its login there has expired" : "not logged in there yet"} — run \`tiny profiles login ${name}\``;
-    const scan = prof.agent === "codex" ? `\nTo see sessions you start in the terminal, turn on the scan: \`tiny live on --profile ${name}\`` : "";
+    const scan = prof.agent === "codex" || prof.agent === "opencode" ? `\nTo see sessions you start in the terminal, turn on the scan: \`tiny live on --profile ${name}\`` : "";
     console.log(`Added: ${name} → ${prof.dir} (${prof.label}, ${login})${scan}`);
   });
 profiles.command("rename <old> <new>").action((from: string, to: string) => {
