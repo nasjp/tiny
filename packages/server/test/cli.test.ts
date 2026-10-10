@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { EMPTY_CAPABILITIES } from "../src/agents/index.js";
+import { EMPTY_CAPABILITIES, getDriver } from "../src/agents/index.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -465,11 +465,26 @@ describe("runProfileAdd", () => {
     expect(fs.existsSync(path.join(root, "cx-missing"))).toBe(false);
   });
 
-  it("refuses --config-dir for agents whose profile layout is not the directory itself", () => {
+  it("opencode --config-dir wraps the XDG root of the terminal's opencode and keeps the profile dir tiny's own", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-padd-"));
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-oc-"));
-    expect(() => runProfileAdd(root, "oc-local", { agent: "opencode", configDir: dir })).toThrow(/--config-dir/);
-    expect(fs.existsSync(path.join(root, "oc-local"))).toBe(false);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-home-"));
+    fs.mkdirSync(path.join(home, ".local", "share", "opencode"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".local", "share", "opencode", "auth.json"), JSON.stringify({ opencode: { type: "api", key: "x" } }));
+    const p = runProfileAdd(root, "local-opencode", { agent: "opencode", configDir: home });
+    // tiny writes its caches (acp-choices.json) into the profile dir, so that never becomes the person's home
+    expect(p.dir).toBe(path.join(root, "local-opencode"));
+    expect(p.loggedIn).toBe(true);
+    expect(getDriver("opencode").homeEnv(p.dir).XDG_DATA_HOME).toBe(path.join(home, ".local", "share"));
+    // nothing scaffolded: neither tiny's own tree nor anything in the wrapped home
+    expect(fs.existsSync(path.join(p.dir, "xdg"))).toBe(false);
+    expect(fs.existsSync(path.join(home, ".config"))).toBe(false);
+  });
+
+  it("refuses --config-dir for agents that cannot wrap an existing home", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-padd-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cur-"));
+    expect(() => runProfileAdd(root, "cur-local", { agent: "cursor", configDir: dir })).toThrow(/--config-dir/);
+    expect(fs.existsSync(path.join(root, "cur-local"))).toBe(false);
   });
 
   it("without --config-dir behaves like addProfile", () => {

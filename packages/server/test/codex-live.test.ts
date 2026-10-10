@@ -36,12 +36,15 @@ function writeRollout(root: string, records: unknown[], id = TID, day = "2026/09
 describe("codex-live", () => {
   it("lists recent sessions with cwd and the first user message as title, skipping empty ones", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cx-"));
-    writeRollout(root, [L.meta, L.taskStart, L.devNoise, L.user]);
+    const file = writeRollout(root, [L.meta, L.taskStart, L.devNoise, L.user]);
+    const touched = new Date("2026-08-30T01:02:03.000Z");
+    fs.utimesSync(file, touched, touched);
     writeRollout(root, [L.meta], "01a04e08-f742-7aa2-b039-b3a952f6ef00", "2026/08/31");
     const sessions = listCodexSessions(root, { now: NOW });
     expect(sessions).toHaveLength(2);
     const full = sessions.find((s) => s.agentSessionId === TID)!;
-    expect(full).toMatchObject({ cwd: "/Users/x/repo", title: "fix the failing test", startedAt: "2026-08-29T15:00:05.582Z" });
+    // lastActiveAt = the rollout's mtime (codex appends to it on every turn)
+    expect(full).toMatchObject({ cwd: "/Users/x/repo", title: "fix the failing test", startedAt: "2026-08-29T15:00:05.582Z", lastActiveAt: touched.toISOString() });
     // yesterday's empty session is listed but unadoptable (title null)
     expect(sessions.find((s) => s.agentSessionId.endsWith("00"))!.title).toBeNull();
     // outside the window: nothing

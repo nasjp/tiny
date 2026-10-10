@@ -8,6 +8,7 @@ import { agentEnv, getDriver, listDrivers } from "../src/agents/index.js";
 import { writeAcpChoices } from "../src/acp-choices.js";
 import { writeTinyMcpServer } from "../src/agents/codex.js";
 import { cursorLoggedIn } from "../src/agents/cursor.js";
+import { opencodeAuthPath } from "../src/agents/opencode.js";
 import { claudeAuthStatus, claudeLoggedIn, readClaudeOauthAccount, type AuthStatusRunner } from "../src/agents/claude.js";
 
 describe("agent drivers", () => {
@@ -91,6 +92,26 @@ describe("agent drivers", () => {
       expect(d.isLoggedIn(dir)).toBe(false);
       fs.writeFileSync(path.join(authDir, "auth.json"), JSON.stringify({ opencode: { type: "api", key: "x" } }));
       expect(d.isLoggedIn(dir)).toBe(true);
+    });
+
+    it("a profile wrapping the terminal's opencode (xdgRoot) uses the XDG default layout under that root and asks first", () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-oc-"));
+      fs.writeFileSync(path.join(dir, "tiny-profile.json"), JSON.stringify({ agent: "opencode", xdgRoot: "/Users/u" }));
+      const d = getDriver("opencode");
+      const env = d.homeEnv(dir);
+      expect(env).toMatchObject({
+        XDG_DATA_HOME: "/Users/u/.local/share",
+        XDG_CONFIG_HOME: "/Users/u/.config",
+        XDG_CACHE_HOME: "/Users/u/.cache",
+        XDG_STATE_HOME: "/Users/u/.local/state",
+      });
+      // The person's own opencode.json is never edited; tiny's launches carry "ask" inline instead
+      expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT!)).toEqual({ permission: { bash: "ask", edit: "ask", webfetch: "ask" } });
+      expect(opencodeAuthPath(dir)).toBe("/Users/u/.local/share/opencode/auth.json");
+      // tiny's own profile keeps its tree and its config file (no inline override)
+      fs.writeFileSync(path.join(dir, "tiny-profile.json"), JSON.stringify({ agent: "opencode" }));
+      expect(d.homeEnv(dir).XDG_DATA_HOME).toBe(path.join(dir, "xdg", "data"));
+      expect(d.homeEnv(dir).OPENCODE_CONFIG_CONTENT).toBeUndefined();
     });
 
     it("prepareProfile writes an opencode.json with permission=ask and leaves an existing one alone", () => {

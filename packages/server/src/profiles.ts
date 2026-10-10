@@ -176,17 +176,21 @@ export function listProfiles(profilesDir: string): ProfileInfo[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function addProfile(profilesDir: string, name: string, agent = "claude", configDir?: string): ProfileInfo {
+/**
+ * `configDir`: the profile IS an existing agent home (claude / codex). `xdgRoot`: the profile keeps
+ * its own dir but its agent's XDG tree points at an existing one (opencode, see opencodeXdgRoot)
+ */
+export function addProfile(profilesDir: string, name: string, agent = "claude", configDir?: string, xdgRoot?: string): ProfileInfo {
   if (!NAME_RE.test(name)) throw new Error(`invalid profile name: ${name}`);
   const driver = getDriver(agent); // throws if unregistered
   const metaDir = path.join(profilesDir, name);
   fs.mkdirSync(metaDir, { recursive: true });
   fs.writeFileSync(
     path.join(metaDir, PROFILE_META),
-    JSON.stringify({ agent, ...(configDir ? { configDir } : {}) }, null, 2) + "\n",
+    JSON.stringify({ agent, ...(configDir ? { configDir } : {}), ...(xdgRoot ? { xdgRoot } : {}) }, null, 2) + "\n",
   );
-  // Never scaffold into someone else's CLAUDE_CONFIG_DIR
-  if (!configDir) driver.prepareProfile?.(metaDir);
+  // Never scaffold into someone else's home, nor a tree nobody will use
+  if (!configDir && !xdgRoot) driver.prepareProfile?.(metaDir);
   return info(profilesDir, name);
 }
 

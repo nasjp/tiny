@@ -53,8 +53,9 @@ pnpm tiny handoff [--auto] [--ended] [--profile <name>] [--session <id>] [--conf
 #     Asking the agent in prose misfires: `handoff` collides with a skill name and the skill runs instead.
 pnpm tiny live [on|off] [--profile <name> | --config-dir <dir>]  # auto-handoff of new sessions (default off; claude = hooks in the targeted config dir, codex/opencode = `--profile <name>` turns on the tinyd storage scan)
 pnpm tiny profiles ls | add <name> [--agent <id>] [--config-dir <dir>] | rename <old> <new> | login <name>
-#   ^ --config-dir wraps an existing agent home (claude: CLAUDE_CONFIG_DIR / codex: CODEX_HOME, e.g. ~/.codex);
-#     with `tiny live on --profile <name>` that is how a codex started in a terminal reaches the phone
+#   ^ --config-dir wraps an existing agent home (claude: CLAUDE_CONFIG_DIR / codex: CODEX_HOME, e.g. ~/.codex /
+#     opencode: the XDG root, i.e. ~ — kept as tiny-profile.json `xdgRoot`, the profile dir stays tiny's);
+#     with `tiny live on --profile <name>` that is how a codex / opencode started in a terminal reaches the phone
 pnpm tiny pair                        # show the pairing QR
 pnpm tiny devices                     # list paired devices
 pnpm tiny config                      # server URL embedded in the QR (mandatory over Tailscale)
@@ -117,7 +118,7 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
 - **Any code that spawns child processes must strip `ANTHROPIC_API_KEY` from the env**
   (leaving it set bills the API pay-as-you-go instead of the subscription; every
   existing spawn path already strips it)
-- Read test counts, not just pass/fail (currently server 712 / relay 37 / iOS unit 205
+- Read test counts, not just pass/fail (currently server 718 / relay 37 / iOS unit 205
   + 5 demo-UI + 3 live E2E [need a real tinyd — see HANDOFF]). **`xcodebuild test |
   tail` exits 0 even on failure** — always check for the literal
   `** TEST FAILED **` / `** TEST SUCCEEDED **` strings

@@ -2213,6 +2213,47 @@ describe("SessionManager external sessions (Step 3 Wave 1)", () => {
     expect(m2.activity(m2.getSession(s2.id))).toBeNull();
   });
 
+  it("announces only sessions just started in the terminal, not the backlog a scan finds on first look", () => {
+    // Turning the scan on for a long-used terminal agent adopts dozens of old sessions at once;
+    // each announcement is a push to the phone
+    const { manager, home } = makeManager(okAdapter, { deps: { liveScanEnabled: () => true } });
+    const announced: string[] = [];
+    manager.on("session_added", (s: { agentSessionId: string | null }) => announced.push(s.agentSessionId!));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const profilesDir = path.join(home, "profiles");
+    const OLD = "01a04e08-f742-7aa2-b039-b3a952f6ef01";
+    const NEW = "01a04e08-f742-7aa2-b039-b3a952f6ef02";
+    writeCodexRollout(profilesDir, OLD, [
+      { type: "session_meta", payload: { id: OLD, cwd, timestamp: new Date(Date.now() - 3 * 86_400_000).toISOString() } },
+      cxUser("an old one"),
+    ]);
+    writeCodexRollout(profilesDir, NEW, [
+      { type: "session_meta", payload: { id: NEW, cwd, timestamp: new Date(Date.now() - 30_000).toISOString() } },
+      cxUser("a new one"),
+    ]);
+    expect(manager.scanExternalSessions()).toBe(2);
+    expect(announced).toEqual([NEW]);
+  });
+
+  it("files a backlog session at its last activity in the storage, not at the moment of the scan", () => {
+    // Otherwise turning the scan on lifts dozens of old sessions above everything on the phone's list
+    const { manager, home } = makeManager(okAdapter, { deps: { liveScanEnabled: () => true } });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const OLD = "01a04e08-f742-7aa2-b039-b3a952f6ef03";
+    const startedAt = new Date(Date.now() - 3 * 86_400_000);
+    const lastActive = new Date(Date.now() - 2 * 86_400_000);
+    const file = writeCodexRollout(path.join(home, "profiles"), OLD, [
+      { type: "session_meta", payload: { id: OLD, cwd, timestamp: startedAt.toISOString() } },
+      cxTaskStart, cxUser("an old one"), cxAnswer, cxTaskEnd,
+    ]);
+    fs.utimesSync(file, lastActive, lastActive);
+    manager.scanExternalSessions();
+    const s = manager.listSessions().find((x) => x.agentSessionId === OLD)!;
+    expect(s.title).toBe("an old one");
+    expect(s.updatedAt).toBe(lastActive.toISOString());
+    expect(s.createdAt).toBe(startedAt.toISOString());
+  });
+
   it("a finished codex turn closes the activity and lets tiny run its own turn without replaying it", async () => {
     let launched = 0;
     let rollout = "";
@@ -2258,10 +2299,10 @@ describe("SessionManager external sessions (Step 3 Wave 1)", () => {
     const dataDir = path.join(profilesDir, "oc", "xdg", "data", "opencode");
     fs.mkdirSync(dataDir, { recursive: true });
     const db = new (require("better-sqlite3"))(path.join(dataDir, "opencode.db"));
-    db.exec(`CREATE TABLE session (id text PRIMARY KEY, directory text NOT NULL, title text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer);
+    db.exec(`CREATE TABLE session (id text PRIMARY KEY, directory text NOT NULL, title text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer, parent_id text);
              CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
              CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);`);
-    db.prepare("INSERT INTO session VALUES ('ses_1', ?, 'lint the repo', 1000, 2000, NULL)").run(cwd);
+    db.prepare("INSERT INTO session VALUES ('ses_1', ?, 'lint the repo', 1000, 2000, NULL, NULL)").run(cwd);
     db.prepare("INSERT INTO message VALUES ('m_u1','ses_1',1000,1000,?)").run(JSON.stringify({ role: "user", time: { created: 1000 } }));
     db.prepare("INSERT INTO part VALUES ('p1','m_u1','ses_1',1000,1000,?)").run(JSON.stringify({ type: "text", text: "lint please" }));
     db.prepare("INSERT INTO message VALUES ('m_a1','ses_1',1500,1500,?)").run(JSON.stringify({ role: "assistant", time: { created: 1500 } }));

@@ -92,6 +92,14 @@ export function createStores(db: Database.Database) {
       const r = db.prepare(`UPDATE sessions SET cli_closed_at = ? WHERE id = ?`).run(at, id);
       if (r.changes === 0) throw new Error(`session not found: ${id}`);
     },
+    /**
+     * Back-dates a session adopted from an agent's storage to when it really started and was last
+     * active there. Adoption itself is not conversation activity (same reasoning as setCliClosedAt)
+     */
+    setTimes(id: string, createdAt: string, updatedAt: string): void {
+      const r = db.prepare(`UPDATE sessions SET created_at = ?, updated_at = ? WHERE id = ?`).run(createdAt, updatedAt, id);
+      if (r.changes === 0) throw new Error(`session not found: ${id}`);
+    },
     // For profile rename. Leaves updated_at alone (a rename is not session activity,
     // so the list order should not move)
     renameProfile(from: string, to: string): number {

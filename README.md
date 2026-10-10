@@ -82,7 +82,7 @@ tiny live on --profile <name>            #   ... for one tiny profile instead of
 
 tiny profiles ls                         # list profiles
 tiny profiles add <name> --agent <id>    # add one (then: tiny profiles login <name>)
-tiny profiles add <name> --agent codex --config-dir ~/.codex   # wrap the codex you already use in the terminal (claude / codex only)
+tiny profiles add <name> --agent codex --config-dir ~/.codex   # wrap the codex you already use in the terminal (claude / codex / opencode)
 tiny profiles rename <old> <new>
 
 tiny daemon install                      # run under launchd (use tiny serve to run in the foreground)
@@ -136,7 +136,23 @@ it waits its turn. Stop takes the message back as long as the terminal has not s
 it; once it has, the turn is the terminal's to stop (Esc). When no terminal holds the
 thread, turns you send run under your own `~/.codex` settings (the same trade-off as the
 `local` profile Claude Code handoffs use). Sub-agent threads codex spawns for itself are
-never listed. OpenCode cannot wrap an external directory yet.
+never listed.
+
+Plain `opencode` in a terminal keeps its sessions under your home's default XDG
+directories (`~/.local/share/opencode` and friends), so for OpenCode `--config-dir` names
+that root — your home directory:
+
+```bash
+tiny profiles add local-opencode --agent opencode --config-dir ~
+tiny live on --profile local-opencode
+```
+
+tiny keeps its own files in the profile under `~/.tiny/profiles` and never edits your
+`opencode.json`; its own launches pass "ask before running" inline, so **Ask first** on the
+phone still asks even when your terminal setup lets everything run. Sub-agent sessions are
+never listed, and switching the scan on files your existing sessions at their last activity
+without a notification for each — only a session you start from then on is announced.
+OpenCode has no live join yet: while a terminal is running a turn, the phone waits for it.
 
 That acts on the config directory your own shell uses (`$CLAUDE_CONFIG_DIR`, or `~/.claude`).
 Each tiny profile has its own, so name the profile to turn it on there:

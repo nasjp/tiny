@@ -11,7 +11,33 @@ import type { AgentDriver } from "./index.js";
 // Decision: OpenCode profiles assume API keys / third-party providers (no Claude subscription).
 // So API keys like ANTHROPIC_API_KEY are NOT stripped (using them is the premise).
 
+/**
+ * The XDG root a profile wraps (tiny-profile.json "xdgRoot"), or null for tiny's own tree.
+ * Set by `tiny profiles add <name> --agent opencode --config-dir ~`: the opencode the person runs
+ * in the terminal (XDG_* unset) keeps everything under $HOME's default XDG dirs, spread over four
+ * directories, so the profile cannot simply BE that home the way a claude / codex profile can.
+ * The profile dir stays tiny's (acp-choices.json etc. land there) and only the XDG tree points out
+ */
+export function opencodeXdgRoot(profileDir: string): string | null {
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(profileDir, "tiny-profile.json"), "utf8")) as { xdgRoot?: unknown };
+    return typeof meta.xdgRoot === "string" && meta.xdgRoot !== "" ? meta.xdgRoot : null;
+  } catch {
+    return null;
+  }
+}
+
 export function opencodeXdg(profileDir: string): { data: string; config: string; cache: string; state: string } {
+  const root = opencodeXdgRoot(profileDir);
+  if (root !== null) {
+    // The XDG Base Directory defaults, which is where a terminal opencode with no XDG_* set looks
+    return {
+      data: path.join(root, ".local", "share"),
+      config: path.join(root, ".config"),
+      cache: path.join(root, ".cache"),
+      state: path.join(root, ".local", "state"),
+    };
+  }
   const base = path.join(profileDir, "xdg");
   return { data: path.join(base, "data"), config: path.join(base, "config"), cache: path.join(base, "cache"), state: path.join(base, "state") };
 }
@@ -34,11 +60,13 @@ export function opencodeLoggedIn(profileDir: string): boolean {
   }
 }
 
+// Makes tiny's "Ask first" hold (by default things run with no permission request)
+const ASK_PERMISSIONS = { bash: "ask", edit: "ask", webfetch: "ask" };
+
 const DEFAULT_CONFIG = {
   $schema: "https://opencode.ai/config.json",
-  // Makes tiny's "Ask first" hold (by default things run with no permission request).
   // Don't write model: opencode picks a default from the logged-in providers. Add by hand if needed
-  permission: { bash: "ask", edit: "ask", webfetch: "ask" },
+  permission: ASK_PERMISSIONS,
 };
 
 export const opencodeDriver: AgentDriver = {
@@ -49,7 +77,12 @@ export const opencodeDriver: AgentDriver = {
   launch: { command: "opencode", args: ["acp"] },
   homeEnv: (profileDir) => {
     const x = opencodeXdg(profileDir);
-    return { XDG_DATA_HOME: x.data, XDG_CONFIG_HOME: x.config, XDG_CACHE_HOME: x.cache, XDG_STATE_HOME: x.state };
+    const env: Record<string, string> = { XDG_DATA_HOME: x.data, XDG_CONFIG_HOME: x.config, XDG_CACHE_HOME: x.cache, XDG_STATE_HOME: x.state };
+    // A wrapped terminal opencode has the person's own opencode.json, which tiny never edits (and
+    // which usually lets everything run unasked). Measured on 1.18.35: OPENCODE_CONFIG_CONTENT is
+    // merged over it, so tiny's own launches still ask first
+    if (opencodeXdgRoot(profileDir) !== null) env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ permission: ASK_PERMISSIONS });
+    return env;
   },
   stripEnv: [],
   isLoggedIn: opencodeLoggedIn,

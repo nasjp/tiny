@@ -58,23 +58,53 @@ function parseData(row: { data: string }): MessageData | null {
   }
 }
 
-/** Sessions that carry at least one user message (empty ones include tiny's own choice-fetch probes) */
+/**
+ * opencode's title before its small model names the session (measured 1.18.35: "New session - <ISO>",
+ * "Child session - <ISO>" for subagents). It stays forever when that model cannot answer — e.g. a
+ * local LM Studio model that is not running
+ */
+const PLACEHOLDER_TITLE = /^(New|Child) session - \d{4}-\d{2}-\d{2}T/;
+
+/** The session's title, or the first thing the person said while it still has the placeholder */
+function sessionTitle(db: Database.Database, sessionId: string, title: string | undefined): string | null {
+  if (title && !PLACEHOLDER_TITLE.test(title)) return title;
+  const parts = db
+    .prepare(
+      `SELECT p.data FROM message m JOIN part p ON p.message_id = m.id
+       WHERE m.session_id = ? AND m.data LIKE '%"role":"user"%'
+       ORDER BY m.time_created, m.id, p.id`,
+    )
+    .all(sessionId) as Array<{ data: string }>;
+  for (const p of parts) {
+    const part = parseData(p) as { type?: string; text?: string; synthetic?: boolean } | null;
+    if (part?.type !== "text" || typeof part.text !== "string" || part.synthetic === true) continue;
+    const text = oneLine(part.text);
+    if (text !== "") return text;
+  }
+  return null;
+}
+
+/**
+ * Sessions that carry at least one user message (empty ones include tiny's own choice-fetch probes).
+ * Subagent sessions (parent_id set) are part of their parent's turn, not something to open on the phone
+ */
 export function listOpencodeSessions(profileDir: string): ExternalSession[] {
   return (
     withDb(profileDir, (db) => {
       const rows = db
         .prepare(
-          `SELECT s.id, s.directory, s.title, s.time_created FROM session s
-           WHERE s.time_archived IS NULL
+          `SELECT s.id, s.directory, s.title, s.time_created, s.time_updated FROM session s
+           WHERE s.time_archived IS NULL AND s.parent_id IS NULL
              AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id AND m.data LIKE '%"role":"user"%')
            ORDER BY s.time_updated DESC LIMIT 100`,
         )
-        .all() as Array<{ id: string; directory: string; title: string; time_created: number }>;
+        .all() as Array<{ id: string; directory: string; title: string; time_created: number; time_updated: number }>;
       return rows.map((r) => ({
         agentSessionId: r.id,
         cwd: r.directory,
         startedAt: Number.isFinite(r.time_created) ? new Date(r.time_created).toISOString() : null,
-        title: r.title !== "" ? r.title : null,
+        lastActiveAt: Number.isFinite(r.time_updated) ? new Date(r.time_updated).toISOString() : null,
+        title: sessionTitle(db, r.id, r.title),
       }));
     }) ?? []
   );
@@ -172,7 +202,7 @@ export function readOpencodeSession(profileDir: string, agentSessionId: string, 
       };
       cursor = `t:${row.time_created}:${row.id}`;
     }
-    return { events, cursor, turn, title: titleRow?.title ? titleRow.title : null };
+    return { events, cursor, turn, title: sessionTitle(db, agentSessionId, titleRow?.title) };
   });
 }
 

@@ -18,13 +18,13 @@ function makeStorage(): { profileDir: string; db: Database.Database } {
   const db = new Database(path.join(dataDir, "opencode.db"));
   db.exec(`
     CREATE TABLE session (id text PRIMARY KEY, directory text NOT NULL, title text NOT NULL,
-      time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer);
+      time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer, parent_id text);
     CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL,
       time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
     CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL,
       time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
   `);
-  db.prepare("INSERT INTO session VALUES (?,?,?,?,?,NULL)").run(SID, "/Users/x/repo", "fix the tests", 1788192888365, 1788192890990);
+  db.prepare("INSERT INTO session VALUES (?,?,?,?,?,NULL,NULL)").run(SID, "/Users/x/repo", "fix the tests", 1788192888365, 1788192890990);
   return { profileDir, db };
 }
 
@@ -40,10 +40,32 @@ describe("opencode-live", () => {
     expect(listOpencodeSessions(profileDir)).toEqual([]); // no user message yet (choice-probe debris)
     addMessage(db, "msg_u1", 1000, { role: "user", time: { created: 1000 } }, [{ type: "text", text: "hello" }]);
     expect(listOpencodeSessions(profileDir)).toEqual([
-      { agentSessionId: SID, cwd: "/Users/x/repo", startedAt: "2026-08-31T16:14:48.365Z", title: "fix the tests" },
+      { agentSessionId: SID, cwd: "/Users/x/repo", startedAt: "2026-08-31T16:14:48.365Z", lastActiveAt: "2026-08-31T16:14:50.990Z", title: "fix the tests" },
     ]);
     db.prepare("UPDATE session SET time_archived = 1 WHERE id = ?").run(SID);
     expect(listOpencodeSessions(profileDir)).toEqual([]);
+  });
+
+  it("leaves out subagent sessions (parent_id set) — they belong to their parent's turn", () => {
+    const { profileDir, db } = makeStorage();
+    addMessage(db, "msg_u1", 1000, { role: "user", time: { created: 1000 } }, [{ type: "text", text: "hello" }]);
+    db.prepare("INSERT INTO session VALUES (?,?,?,?,?,NULL,?)").run("ses_child", "/Users/x/repo", "Explore the repo (@explore subagent)", 1788192889000, 1788192891000, SID);
+    db.prepare("INSERT INTO message VALUES (?,?,?,?,?)").run("msg_c1", "ses_child", 1100, 1100, JSON.stringify({ role: "user", time: { created: 1100 } }));
+    expect(listOpencodeSessions(profileDir).map((s) => s.agentSessionId)).toEqual([SID]);
+  });
+
+  it("replaces opencode's placeholder title with the first thing the person said", () => {
+    // Title generation runs on the small model; when that cannot answer (a local model that is
+    // not running) the placeholder stays forever
+    const { profileDir, db } = makeStorage();
+    db.prepare("UPDATE session SET title = ? WHERE id = ?").run("New session - 2026-10-10T07:49:04.494Z", SID);
+    addMessage(db, "msg_u1", 1000, { role: "user", time: { created: 1000 } }, [{ type: "text", text: "  why is CI red?\nsee the log" }]);
+    addMessage(db, "msg_u2", 2000, { role: "user", time: { created: 2000 } }, [{ type: "text", text: "later message" }]);
+    expect(listOpencodeSessions(profileDir)[0]!.title).toBe("why is CI red? see the log");
+    expect(readOpencodeSession(profileDir, SID, null)!.title).toBe("why is CI red? see the log");
+    // A session with only the placeholder and no text from the person has no title (= not adopted)
+    db.prepare("DELETE FROM part").run();
+    expect(listOpencodeSessions(profileDir)[0]!.title).toBeNull();
   });
 
   it("imports committed messages, holds at an unfinished assistant, and reports the turn", () => {

@@ -13,6 +13,8 @@ export interface ExternalSession {
   cwd: string;
   /** When the session started (ISO 8601), null when the storage does not say */
   startedAt: string | null;
+  /** The session's last activity in the storage (ISO 8601), null when the storage does not say */
+  lastActiveAt: string | null;
   /** Something the person actually said (or the agent's own title). null = nothing yet — do not adopt */
   title: string | null;
 }
