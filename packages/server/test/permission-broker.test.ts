@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PermissionBroker } from "../src/permission-broker.js";
+import { PermissionBroker, WITHDRAWN } from "../src/permission-broker.js";
 
 describe("PermissionBroker", () => {
   it("resolve settles the decision Promise", async () => {
@@ -37,5 +37,14 @@ describe("PermissionBroker", () => {
     const { decision } = b.request("s1", "Bash", {});
     await expect(decision).resolves.toEqual({ behavior: "deny", message: "timeout" });
     expect(b.listPending("s1")).toHaveLength(0);
+  });
+  it("withdraws a request settled elsewhere: off the list, its waiter released, a second withdraw is false", async () => {
+    const b = new PermissionBroker();
+    const { id, decision } = b.request("s1", "bash", { command: "ls" });
+    expect(b.withdraw(id)).toBe(true);
+    expect(b.listPending("s1")).toHaveLength(0);
+    await expect(decision).resolves.toEqual({ behavior: "deny", message: WITHDRAWN });
+    expect(b.withdraw(id)).toBe(false);
+    expect(b.resolve(id, { behavior: "allow" })).toBe(false);
   });
 });

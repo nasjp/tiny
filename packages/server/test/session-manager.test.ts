@@ -7,7 +7,10 @@ import { createStores } from "../src/stores.js";
 import { addProfile } from "../src/profiles.js";
 import { PermissionBroker } from "../src/permission-broker.js";
 import { FileOutbox } from "../src/outbox.js";
-import { ConflictError, NotFoundError, SessionManager, type CodexPeerBridge, type PeerBridge, type SessionManagerDeps } from "../src/session-manager.js";
+import {
+  ConflictError, NotFoundError, SessionManager, type CodexPeerBridge, type OpencodePeerBridge, type OpencodePrompt, type OpencodeSessionState,
+  type OpencodeTarget, type PeerBridge, type SessionManagerDeps,
+} from "../src/session-manager.js";
 import type { AgentAdapter, RunTurnParams, TurnImage } from "../src/adapter.js";
 import { PEER_STOP, type PeerFrame, type PeerStatus, type PeerTarget } from "../src/claude-peer.js";
 import type { LiveSessionEntry } from "../src/claude-live.js";
@@ -2618,5 +2621,234 @@ describe("SessionManager codex live turns (the CLI holds the thread)", () => {
     const { manager, s } = heldSession({ isCliLive: () => true, externalBusy: () => true });
     expect(manager.canJoin(manager.getSession(s.id))).toBe(false);
     expect(() => manager.startTurn(s.id, "hi")).toThrow(/open in the CLI/);
+  });
+});
+
+describe("SessionManager opencode live turns (the person's opencode serves the session)", () => {
+  /** opencode's storage for the "oc" profile, with one session the person started in a TUI */
+  function ocStorage(profilesDir: string, cwd: string) {
+    const dataDir = path.join(profilesDir, "oc", "xdg", "data", "opencode");
+    fs.mkdirSync(dataDir, { recursive: true });
+    const db = new (require("better-sqlite3"))(path.join(dataDir, "opencode.db"));
+    db.exec(`CREATE TABLE session (id text PRIMARY KEY, directory text NOT NULL, title text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, time_archived integer, parent_id text);
+             CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
+             CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);`);
+    db.prepare("INSERT INTO session VALUES ('ses_1', ?, 'research', 1000, 2000, NULL, NULL)").run(cwd);
+    let at = 1000;
+    let n = 0;
+    const user = (text: string, extra: Record<string, unknown> = {}) => {
+      const id = `m_${++n}`;
+      at += 10;
+      db.prepare("INSERT INTO message VALUES (?,'ses_1',?,?,?)").run(id, at, at, JSON.stringify({ role: "user", time: { created: at }, ...extra }));
+      db.prepare("INSERT INTO part VALUES (?,?,'ses_1',?,?,?)").run(`p_${id}`, id, at, at, JSON.stringify({ type: "text", text }));
+    };
+    const reply = (text: string, extra: Record<string, unknown> = {}) => {
+      const id = `m_${++n}`;
+      at += 10;
+      db.prepare("INSERT INTO message VALUES (?,'ses_1',?,?,?)").run(id, at, at, JSON.stringify({ role: "assistant", time: { created: at, completed: at + 5 }, ...extra }));
+      if (text !== "") db.prepare("INSERT INTO part VALUES (?,?,'ses_1',?,?,?)").run(`p_${id}`, id, at, at, JSON.stringify({ type: "text", text }));
+    };
+    return { db, user, reply };
+  }
+
+  function fakeOpencodePeer() {
+    const prompts: OpencodePrompt[] = [];
+    const aborts: string[] = [];
+    const replies: Array<{ sessionID: string; requestID: string; reply: string }> = [];
+    let state: OpencodeSessionState | null = { busy: false, idleAt: null, permissions: [], questions: [] };
+    let target: OpencodeTarget | null = { pid: 777 };
+    const bridge: OpencodePeerBridge = {
+      resolve: () => target,
+      state: () => state,
+      prompt: async (_s, _t, msg) => {
+        prompts.push(msg);
+      },
+      abort: async (s) => {
+        aborts.push(s.id);
+      },
+      reply: async (_s, _t, r) => {
+        replies.push(r);
+      },
+    };
+    return {
+      bridge, prompts, aborts, replies,
+      set: (next: Partial<OpencodeSessionState> | null) => {
+        state = next === null ? null : { ...(state ?? { busy: false, idleAt: null, permissions: [], questions: [] }), ...next };
+      },
+      gone: () => {
+        target = null;
+        state = null;
+      },
+    };
+  }
+
+  /** An adopted opencode session that a TUI with tiny's plugin serves */
+  function servedSession(deps: Partial<SessionManagerDeps> = {}) {
+    const oc = fakeOpencodePeer();
+    const { manager, stores, home } = makeManager(okAdapter, {
+      deps: { liveScanEnabled: () => true, liveTiming: FAST_LIVE, opencodePeer: oc.bridge, externalBusy: () => false, ...deps },
+    });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-cwd-"));
+    const storage = ocStorage(path.join(home, "profiles"), cwd);
+    storage.user("look into reviews", { agent: "plan", model: { providerID: "opencode-go", modelID: "space-bunny", variant: "xhigh" } });
+    storage.reply("here is what I found");
+    manager.scanExternalSessions();
+    const s = manager.listSessions()[0]!;
+    const seen: EventRecord[] = [];
+    manager.on("event", (e) => seen.push(e));
+    return { manager, stores, s, oc, storage, seen, types: () => seen.map((e) => e.type) };
+  }
+
+  it("hands the message to that process, on what the session last ran with, and completes when it is answered and idle", async () => {
+    const { manager, stores, s, oc, storage, seen, types } = servedSession();
+    expect(manager.canJoin(manager.getSession(s.id))).toBe(true);
+    expect(manager.startTurn(s.id, "from the phone")).toEqual({ queued: false });
+    await until(() => types().includes("turn_started"));
+    expect(oc.prompts).toEqual([{
+      text: "from the phone",
+      model: { providerID: "opencode-go", modelID: "space-bunny" }, variant: "xhigh", agent: "plan",
+    }]);
+    expect(manager.getSession(s.id).status).toBe("running");
+
+    // That process takes it (stored at once) and works on it
+    oc.set({ busy: true });
+    storage.user("from the phone", { agent: "plan" });
+    await new Promise((r) => setTimeout(r, FAST_LIVE.pollMs * 5));
+    expect(manager.getSession(s.id).status).toBe("running");
+    storage.reply("hi phone");
+    oc.set({ busy: false, idleAt: Date.now() });
+    await manager.waitForIdle(s.id);
+    expect(seen.at(-1)).toMatchObject({ type: "turn_completed", payload: { costUsd: null, resultText: "hi phone" } });
+    expect(types()).toEqual(["user_message", "turn_started", "assistant_text", "turn_completed"]);
+    // Our message came back through the storage but is not shown twice
+    const users = stores.events.listSince(s.id, 0).filter((e) => e.type === "user_message").map((e) => e.payload.text);
+    expect(users).toEqual(["look into reviews", "from the phone"]);
+    expect(manager.getSession(s.id).status).toBe("idle");
+    storage.db.close();
+  });
+
+  it("completes a message that leaves no echo (an image alone) once that process has been idle since it was sent", async () => {
+    const { manager, s, oc, seen, types } = servedSession();
+    manager.startTurn(s.id, "", [{ mediaType: "image/png", data: "AAAA" }]);
+    await until(() => types().includes("turn_started"));
+    expect(oc.prompts[0]).toMatchObject({ text: "", images: [{ mediaType: "image/png", data: "AAAA" }] });
+    oc.set({ busy: false, idleAt: Date.now() });
+    await manager.waitForIdle(s.id);
+    expect(seen.at(-1)).toMatchObject({ type: "turn_completed" });
+  });
+
+  it("uses the phone's own model and effort when it picked them", async () => {
+    const { manager, s, oc, types } = servedSession();
+    manager.updateSession(s.id, { model: "opencode/gpt-5.5", effort: null });
+    manager.startTurn(s.id, "x");
+    await until(() => types().includes("turn_started"));
+    expect(oc.prompts[0]).toEqual({ text: "x", model: { providerID: "opencode", modelID: "gpt-5.5" }, agent: "plan" });
+  });
+
+  it("puts that process's prompts on the phone, answers them from there, and takes back the ones settled at the terminal", async () => {
+    const { manager, s, oc, storage, seen, types } = servedSession();
+    manager.startTurn(s.id, "dig deeper");
+    await until(() => types().includes("turn_started"));
+    oc.set({ busy: true });
+    storage.user("dig deeper");
+    const ask = (id: string, sessionID: string) => ({
+      id, sessionID, root: "ses_1", permission: "bash", patterns: [`curl ${id}`], metadata: { command: `curl ${id}` },
+    });
+    oc.set({ permissions: [ask("per_1", "ses_child")] });
+    await until(() => types().includes("permission_requested"));
+    const req1 = seen.find((e) => e.type === "permission_requested")!;
+    expect(req1.payload).toMatchObject({ toolName: "bash", input: { command: "curl per_1" }, kind: "execute", summary: "(subagent) curl per_1" });
+    expect(manager.listPendingPermissions(s.id)).toHaveLength(1);
+    manager.resolvePermission(String(req1.payload.reqId), { behavior: "allow" });
+    await until(() => oc.replies.length === 1);
+    expect(oc.replies).toEqual([{ sessionID: "ses_child", requestID: "per_1", reply: "once" }]);
+
+    // Asked again by the next one, which the person answers at the terminal instead
+    oc.set({ permissions: [ask("per_2", "ses_1")] });
+    await until(() => seen.filter((e) => e.type === "permission_requested").length === 2);
+    oc.set({ permissions: [] });
+    await until(() => seen.filter((e) => e.type === "permission_resolved").length === 2);
+    expect(seen.filter((e) => e.type === "permission_resolved").map((e) => e.payload.behavior)).toEqual(["allow", "withdrawn"]);
+    expect(manager.listPendingPermissions(s.id)).toEqual([]);
+    expect(oc.replies).toHaveLength(1);
+
+    // A question only the terminal can answer: the phone is told where the turn is waiting, once
+    oc.set({ questions: [{ id: "que_1" }] });
+    await new Promise((r) => setTimeout(r, FAST_LIVE.pollMs * 5));
+    expect(seen.filter((e) => e.type === "cli_attention").map((e) => e.payload)).toEqual([{ reason: "question" }]);
+
+    storage.reply("dug");
+    oc.set({ busy: false, idleAt: Date.now(), questions: [] });
+    await manager.waitForIdle(s.id);
+    expect(types().at(-1)).toBe("turn_completed");
+    storage.db.close();
+  });
+
+  it("fails the turn in opencode's own words when the reply failed over there", async () => {
+    const { manager, s, oc, storage, seen, types } = servedSession();
+    manager.startTurn(s.id, "go");
+    await until(() => types().includes("turn_started"));
+    storage.user("go");
+    storage.reply("", { error: { name: "APIError", data: { message: "Cannot connect to API: 127.0.0.1:1234" } } });
+    oc.set({ busy: false, idleAt: Date.now() });
+    await manager.waitForIdle(s.id);
+    expect(seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "Cannot connect to API: 127.0.0.1:1234" } });
+    storage.db.close();
+  });
+
+  it("Stop aborts the turn in that process and ends it as interrupted once it is idle", async () => {
+    const { manager, s, oc, storage, seen, types } = servedSession();
+    manager.startTurn(s.id, "long job");
+    await until(() => types().includes("turn_started"));
+    oc.set({ busy: true });
+    storage.user("long job");
+    await manager.interrupt(s.id);
+    expect(oc.aborts).toEqual([s.id]);
+    await manager.interrupt(s.id); // a second tap while it stops does nothing more
+    expect(oc.aborts).toEqual([s.id]);
+    oc.set({ busy: false, idleAt: Date.now() });
+    await manager.waitForIdle(s.id);
+    expect(seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "interrupted" } });
+    storage.db.close();
+  });
+
+  it("fails when that process goes away, and when an idle one never takes the message", async () => {
+    const a = servedSession();
+    a.manager.startTurn(a.s.id, "hello?");
+    await until(() => a.types().includes("turn_started"));
+    a.oc.gone();
+    await a.manager.waitForIdle(a.s.id);
+    expect(a.seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "the CLI closed" } });
+
+    const b = servedSession();
+    b.manager.startTurn(b.s.id, "anyone?");
+    await b.manager.waitForIdle(b.s.id); // stays idle, never stores it
+    expect(b.seen.at(-1)).toMatchObject({ type: "turn_failed", payload: { error: "the opencode CLI did not take the message" } });
+    // Nothing is waiting to swallow a later identical message as an echo
+    b.storage.user("anyone?");
+    b.manager.syncTranscript(b.s.id);
+    expect(b.stores.events.listSince(b.s.id, 0).filter((e) => e.type === "user_message").map((e) => e.payload.text))
+      .toEqual(["look into reviews", "anyone?", "anyone?"]);
+  });
+
+  it("runs the turn itself, as before, when no process serves the session", async () => {
+    const { manager, s, oc, types } = servedSession();
+    oc.gone();
+    expect(manager.canJoin(manager.getSession(s.id))).toBe(false);
+    manager.startTurn(s.id, "nobody home");
+    await manager.waitForIdle(s.id);
+    expect(oc.prompts).toEqual([]);
+    expect(types()).toEqual(["user_message", "turn_started", "turn_completed"]); // okAdapter
+  });
+
+  it("shows a turn typed into that process as running, and Stop from the phone aborts it there", async () => {
+    let busy: boolean | null = false;
+    const { manager, s, oc } = servedSession({ externalBusy: () => busy });
+    expect(manager.activity(manager.getSession(s.id))).toBeNull();
+    busy = true;
+    oc.set({ busy: true });
+    expect(manager.activity(manager.getSession(s.id))).toEqual({ since: null, outputTokens: null });
+    await manager.interrupt(s.id);
+    expect(oc.aborts).toEqual([s.id]);
   });
 });

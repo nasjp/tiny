@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   alwaysHandoffTargets,
+  applyProfileLive,
   buildAttachCommand,
   ensureHandoffProfile,
   formatDeviceRow,
@@ -491,5 +492,33 @@ describe("runProfileAdd", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-padd-"));
     const p = runProfileAdd(root, "cx", { agent: "codex" });
     expect(p.dir).toBe(path.join(root, "cx"));
+  });
+});
+
+// `tiny live on --profile <opencode profile>`: besides the storage scan, tiny's plugin goes into that
+// opencode's config — the way phone messages reach (and show in) the person's own TUI
+describe("applyProfileLive", () => {
+  it("installs tiny's plugin for an opencode profile on \"on\", reports it, and removes it on \"off\"", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-plive-"));
+    addProfile(root, "oc", "opencode");
+    const plugin = path.join(root, "oc", "xdg", "config", "opencode", "plugin", "tiny.js");
+    expect(applyProfileLive(root, "/tiny-home", "oc", undefined)).toEqual(["off  (oc: storage scan — plugin not installed)"]);
+    const on = applyProfileLive(root, "/tiny-home", "oc", "on");
+    expect(on[0]).toBe("Always-handoff is now on (oc: tinyd scans the agent's own sessions)");
+    expect(on[1]).toBe(`Installed tiny's opencode plugin: ${plugin}`);
+    expect(fs.readFileSync(plugin, "utf8")).toContain(`const PEERS_DIR = ${JSON.stringify(path.join("/tiny-home", "opencode-peers"))};`);
+    expect(applyProfileLive(root, "/tiny-home", "oc", undefined)[0]).toBe(`on  (oc: storage scan + plugin v1 (${plugin}))`);
+    expect(applyProfileLive(root, "/tiny-home", "oc", "off")).toEqual([
+      "Always-handoff is now off (oc: tinyd scans the agent's own sessions)",
+      `Removed tiny's opencode plugin: ${plugin}`,
+    ]);
+    expect(fs.existsSync(plugin)).toBe(false);
+  });
+
+  it("leaves codex at the storage scan alone", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tiny-plive-"));
+    addProfile(root, "cx", "codex");
+    expect(applyProfileLive(root, "/tiny-home", "cx", "on")).toEqual(["Always-handoff is now on (cx: tinyd scans the agent's own sessions)"]);
+    expect(applyProfileLive(root, "/tiny-home", "cx", undefined)).toEqual(["on  (cx: storage scan)"]);
   });
 });

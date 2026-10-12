@@ -9,11 +9,12 @@ import type { LiveSessionEntry } from "./claude-live.js";
 import type { ExternalTurn } from "./agent-storage.js";
 import { codexRolloutCursor, findCodexRollout, listCodexSessions, readCodexRollout } from "./codex-live.js";
 import type { CodexQueueMessage } from "./codex-peer.js";
-import { listOpencodeSessions, opencodeDbStat, opencodeSessionCursor, readOpencodeSession } from "./opencode-live.js";
+import { listOpencodeSessions, opencodeDbStat, opencodeLastChoice, opencodeSessionCursor, readOpencodeSession } from "./opencode-live.js";
+import { opencodePermissionView, type OpencodePermissionRequest } from "./opencode-peer.js";
 import { findTranscript, readTranscript, readTranscriptCursor, type TranscriptTurn } from "./claude-transcript.js";
 import { PEER_STOP, wrapForPeer, type CliMode, type PeerFrame, type PeerStatus, type PeerTarget } from "./claude-peer.js";
 import type { AgentCapabilities, AgentDriver } from "./agents/index.js";
-import type { PendingPermission, PermissionBroker, PermissionDecision } from "./permission-broker.js";
+import { WITHDRAWN, type PendingPermission, type PermissionBroker, type PermissionDecision } from "./permission-broker.js";
 import type { SessionPatch, Stores } from "./stores.js";
 import type { FileRecord, PermissionModeValue, SessionRecord, SessionStatus, SessionActivity } from "./types.js";
 
@@ -64,6 +65,46 @@ export interface CodexPeerBridge {
   queue: (s: SessionRecord, msg: Omit<CodexQueueMessage, "threadId">) => Promise<{ queuedSubmissionId: string }>;
   /** Take an untaken message back. true = it was still queued. Throws when codex cannot be reached */
   unqueue: (s: SessionRecord, queuedSubmissionId: string) => Promise<boolean>;
+}
+
+/**
+ * How the manager hands a message to the opencode the person has open — a TUI, or an `opencode
+ * serve` TUIs attach to — through tiny's opencode plugin (opencode-plugin.ts / opencode-peer.ts).
+ * Implemented in server.ts; tests inject fakes. Absent = tiny runs every opencode turn in its own
+ * `opencode acp`, which a TUI never shows (it redraws only from its own process's events)
+ */
+export interface OpencodePeerBridge {
+  /** The live process that can run this session (it serves the session's directory and storage), or null */
+  resolve: (s: SessionRecord) => OpencodeTarget | null;
+  /** What that process says about the session right now. null = the process is gone */
+  state: (s: SessionRecord, target: OpencodeTarget) => OpencodeSessionState | null;
+  /** Hand a message over; it runs there as if typed (queued behind a turn in progress). Throws when refused */
+  prompt: (s: SessionRecord, target: OpencodeTarget, msg: OpencodePrompt) => Promise<void>;
+  abort: (s: SessionRecord, target: OpencodeTarget) => Promise<void>;
+  reply: (s: SessionRecord, target: OpencodeTarget, r: { sessionID: string; requestID: string; reply: "once" | "reject" }) => Promise<void>;
+}
+
+export interface OpencodeTarget {
+  pid: number;
+}
+
+export interface OpencodeSessionState {
+  /** A turn is running on the session in that process */
+  busy: boolean;
+  /** When the session last went idle there (ms, same machine clock). null = not since that process started */
+  idleAt: number | null;
+  /** Permission prompts that process shows for the session — its subagents' included */
+  permissions: OpencodePermissionRequest[];
+  /** Questions (opencode's question tool) it shows for the session; answered at the terminal */
+  questions: Array<{ id: string }>;
+}
+
+export interface OpencodePrompt {
+  text: string;
+  images?: TurnImage[];
+  model?: { providerID: string; modelID: string };
+  variant?: string;
+  agent?: string;
 }
 
 export interface LiveTiming {
@@ -120,6 +161,8 @@ export interface SessionManagerDeps {
   peer?: PeerBridge;
   /** Live join into the Codex CLI through its message queue (Step 3 Wave 2). Absent = 409 while the CLI holds the thread */
   codexPeer?: CodexPeerBridge;
+  /** Live join into the person's opencode through tiny's plugin. Absent = tiny's own `opencode acp` runs every turn */
+  opencodePeer?: OpencodePeerBridge;
   /** Watcher timings. Tests shorten them; production uses the defaults */
   liveTiming?: LiveTiming;
   /**
@@ -185,6 +228,31 @@ interface CodexLiveTurn {
 const CODEX_STOP_IN_TERMINAL = "this turn is running in the codex CLI; stop it there (Esc)";
 
 /**
+ * A turn running inside the person's opencode on tiny's behalf. Evidence: the storage (our message
+ * imported = taken; its replies) and the plugin's view of that process (busy / idle, the prompts it
+ * shows, whether it is there at all)
+ */
+interface OpencodeLiveTurn {
+  target: OpencodeTarget;
+  /** When the message went out (tinyd's clock; the plugin stamps statuses with the same machine's) */
+  sentAt: number;
+  /** When the storage first showed our message (its echo); replies count as ours from then on */
+  deliveredAt: number | null;
+  /** Since when that process has sat idle without our message in the storage (null while busy / delivered) */
+  idleUndeliveredSince: number | null;
+  /** interrupt() asked that process to abort: the turn ends as interrupted once it is idle */
+  stopRequested: boolean;
+  /** opencode's request id → the broker's, for every prompt put on the phone */
+  asked: Map<string, string>;
+  /** Questions already announced (cli_attention) */
+  announced: Set<string>;
+  /** Newest assistant text imported after delivery; goes out as turn_completed's resultText */
+  lastAssistantText: string | null;
+  /** How the newest reply imported after delivery failed (opencode's words), or null */
+  replyError: string | null;
+}
+
+/**
  * Registry statuses that mean "work is in progress over there": a turn (busy), a permission prompt
  * mid-turn (waiting), or a background shell task the CLI is waiting on after its turn ended (shell —
  * measured: a `!cmd` typed at the prompt reads busy, not shell). The CLI resumes when that task exits
@@ -221,6 +289,14 @@ export class SessionManager extends EventEmitter {
   private liveTurns = new Map<string, LiveTurn>();
   /** Same, for Codex: turns handed to the CLI holding the thread through its queue */
   private codexLiveTurns = new Map<string, CodexLiveTurn>();
+  /** Same, for opencode: turns handed to the person's own opencode process through tiny's plugin */
+  private opencodeLiveTurns = new Map<string, OpencodeLiveTurn>();
+  /**
+   * Messages tiny handed to the person's opencode, by session, not yet seen in its storage. The
+   * storage brings each back as a user message; tiny already wrote it into the conversation when it
+   * was sent, so that echo is dropped on import (and is the delivery receipt)
+   */
+  private opencodeEchoes = new Map<string, string[]>();
   /**
    * Every client id tiny ever queued into a codex thread, by session. The rollout echoes our message
    * back as a UserMessage; tiny already wrote it into the conversation when it was sent, so the
@@ -443,7 +519,8 @@ export class SessionManager extends EventEmitter {
   private advanceCursorAfterTurn(id: string): void {
     try {
       const s = this.deps.stores.sessions.get(id);
-      if (s?.sourceCursor) this.advanceCursor(s);
+      // tiny's own process is gone by now, so an opencode reply it left unfinished stays that way
+      if (s?.sourceCursor) this.advanceCursor(s, { ownTurnEnded: true });
     } catch {
       // bookkeeping must never mask the turn's own outcome (this runs in a finally)
     }
@@ -453,7 +530,7 @@ export class SessionManager extends EventEmitter {
    * Move the cursor to the transcript's current tail without emitting anything.
    * Never throws — an unreadable transcript just leaves the cursor where it is.
    */
-  private advanceCursor(s: SessionRecord): void {
+  private advanceCursor(s: SessionRecord, opts: { ownTurnEnded?: boolean } = {}): void {
     try {
       if (s.agent === "codex") {
         const file = this.codexRollout(s);
@@ -463,7 +540,9 @@ export class SessionManager extends EventEmitter {
       }
       if (s.agent === "opencode") {
         if (!s.agentSessionId) return;
-        const cursor = opencodeSessionCursor(profileDir(this.deps.profilesDir, s.profile), s.agentSessionId);
+        const cursor = opencodeSessionCursor(profileDir(this.deps.profilesDir, s.profile), s.agentSessionId, {
+          includeUnfinished: opts.ownTurnEnded === true,
+        });
         // null = the tail is an unfinished reply; leaving the cursor lets the next sync take it whole
         if (cursor !== null && cursor !== "" && cursor !== s.sourceCursor) {
           this.deps.stores.sessions.patch(s.id, { sourceCursor: cursor });
@@ -530,7 +609,7 @@ export class SessionManager extends EventEmitter {
     if (s.agent === "codex" || s.agent === "opencode") {
       // Same running guard as claude: while tiny's own adapter appends to the storage nothing is
       // imported; a live turn is the exception (the CLI is the only writer, importing is the point)
-      if (this.running.has(id) && !this.codexLiveTurns.has(id)) return SessionManager.noImport();
+      if (this.running.has(id) && !this.codexLiveTurns.has(id) && !this.opencodeLiveTurns.has(id)) return SessionManager.noImport();
       try {
         return s.agent === "codex" ? this.importCodex(s) : this.importOpencode(s);
       } catch {
@@ -679,7 +758,23 @@ export class SessionManager extends EventEmitter {
     if (seen && seen.size === st.size && seen.mtimeMs === st.mtimeMs) return SessionManager.noImport();
     const read = readOpencodeSession(dir, s.agentSessionId, s.sourceCursor);
     if (!read) return SessionManager.noImport();
-    for (const ev of read.events) this.emitEvent(s.id, ev.type, ev.payload);
+    const echoes = this.opencodeEchoes.get(s.id);
+    const live = this.opencodeLiveTurns.get(s.id);
+    for (const ev of read.events) {
+      // A message tiny handed to the person's opencode, coming back from its storage: already in the
+      // conversation since it was sent, and the receipt that the process took it
+      if (ev.type === "user_message" && echoes && echoes[0] === ev.payload.text) {
+        echoes.shift();
+        if (echoes.length === 0) this.opencodeEchoes.delete(s.id);
+        if (live && live.deliveredAt === null) live.deliveredAt = Date.now();
+        continue;
+      }
+      this.emitEvent(s.id, ev.type, ev.payload);
+      if (live && live.deliveredAt !== null && ev.type === "assistant_text" && typeof ev.payload.text === "string") {
+        live.lastAssistantText = ev.payload.text;
+      }
+    }
+    if (live && live.deliveredAt !== null && read.replyError !== undefined) live.replyError = read.replyError;
     this.recordExternalTurn(s.id, read.turn);
     const patch: SessionPatch = {};
     if (read.cursor !== "" && read.cursor !== s.sourceCursor) patch.sourceCursor = read.cursor;
@@ -1037,7 +1132,20 @@ export class SessionManager extends EventEmitter {
 
   /** Whether a turn sent now would run inside the user's CLI (live join) rather than be refused */
   canJoin(s: SessionRecord): boolean {
-    return this.joinTarget(s) !== null || this.codexJoinable(s);
+    return this.joinTarget(s) !== null || this.codexJoinable(s) || this.opencodeTarget(s) !== null;
+  }
+
+  /**
+   * The person's own opencode process that can run this session (tiny's plugin is loaded in it and
+   * it serves the session's directory), or null — then tiny runs the turn in its own `opencode acp`
+   */
+  private opencodeTarget(s: SessionRecord): OpencodeTarget | null {
+    if (!this.deps.opencodePeer || s.agent !== "opencode" || !s.agentSessionId) return null;
+    try {
+      return this.deps.opencodePeer.resolve(s);
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1110,8 +1218,28 @@ export class SessionManager extends EventEmitter {
       });
       return;
     }
+    // The person's own opencode serves this session: the message goes to that process, whose TUI
+    // shows it as it runs. Its own turn in progress is no obstacle — opencode takes the message
+    // after it, the way it takes one typed during a turn
+    const ocTarget = this.opencodeTarget(s);
+    if (ocTarget) {
+      // Whatever that process wrote since the last look goes in first, so the conversation stays in order
+      this.importTranscript(id);
+      this.deps.stores.sessions.patch(id, { status: "running", title: s.title ?? prompt.slice(0, 60) });
+      const abort = new AbortController();
+      this.turnProgress.set(id, { since: new Date().toISOString(), outputTokens: null });
+      const entry: RunningTurn = { abort, done: Promise.resolve() };
+      this.running.set(id, entry);
+      if (!saved) this.persistUserMessage(id, prompt, images);
+      entry.done = this.runOpencodeLiveTurn(s, ocTarget, prompt, images, abort.signal).finally(() => {
+        this.running.delete(id);
+        this.turnProgress.delete(id);
+        this.startNextQueued(id);
+      });
+      return;
+    }
     // A turn the agent's own CLI is running (seen through its storage): a second writer on the
-    // same session is the one thing every agent forbids. opencode has no live join (yet)
+    // same session is the one thing every agent forbids
     const ext = this.transcriptTurns.get(id);
     if ((s.agent === "codex" || s.agent === "opencode") && ext?.open === true && this.deps.externalBusy?.(s) !== false) {
       throw new ConflictError("a turn is running in the agent's own CLI");
@@ -1189,10 +1317,22 @@ export class SessionManager extends EventEmitter {
     const own = this.turnProgress.get(s.id);
     if (own) {
       // A live turn's output is written by the CLI, so the transcript is the only place it shows up
-      const fromTranscript = this.liveTurns.has(s.id) || this.codexLiveTurns.has(s.id) ? this.transcriptTurns.get(s.id)?.outputTokens ?? null : null;
+      const live = this.liveTurns.has(s.id) || this.codexLiveTurns.has(s.id) || this.opencodeLiveTurns.has(s.id);
+      const fromTranscript = live ? this.transcriptTurns.get(s.id)?.outputTokens ?? null : null;
       return { since: own.since, outputTokens: own.outputTokens ?? fromTranscript };
     }
-    if (s.agent === "codex" || s.agent === "opencode") {
+    if (s.agent === "opencode") {
+      // The plugin in the person's opencode says outright when a turn runs there; the storage alone
+      // (an unfinished reply) counts while no process-level evidence says nobody is there
+      const ext = this.transcriptTurns.get(s.id);
+      const busy = this.deps.externalBusy?.(s);
+      if (busy === true || (ext?.open === true && busy !== false)) {
+        const open = ext?.open === true;
+        return { since: open ? ext.startedAt : null, outputTokens: open && ext.outputTokens > 0 ? ext.outputTokens : null };
+      }
+      return null;
+    }
+    if (s.agent === "codex") {
       // A turn the person runs in the agent's own CLI: the storage says open, and process-level
       // evidence (when available) has not said "nobody is there"
       const ext = this.transcriptTurns.get(s.id);
@@ -1490,6 +1630,175 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  /**
+   * What a message handed to the person's opencode runs on. The phone's own choice when it made one;
+   * otherwise exactly what the session last ran with there (the newest user message's agent, model
+   * and variant) — the TUI sends those with every prompt, and opencode would otherwise fall back to
+   * its default agent
+   */
+  private opencodePromptFor(s: SessionRecord, text: string, images: TurnImage[] | undefined): OpencodePrompt {
+    const last = opencodeLastChoice(profileDir(this.deps.profilesDir, s.profile), s.agentSessionId!);
+    const slash = s.model ? s.model.indexOf("/") : -1;
+    const model = s.model && slash > 0
+      ? { providerID: s.model.slice(0, slash), modelID: s.model.slice(slash + 1) }
+      : last.model ? { providerID: last.model.providerID, modelID: last.model.modelID } : undefined;
+    const variant = s.effort ?? (s.model ? undefined : last.model?.variant);
+    return {
+      text,
+      ...(images && images.length > 0 ? { images } : {}),
+      ...(model ? { model } : {}),
+      ...(variant ? { variant } : {}),
+      ...(last.agent ? { agent: last.agent } : {}),
+    };
+  }
+
+  /**
+   * Run a turn inside the person's opencode (a TUI, or a serve TUIs attach to): hand the message to
+   * that process through tiny's plugin, then watch two things. The storage says when our message was
+   * taken (its echo) and what came of it; the plugin says when the session goes idle again, which
+   * ends the turn, and which prompts it shows — those go to the phone as well, and whichever side
+   * answers first wins. The turn fails when that process goes away, or when an idle process never
+   * takes the message
+   */
+  private async runOpencodeLiveTurn(
+    s: SessionRecord,
+    target: OpencodeTarget,
+    prompt: string,
+    images: TurnImage[] | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const timing = this.deps.liveTiming ?? DEFAULT_LIVE_TIMING;
+    const bridge = this.deps.opencodePeer!;
+    const live: OpencodeLiveTurn = {
+      target, sentAt: Date.now(), deliveredAt: null, idleUndeliveredSince: null, stopRequested: false,
+      asked: new Map(), announced: new Set(), lastAssistantText: null, replyError: null,
+    };
+    // Registered before anything awaits: importTranscript only imports for a turn it can see
+    this.opencodeLiveTurns.set(s.id, live);
+    const echoes = this.opencodeEchoes.get(s.id) ?? [];
+    echoes.push(prompt);
+    this.opencodeEchoes.set(s.id, echoes);
+    const dropEcho = () => {
+      const left = this.opencodeEchoes.get(s.id);
+      const i = left?.indexOf(prompt) ?? -1;
+      if (left && i >= 0) left.splice(i, 1);
+      if (left?.length === 0) this.opencodeEchoes.delete(s.id);
+    };
+    try {
+      try {
+        await bridge.prompt(s, target, this.opencodePromptFor(s, prompt, images));
+      } catch (err) {
+        dropEcho();
+        this.emitEvent(s.id, "turn_failed", { error: `could not reach the opencode CLI: ${err instanceof Error ? err.message : String(err)}` });
+        return;
+      }
+      this.emitEvent(s.id, "turn_started", { agentSessionId: s.agentSessionId });
+      for (;;) {
+        await new Promise((r) => setTimeout(r, timing.pollMs));
+        // No path aborts a live turn today (Stop goes through interrupt(), which asks opencode to
+        // abort); a shutdown must still be able to end the watcher through the same controller
+        if (signal.aborted) {
+          this.emitEvent(s.id, "turn_failed", { error: "interrupted" });
+          return;
+        }
+        this.importTranscript(s.id);
+        const st = bridge.state(s, target);
+        if (st === null) {
+          dropEcho();
+          this.emitEvent(s.id, "turn_failed", { error: "the CLI closed" });
+          return;
+        }
+        this.syncOpencodePrompts(s, live, st);
+        if (live.stopRequested && !st.busy) {
+          this.importTranscript(s.id);
+          dropEcho();
+          this.emitEvent(s.id, "turn_failed", { error: "interrupted" });
+          return;
+        }
+        // Idle again after we sent = our message has run: opencode stores a message the moment it
+        // takes it, and a session goes idle only once no message is left for it (one sent during a
+        // turn is picked up by that same run). The echo is not required — an image-only message has none
+        if (!st.busy && st.idleAt !== null && st.idleAt >= live.sentAt) {
+          // The last reply can land between this tick's import and the idle it reported
+          this.importTranscript(s.id);
+          dropEcho();
+          // A reply that failed over there (a model that is not running, a refused request) is the
+          // turn failing: the phone must say so rather than show a quiet "done"
+          if (live.replyError) this.emitEvent(s.id, "turn_failed", { error: live.replyError });
+          else this.emitEvent(s.id, "turn_completed", { costUsd: null, resultText: live.lastAssistantText });
+          return;
+        }
+        if (live.deliveredAt === null && !st.busy) {
+          // Idle, and not since we sent (that returned above): it has not run our message. Taken
+          // messages are stored at once; an idle process that has not stored ours is not going to
+          live.idleUndeliveredSince ??= Date.now();
+          if (Date.now() - live.idleUndeliveredSince > timing.deliveryTimeoutMs) {
+            dropEcho();
+            this.emitEvent(s.id, "turn_failed", { error: "the opencode CLI did not take the message" });
+            return;
+          }
+        } else {
+          live.idleUndeliveredSince = null;
+        }
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(`[tinyd] opencode live turn crashed: ${reason}`);
+      try {
+        this.emitEvent(s.id, "turn_failed", { error: reason });
+      } catch (emitErr) {
+        console.error("[tinyd] could not record turn_failed for a crashed opencode live turn:", emitErr);
+      }
+    } finally {
+      // Prompts still on the phone belong to a turn that is over here
+      for (const reqId of live.asked.values()) this.deps.broker.withdraw(reqId);
+      this.opencodeLiveTurns.delete(s.id);
+      try {
+        this.deps.stores.sessions.patch(s.id, { status: "idle" });
+      } catch {
+        // The session row may already be gone (deleted mid-turn) — nothing left to patch
+      }
+    }
+  }
+
+  /**
+   * Put the prompts that process shows for this turn on the phone, and take back the ones settled
+   * there. A phone answer goes to that process; a request that disappears was answered at the
+   * terminal (or went with an abort). The broker's own timeout is NOT an answer here: the person at
+   * the terminal may still answer it, so it only clears the phone's card
+   */
+  private syncOpencodePrompts(s: SessionRecord, live: OpencodeLiveTurn, st: OpencodeSessionState): void {
+    for (const r of st.permissions) {
+      if (live.asked.has(r.id)) continue;
+      const view = opencodePermissionView(r);
+      const { id: reqId, decision } = this.deps.broker.request(s.id, view.toolName, view.input, view.hint);
+      live.asked.set(r.id, reqId);
+      this.emitEvent(s.id, "permission_requested", {
+        reqId, toolName: view.toolName, input: view.input, kind: view.hint.kind, summary: view.hint.summary,
+      });
+      void decision
+        .then(async (d) => {
+          const settled = d.behavior === "deny" && (d.message === WITHDRAWN || d.message === "timeout");
+          this.emitEvent(s.id, "permission_resolved", { reqId, behavior: settled ? "withdrawn" : d.behavior });
+          if (settled) return;
+          await this.deps.opencodePeer!.reply(s, live.target, {
+            sessionID: r.sessionID, requestID: r.id, reply: d.behavior === "allow" ? "once" : "reject",
+          });
+        })
+        .catch((err) => console.error(`[tinyd] could not answer an opencode permission prompt: ${err instanceof Error ? err.message : String(err)}`));
+    }
+    const open = new Set(st.permissions.map((r) => r.id));
+    for (const [id, reqId] of live.asked) {
+      // false when the phone already answered it (that answer is on its way); otherwise it was settled there
+      if (!open.has(id)) this.deps.broker.withdraw(reqId);
+    }
+    for (const q of st.questions) {
+      if (live.announced.has(q.id)) continue;
+      live.announced.add(q.id);
+      this.emitEvent(s.id, "cli_attention", { reason: "question" });
+    }
+  }
+
   /** One watcher tick. Returns the terminal event when the turn is over, null to keep watching */
   private pollLiveTurn(
     s: SessionRecord,
@@ -1647,6 +1956,20 @@ export class SessionManager extends EventEmitter {
       codexLive.unqueued = true; // the watcher ends the turn as interrupted
       return;
     }
+    const ocLive = this.opencodeLiveTurns.get(id);
+    if (ocLive) {
+      // The person's opencode runs this turn; its own abort stops it there, TUI and all. The watcher
+      // closes the turn as interrupted once that process reports the session idle
+      if (ocLive.stopRequested) return;
+      ocLive.stopRequested = true;
+      try {
+        await this.deps.opencodePeer!.abort(s, ocLive.target);
+      } catch (err) {
+        ocLive.stopRequested = false; // let a later tap try again
+        throw new ConflictError(`could not stop the opencode CLI: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
     const live = this.liveTurns.get(id);
     if (!live) {
       const own = this.running.get(id);
@@ -1682,6 +2005,21 @@ export class SessionManager extends EventEmitter {
    * "now" message the CLI takes instead of continuing. Awaited so a socket failure reaches the tap
    */
   private async stopCliTurn(s: SessionRecord): Promise<void> {
+    if (s.agent === "opencode") {
+      // A turn typed into the person's opencode stops the same way as one tiny handed over
+      const target = this.opencodeTarget(s);
+      const busyThere = target ? this.deps.opencodePeer!.state(s, target)?.busy === true : false;
+      if (target && busyThere) {
+        try {
+          await this.deps.opencodePeer!.abort(s, target);
+        } catch (err) {
+          throw new ConflictError(`could not stop the opencode CLI: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return;
+      }
+      if (this.activity(s) !== null) throw new ConflictError("this turn is running in an opencode tiny cannot reach; stop it there (Esc)");
+      return;
+    }
     if (s.agent === "codex") {
       // A turn typed into the codex terminal shows as running from its rollout; nothing here can stop it
       if (this.transcriptTurns.get(s.id)?.open === true && this.deps.externalBusy?.(s) !== false) throw new ConflictError(CODEX_STOP_IN_TERMINAL);

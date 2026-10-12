@@ -14,6 +14,8 @@ import { openDb } from "./db.js";
 import { tinyEntry, tinyLaunch } from "./entry.js";
 import { buildHookCommand, readLiveMode, setLiveMode } from "./claude-hooks.js";
 import { fetchAcpChoices } from "./acp-adapter.js";
+import { listOpencodePeers, opencodePeersDir } from "./opencode-peer.js";
+import { installOpencodePlugin, OPENCODE_PLUGIN_VERSION, opencodePluginPath, readOpencodePlugin, removeOpencodePlugin } from "./opencode-plugin.js";
 import { detectTailscaleIp } from "./tailscale.js";
 import { findOnPath } from "./which.js";
 import { migrateClaudeCredential, type KeychainMigration } from "./keychain.js";
@@ -578,6 +580,32 @@ program
     }
   });
 
+/**
+ * `tiny live [on|off] --profile <name>` for a hookless agent (codex / opencode): the storage scan
+ * flag, and for opencode tiny's plugin as well — the way the phone's messages reach (and show in)
+ * the person's own opencode TUI. state undefined = report. Returns the lines to print
+ */
+export function applyProfileLive(profilesDir: string, tinyHome: string, name: string, state: "on" | "off" | undefined): string[] {
+  const agent = profileDriver(profilesDir, name).id;
+  const dir = profileDir(profilesDir, name);
+  if (state === undefined) {
+    const plugin = agent === "opencode" ? readOpencodePlugin(dir) : null;
+    const extra = plugin ? (plugin.installed ? ` + plugin v${plugin.version} (${opencodePluginPath(dir)})` : " — plugin not installed") : "";
+    return [`${readProfileLive(profilesDir, name) ? "on" : "off"}  (${name}: storage scan${extra})`];
+  }
+  setProfileLive(profilesDir, name, state === "on");
+  const lines = [`Always-handoff is now ${state} (${name}: tinyd scans the agent's own sessions)`];
+  if (agent === "opencode") {
+    if (state === "on") {
+      lines.push(`Installed tiny's opencode plugin: ${installOpencodePlugin(dir, opencodePeersDir(tinyHome))}`);
+      lines.push("Messages from the phone now run in the opencode TUI itself — restart a TUI that is already open to load it.");
+    } else if (removeOpencodePlugin(dir)) {
+      lines.push(`Removed tiny's opencode plugin: ${opencodePluginPath(dir)}`);
+    }
+  }
+  return lines;
+}
+
 program
   .command("live [state]")
   .description("always hand new Claude Code sessions to tiny (state: on|off; omit to show)")
@@ -587,13 +615,8 @@ program
     const paths = tinyPaths();
     // Claude gets hooks; codex / opencode get tinyd's storage scan — one command, per-agent means
     if (opts.profile !== undefined && profileDriver(paths.profilesDir, opts.profile).id !== "claude") {
-      if (state === undefined) {
-        console.log(`${readProfileLive(paths.profilesDir, opts.profile) ? "on" : "off"}  (${opts.profile}: storage scan)`);
-        return;
-      }
-      if (state !== "on" && state !== "off") throw new Error(`state must be on or off (got ${state})`);
-      setProfileLive(paths.profilesDir, opts.profile, state === "on");
-      console.log(`Always-handoff is now ${state} (${opts.profile}: tinyd scans the agent's own sessions)`);
+      if (state !== undefined && state !== "on" && state !== "off") throw new Error(`state must be on or off (got ${state})`);
+      for (const line of applyProfileLive(paths.profilesDir, paths.home, opts.profile, state)) console.log(line);
       return;
     }
     const configDir = resolveLiveConfigDir(opts, paths.profilesDir);
@@ -645,6 +668,13 @@ program
         (name) => readProfileLive(p.profilesDir, name),
       ),
       peerInboxes: summarizePeerInboxes(process.env.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigDir()),
+      opencodeLive: {
+        profiles: listProfiles(p.profilesDir)
+          .filter((pr) => pr.agent === "opencode" && readProfileLive(p.profilesDir, pr.name))
+          .map((pr) => ({ name: pr.name, plugin: readOpencodePlugin(profileDir(p.profilesDir, pr.name)) })),
+        currentVersion: OPENCODE_PLUGIN_VERSION,
+        running: listOpencodePeers(opencodePeersDir(p.home)).length,
+      },
     });
     console.log(formatDoctorReport(report));
     if (!report.ok) process.exitCode = 1;

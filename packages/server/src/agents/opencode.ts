@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { readAcpChoices } from "../acp-choices.js";
+import { OPENCODE_PEER_ENV, opencodePermissionView, opencodeServerPermissions, opencodeServerReply } from "../opencode-peer.js";
 import type { AgentDriver } from "./index.js";
 
 // OpenCode (`opencode acp`, bundled in the binary). Measured (HANDOFF "OpenCode ACP measurements"):
@@ -75,6 +76,19 @@ export const opencodeDriver: AgentDriver = {
   bin: "opencode",
   adapter: "acp",
   launch: { command: "opencode", args: ["acp"] },
+  // `opencode acp` serves the HTTP API on loopback anyway (4096, else a random port); pinning the
+  // port is what lets the adapter reach it for the subagent prompts ACP drops
+  acpSideChannel: {
+    launchArgs: (port) => ["--port", String(port)],
+    pending: async (port, cwd, acpSessionId) =>
+      (await opencodeServerPermissions(port, cwd))
+        .filter((r) => r.sessionID !== acpSessionId)
+        .map((r) => ({ id: r.id, ...opencodePermissionView({ ...r, root: acpSessionId }) })),
+    reply: (port, cwd, id, allow) => opencodeServerReply(port, cwd, id, allow ? "once" : "reject"),
+  },
+  // tiny's own plugin (installed for `tiny live on`) loads in every opencode on that config,
+  // tiny's children included; those are tiny already and must not offer themselves as a terminal
+  turnEnv: { [OPENCODE_PEER_ENV]: "off" },
   homeEnv: (profileDir) => {
     const x = opencodeXdg(profileDir);
     const env: Record<string, string> = { XDG_DATA_HOME: x.data, XDG_CONFIG_HOME: x.config, XDG_CACHE_HOME: x.cache, XDG_STATE_HOME: x.state };

@@ -5,6 +5,7 @@ import type { AgentAdapter, RunTurnParams, TurnResult } from "./adapter.js";
 import { harvestAcpChoices, readAcpChoices, type AcpChoices } from "./acp-choices.js";
 import { agentEnv, type AgentDriver, type AgentLaunch } from "./agents/index.js";
 import { JsonRpcConnection, JsonRpcRemoteError } from "./jsonrpc-stdio.js";
+import { freeLoopbackPort } from "./opencode-peer.js";
 import type { PermissionDecision } from "./permission-broker.js";
 import { oneLine, type ToolHint, type ToolKind } from "./tool-kinds.js";
 import { TINY_VERSION } from "./version.js";
@@ -97,21 +98,28 @@ function toolNameOf(tc: { name?: string | null; title?: string | null }): string
 export class AcpAdapter implements AgentAdapter {
   private spawn: AcpSpawn;
   private cancelTimeoutMs: number;
+  private freePort: () => Promise<number>;
+  private sidePollMs: number;
 
   constructor(
     private driver: AgentDriver,
-    opts: { spawn?: AcpSpawn; cancelTimeoutMs?: number } = {},
+    opts: { spawn?: AcpSpawn; cancelTimeoutMs?: number; freePort?: () => Promise<number>; sidePollMs?: number } = {},
   ) {
     if (!driver.launch) throw new Error(`agent ${driver.id} has no launch command (adapter: acp)`);
     this.spawn = opts.spawn ?? spawnAcpProcess;
     this.cancelTimeoutMs = opts.cancelTimeoutMs ?? 5000;
+    this.freePort = opts.freePort ?? freeLoopbackPort;
+    this.sidePollMs = opts.sidePollMs ?? 1000;
   }
 
   async runTurn(p: RunTurnParams): Promise<TurnResult> {
     // Reject an abort before turn_started (before spawning the process) here. Once turn_started is emitted, never throw again
     if (p.signal.aborted) throw new Error(`${this.driver.label} turn was interrupted before it started`);
-    const launch = this.driver.launch!;
-    const proc = this.spawn(launch, { cwd: p.cwd, env: agentEnv(this.driver, p.profileDir) });
+    const side = this.driver.acpSideChannel;
+    const sidePort = side ? await this.freePort() : null;
+    const base = this.driver.launch!;
+    const launch = side && sidePort !== null ? { command: base.command, args: [...base.args, ...side.launchArgs(sidePort)] } : base;
+    const proc = this.spawn(launch, { cwd: p.cwd, env: { ...agentEnv(this.driver, p.profileDir), ...this.driver.turnEnv } });
     const conn = proc.conn;
     const label = this.driver.label;
     const cancelTimeoutMs = this.cancelTimeoutMs;
@@ -222,6 +230,15 @@ export class AcpAdapter implements AgentAdapter {
       onUpdate(n.update);
     });
 
+    // Auto mode allows without asking; otherwise the phone decides. null = the turn was interrupted first.
+    // Deliberately not async: the race itself is awaited, so a cancelled answer goes out on the same
+    // tick as before (an extra hop let the connection close first and swallow it)
+    const decide = (toolName: string, input: unknown, hint: ToolHint): Promise<PermissionDecision | null> => {
+      if (p.permissionMode === "auto") return Promise.resolve({ behavior: "allow" });
+      const cancelled = new Promise<null>((resolve) => onAborted(() => resolve(null)));
+      return Promise.race([p.requestPermission(toolName, input, hint), cancelled]);
+    };
+
     conn.onRequest("session/request_permission", async (params) => {
       const req = params as { toolCall: AcpToolCall; options: PermissionOption[] };
       const tc = req.toolCall ?? ({ toolCallId: "" } as AcpToolCall);
@@ -229,19 +246,53 @@ export class AcpAdapter implements AgentAdapter {
       const pick = (kinds: string[]) => kinds.map((k) => options.find((o) => o.kind === k)).find((o) => o !== undefined);
       const toolName = started.get(tc.toolCallId)?.toolName ?? toolNameOf(tc);
       const hint: ToolHint = { kind: toKind(tc.kind), summary: oneLine(tc.title || toolName) };
-      let decision: PermissionDecision;
-      if (p.permissionMode === "auto") {
-        decision = { behavior: "allow" };
-      } else {
-        const cancelled = new Promise<null>((resolve) => onAborted(() => resolve(null)));
-        const d = await Promise.race([p.requestPermission(toolName, tc.rawInput ?? {}, hint), cancelled]);
-        if (d === null) return { outcome: { outcome: "cancelled" } };
-        decision = d;
-      }
+      const decision = await decide(toolName, tc.rawInput ?? {}, hint);
+      if (decision === null) return { outcome: { outcome: "cancelled" } };
       const opt = decision.behavior === "allow" ? pick(["allow_once", "allow_always"]) : pick(["reject_once", "reject_always"]);
       if (!opt) return { outcome: { outcome: "cancelled" } };
       return { outcome: { outcome: "selected", optionId: opt.optionId } };
     });
+
+    // Prompts the agent raises outside ACP (a subagent's, on OpenCode), polled while the prompt runs
+    // and put through the same decision. Each is asked once; a read that fails is retried next tick
+    const sideAsked = new Set<string>();
+    let sideTimer: ReturnType<typeof setTimeout> | null = null;
+    let sideRunning = false;
+    let sideFailures = 0;
+    const pollSide = async (): Promise<void> => {
+      if (!side || sidePort === null || sessionId === null || !sideRunning) return;
+      try {
+        const pending = await side.pending(sidePort, p.cwd, sessionId);
+        sideFailures = 0;
+        for (const r of pending) {
+          if (sideAsked.has(r.id)) continue;
+          sideAsked.add(r.id);
+          void decide(r.toolName, r.input, r.hint).then(async (d) => {
+            // Interrupted: session/cancel takes the subagent and its prompt down with the turn
+            if (d === null) return;
+            await side.reply(sidePort, p.cwd, r.id, d.behavior === "allow");
+          }).catch((err) => console.error(`[tinyd] ${label}: could not answer a subagent's permission prompt: ${err instanceof Error ? err.message : String(err)}`));
+        }
+      } catch (err) {
+        // One miss is noise (the server answers between turns of its own event loop); a streak is not
+        if (++sideFailures === 3) console.error(`[tinyd] ${label}: cannot read prompts outside ACP: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        if (sideRunning) {
+          sideTimer = setTimeout(() => void pollSide(), this.sidePollMs);
+          sideTimer.unref?.();
+        }
+      }
+    };
+    const startSide = () => {
+      if (!side || sidePort === null) return;
+      sideRunning = true;
+      sideTimer = setTimeout(() => void pollSide(), this.sidePollMs);
+      sideTimer.unref?.();
+    };
+    const stopSide = () => {
+      sideRunning = false;
+      if (sideTimer) clearTimeout(sideTimer);
+    };
 
     // If the process dies first, the request gets rejected (append stderr to make the message meaningful)
     const withExit = async <T>(work: Promise<T>, what: string): Promise<T> => {
@@ -380,11 +431,13 @@ export class AcpAdapter implements AgentAdapter {
           });
         });
         let res: { stopReason?: string };
+        startSide();
         try {
           res = (await Promise.race([withExit(conn.request("session/prompt", { sessionId, prompt }), "session/prompt"), killOnStall])) as {
             stopReason?: string;
           };
         } finally {
+          stopSide();
           if (killTimer) clearTimeout(killTimer);
         }
 
@@ -421,6 +474,7 @@ export class AcpAdapter implements AgentAdapter {
         return { agentSessionId: sessionId, costUsd, resultText };
       }
     } finally {
+      stopSide();
       // Even on the exception path (throw), honor the contract: every tool_started gets a tool_finished.
       // finish() is guarded by the finished set, so overlapping with the success path is safe (idempotent)
       for (const id of started.keys()) finish(id, false);
@@ -444,7 +498,7 @@ export async function fetchAcpChoices(
   if (!driver.launch) return null;
   const proc = (opts.spawn ?? spawnAcpProcess)(driver.launch, {
     cwd: opts.cwd ?? os.tmpdir(),
-    env: agentEnv(driver, profileDir),
+    env: { ...agentEnv(driver, profileDir), ...driver.turnEnv },
   });
   const conn = proc.conn;
   let timer: ReturnType<typeof setTimeout> | undefined;

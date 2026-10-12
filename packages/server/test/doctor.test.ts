@@ -159,6 +159,24 @@ describe("collectDoctor", () => {
     expect(c.detail).toBe("2 open Claude Code session(s), 3 socket(s), 1 stale");
   });
 
+  it("reports opencode live join: tiny's plugin in each opencode profile with live on", async () => {
+    const plugin = (installed: boolean, version: number | null) => ({ installed, version });
+    const ok = await collectDoctor(deps({ opencodeLive: { profiles: [{ name: "local-opencode", plugin: plugin(true, 1) }], currentVersion: 1, running: 2 } }));
+    const c = ok.checks.find((x) => x.name === "opencode live join")!;
+    expect(c).toMatchObject({ status: "ok", detail: "plugin v1 in local-opencode; 2 opencode process(es) running it" });
+
+    const stale = await collectDoctor(deps({
+      opencodeLive: { profiles: [{ name: "a", plugin: plugin(false, null) }, { name: "b", plugin: plugin(true, 0) }], currentVersion: 1, running: 0 },
+    }));
+    const w = stale.checks.find((x) => x.name === "opencode live join")!;
+    expect(w.status).toBe("warn");
+    expect(w.detail).toContain("a (plugin missing), b (plugin v0, current v1)");
+    expect(w.hint).toBe("tiny live on --profile a  (then restart that opencode TUI)");
+
+    const none = await collectDoctor(deps({ opencodeLive: { profiles: [], currentVersion: 1, running: 0 } }));
+    expect(none.checks.some((x) => x.name === "opencode live join")).toBe(false);
+  });
+
   it("omits the CLI live-join line when nothing was collected", async () => {
     const r = await collectDoctor(deps({}));
     expect(r.checks.some((x) => x.name === "CLI live join")).toBe(false);

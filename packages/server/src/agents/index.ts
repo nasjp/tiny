@@ -2,6 +2,7 @@
 // display name, home env var, env vars stripped by the billing guard, login / CLI handoff commands,
 // and choices (capabilities) — is confined here. iOS never knows agent names and renders
 // only from the label and capabilities the server hands out (the receiving side was built in Phase A).
+import type { ToolHint } from "../tool-kinds.js";
 import { claudeDriver } from "./claude.js";
 import { codexDriver } from "./codex.js";
 import { cursorDriver } from "./cursor.js";
@@ -53,6 +54,28 @@ export interface AgentLaunch {
   args: string[];
 }
 
+/** A permission prompt an ACP agent raised outside the protocol (see AcpSideChannel) */
+export interface SidePermission {
+  id: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  hint: ToolHint;
+}
+
+/**
+ * A second way into an ACP agent, for what its ACP layer cannot carry. OpenCode 1.18.35 asks a
+ * subagent's permissions on the subagent's own session, and its ACP layer drops those without a
+ * reply — the turn then waits forever. While a prompt runs, the adapter polls pending() and answers
+ * through reply() with the same decision flow as an ACP session/request_permission
+ */
+export interface AcpSideChannel {
+  /** Launch args that open the agent's own HTTP server on this loopback port */
+  launchArgs(port: number): string[];
+  /** Prompts pending outside the ACP session itself (that session's own still come through ACP) */
+  pending(port: number, cwd: string, acpSessionId: string): Promise<SidePermission[]>;
+  reply(port: number, cwd: string, id: string, allow: boolean): Promise<void>;
+}
+
 export interface AgentDriver {
   id: string;
   label: string;
@@ -61,6 +84,13 @@ export interface AgentDriver {
   adapter: AdapterKind;
   /** Launch command when adapter is "acp" */
   launch?: AgentLaunch;
+  /** ACP only: answers what the agent asks outside ACP (absent = ACP carries everything) */
+  acpSideChannel?: AcpSideChannel;
+  /**
+   * Extra env for the agent processes tiny runs turns in — never for `tiny attach` / login, which
+   * hand the agent to the person (homeEnv goes to both)
+   */
+  turnEnv?: Record<string, string>;
   /**
    * Env vars that pass the profile directory as the agent's home.
    * A value of `undefined` means "remove this variable from the child env" (see claudeConfigDirEnv)

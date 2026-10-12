@@ -152,7 +152,18 @@ tiny keeps its own files in the profile under `~/.tiny/profiles` and never edits
 phone still asks even when your terminal setup lets everything run. Sub-agent sessions are
 never listed, and switching the scan on files your existing sessions at their last activity
 without a notification for each — only a session you start from then on is announced.
-OpenCode has no live join yet: while a terminal is running a turn, the phone waits for it.
+
+For OpenCode, `tiny live on --profile <name>` also installs a small plugin,
+`plugin/tiny.js` in that opencode's config directory (`~/.config/opencode` for the profile
+above); `tiny live off` removes it. An `opencode` TUI (or an `opencode serve` that TUIs
+attach to) loads it at start — restart a TUI that is already open — and from then on a
+message you send from the phone to a session in that TUI's directory runs inside the TUI
+itself and shows on its screen as it happens, the way Codex's queue does. A turn already
+running there finishes first. Permission prompts appear in the terminal and on the phone,
+and whichever answers first wins; Stop on the phone stops the turn in the terminal, also one
+you typed there. With no such TUI open, tiny runs the turn in its own `opencode acp`, which a
+TUI started later picks up from the storage. `tiny doctor` shows whether the plugin is in
+place and how many opencode processes run it.
 
 That acts on the config directory your own shell uses (`$CLAUDE_CONFIG_DIR`, or `~/.claude`).
 Each tiny profile has its own, so name the profile to turn it on there:

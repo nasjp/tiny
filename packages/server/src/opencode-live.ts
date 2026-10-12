@@ -11,10 +11,12 @@ import { oneLine } from "./tool-kinds.js";
  * Read-only readers for OpenCode's own storage (UNDOCUMENTED interfaces, measured 2026-09-01 on
  * opencode 1.18.18 — see HANDOFF "Step 3"):
  *   $XDG_DATA_HOME/opencode/opencode.db          session / message / part tables (WAL)
- *   $XDG_STATE_HOME/opencode/locks/<sha1>.lock/  meta.json { pid, ... } per STORAGE (not per cwd
- *                                                — measured: two instances share one lock), stale
- *                                                after a kill, so only a live pid counts
  * The db is opened read-only per call and every reader degrades to null / empty.
+ *
+ * Which opencode processes are alive and what they are doing is NOT in the storage: the
+ * $XDG_STATE_HOME/opencode/locks entries this module once read are short-lived cache locks
+ * (models.dev, npm installs — opencode 1.18.35 core/util/flock.ts), not one per running instance.
+ * That lives in opencode-peer.ts
  */
 
 function dbPath(profileDir: string): string {
@@ -48,6 +50,17 @@ interface MessageData {
   role?: string;
   time?: { created?: number; completed?: number };
   tokens?: { output?: number };
+  /** Set on a reply that failed (measured 1.18.35: { name: "APIError", data: { message } }) */
+  error?: { name?: unknown; data?: { message?: unknown } };
+}
+
+/** What went wrong with a reply, in opencode's own words. null = nothing */
+function replyError(data: MessageData): string | null {
+  const e = data.error;
+  if (!e || typeof e !== "object") return null;
+  const message = typeof e.data?.message === "string" && e.data.message !== "" ? e.data.message : null;
+  const name = typeof e.name === "string" ? e.name : "error";
+  return message ?? name;
 }
 
 function parseData(row: { data: string }): MessageData | null {
@@ -113,7 +126,11 @@ export function listOpencodeSessions(profileDir: string): ExternalSession[] {
 /**
  * Import messages committed since the cursor. An assistant message still missing time.completed is
  * mid-turn: nothing at or after it is imported (its parts are still growing), and it becomes the
- * open turn instead. Cursor = time_created:id of the last imported message.
+ * open turn instead — unless a NEWER assistant message exists. A session runs one reply at a time,
+ * so a reply something else has already followed was abandoned by its process (killed, or hung on a
+ * prompt nobody could answer) and will never complete: it is imported as it stands and the read goes
+ * on. A newer USER message proves nothing — typing during a turn stores it at once.
+ * Cursor = time_created:id of the last imported message.
  */
 export function readOpencodeSession(profileDir: string, agentSessionId: string, sinceCursor: string | null): ExternalRead | null {
   return withDb(profileDir, (db) => {
@@ -130,12 +147,20 @@ export function readOpencodeSession(profileDir: string, agentSessionId: string, 
     const partsFor = db.prepare(`SELECT data FROM part WHERE message_id = ? ORDER BY id`);
     const titleRow = db.prepare(`SELECT title FROM session WHERE id = ?`).get(agentSessionId) as { title?: string } | undefined;
 
+    const datas = rows.map(parseData);
+    // Index of the newest assistant message in this read: anything unfinished before it was abandoned
+    let lastAssistant = -1;
+    datas.forEach((d, i) => {
+      if (d?.role === "assistant") lastAssistant = i;
+    });
+
     const events: TranscriptEvent[] = [];
     let cursor = sinceCursor ?? "";
     let turn: ExternalTurn | null = null;
     let turnTokens = 0;
-    for (const row of rows) {
-      const data = parseData(row);
+    let error: string | null | undefined;
+    for (const [i, row] of rows.entries()) {
+      const data = datas[i];
       if (!data) {
         cursor = `t:${row.time_created}:${row.id}`;
         continue;
@@ -157,7 +182,8 @@ export function readOpencodeSession(profileDir: string, agentSessionId: string, 
         cursor = `t:${row.time_created}:${row.id}`;
         continue;
       }
-      if (typeof data.time?.completed !== "number") {
+      const abandoned = typeof data.time?.completed !== "number" && i < lastAssistant;
+      if (typeof data.time?.completed !== "number" && !abandoned) {
         // Mid-turn: stop here so the still-growing parts are imported next time, whole
         turn = {
           startedAt: turn?.startedAt ?? (typeof data.time?.created === "number" ? new Date(data.time.created).toISOString() : null),
@@ -185,14 +211,17 @@ export function readOpencodeSession(profileDir: string, agentSessionId: string, 
               summary: oneLine(String(part.state?.title ?? part.tool ?? "tool")),
             },
           });
+          // A tool its process never finished did not succeed
+          const isError = abandoned ? part.state?.status !== "completed" : part.state?.status === "error";
           events.push({
             type: "tool_finished",
-            payload: { toolUseId: part.callID, isError: part.state?.status === "error", ...toolOutputPayload(part.state?.output) },
+            payload: { toolUseId: part.callID, isError, ...toolOutputPayload(part.state?.output) },
           });
         }
         // patch / file / step-start / step-finish are bookkeeping
       }
       if (typeof data.tokens?.output === "number") turnTokens += data.tokens.output;
+      error = replyError(data);
       // Completing a reply closes the turn — also when its user message went out with a previous
       // read and this read never saw a turn open (startedAt null = "keep what you had")
       turn = {
@@ -202,12 +231,19 @@ export function readOpencodeSession(profileDir: string, agentSessionId: string, 
       };
       cursor = `t:${row.time_created}:${row.id}`;
     }
-    return { events, cursor, turn, title: sessionTitle(db, agentSessionId, titleRow?.title) };
+    return {
+      events, cursor, turn, title: sessionTitle(db, agentSessionId, titleRow?.title),
+      ...(error !== undefined ? { replyError: error } : {}),
+    };
   });
 }
 
-/** The tail cursor (newest committed message), for seeding without importing */
-export function opencodeSessionCursor(profileDir: string, agentSessionId: string): string | null {
+/**
+ * The tail cursor (newest committed message), for seeding without importing. `includeUnfinished`
+ * is for a caller that knows the process writing the tail is gone (tiny's own turn just ended):
+ * that reply stays unfinished forever and must not be imported on top of the events tiny emitted
+ */
+export function opencodeSessionCursor(profileDir: string, agentSessionId: string, opts: { includeUnfinished?: boolean } = {}): string | null {
   return withDb(profileDir, (db) => {
     const row = db
       .prepare(`SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created DESC, id DESC LIMIT 1`)
@@ -215,9 +251,41 @@ export function opencodeSessionCursor(profileDir: string, agentSessionId: string
     if (!row) return "";
     const data = parseData(row);
     // Never seed past an unfinished assistant message — its parts must still be imported
-    if (data?.role === "assistant" && typeof data.time?.completed !== "number") return null;
+    if (!opts.includeUnfinished && data?.role === "assistant" && typeof data.time?.completed !== "number") return null;
     return `t:${row.time_created}:${row.id}`;
   });
+}
+
+export interface OpencodeChoice {
+  /** The agent (build / plan / ...) the newest user message went to. null = none recorded */
+  agent: string | null;
+  /** The model it ran on, as opencode records it on the user message. null = none recorded */
+  model: { providerID: string; modelID: string; variant?: string } | null;
+}
+
+/**
+ * What the session last ran with: the newest user message's agent and model (measured 1.18.35:
+ * `{"role":"user","agent":"build","model":{"providerID","modelID","variant"}}`). A message handed to
+ * the person's terminal continues on these unless the phone picked something else
+ */
+export function opencodeLastChoice(profileDir: string, agentSessionId: string): OpencodeChoice {
+  return (
+    withDb(profileDir, (db) => {
+      const row = db
+        .prepare(
+          `SELECT data FROM message WHERE session_id = ? AND data LIKE '%"role":"user"%'
+           ORDER BY time_created DESC, id DESC LIMIT 1`,
+        )
+        .get(agentSessionId) as { data: string } | undefined;
+      const data = row ? (parseData(row) as { agent?: unknown; model?: Record<string, unknown> } | null) : null;
+      const m = data?.model;
+      const model =
+        m && typeof m.providerID === "string" && typeof m.modelID === "string"
+          ? { providerID: m.providerID, modelID: m.modelID, ...(typeof m.variant === "string" ? { variant: m.variant } : {}) }
+          : null;
+      return { agent: typeof data?.agent === "string" ? data.agent : null, model };
+    }) ?? { agent: null, model: null }
+  );
 }
 
 /** mtime/size fingerprint of the storage (db + WAL), for the "nothing changed" fast path */
@@ -237,37 +305,4 @@ export function opencodeDbStat(profileDir: string): { size: number; mtimeMs: num
     }
   }
   return seen ? { size, mtimeMs } : null;
-}
-
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Pids of live OpenCode instances on this profile's storage. The lock directory outlives a killed
- * instance (measured), so a dead pid counts for nothing.
- */
-export function opencodeInstancePids(profileDir: string, alive: (pid: number) => boolean = processAlive): number[] {
-  const locks = path.join(opencodeXdg(profileDir).state, "opencode", "locks");
-  let names: string[];
-  try {
-    names = fs.readdirSync(locks);
-  } catch {
-    return [];
-  }
-  const pids: number[] = [];
-  for (const name of names) {
-    try {
-      const meta = JSON.parse(fs.readFileSync(path.join(locks, name, "meta.json"), "utf8")) as { pid?: unknown };
-      if (typeof meta.pid === "number" && alive(meta.pid)) pids.push(meta.pid);
-    } catch {
-      // a half-written or foreign entry
-    }
-  }
-  return pids;
 }
