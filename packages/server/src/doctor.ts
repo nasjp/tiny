@@ -47,6 +47,15 @@ export interface DoctorDeps {
   alwaysHandoff: AlwaysHandoffTarget[];
   /** Claude Code sessions reachable for live join (claude-peer.summarizePeerInboxes). Undefined = not collected */
   peerInboxes?: { open: number; sockets: number; stale: number } | null;
+  /**
+   * opencode live join: tiny's plugin in each opencode profile with `tiny live on`, the version this
+   * tiny writes, and how many opencode processes run it now. Undefined = not collected
+   */
+  opencodeLive?: {
+    profiles: Array<{ name: string; plugin: { installed: boolean; version: number | null } }>;
+    currentVersion: number;
+    running: number;
+  };
 }
 
 /** One place `tiny live` can be turned on: a profile name, or a path for a dir that is not a profile */
@@ -132,6 +141,27 @@ function checkPeerInboxes(d: DoctorDeps): DoctorCheck | null {
   };
 }
 
+function checkOpencodeLive(d: DoctorDeps): DoctorCheck | null {
+  const live = d.opencodeLive;
+  if (!live || live.profiles.length === 0) return null;
+  const name = "opencode live join";
+  const stale = live.profiles.filter((p) => !p.plugin.installed || p.plugin.version !== live.currentVersion);
+  if (stale.length > 0) {
+    const what = stale.map((p) => `${p.name} (${p.plugin.installed ? `plugin v${p.plugin.version}, current v${live.currentVersion}` : "plugin missing"})`);
+    return {
+      status: "warn",
+      name,
+      detail: `${what.join(", ")} — phone messages run in tiny's own opencode, which an open TUI never shows`,
+      hint: `tiny live on --profile ${stale[0]!.name}  (then restart that opencode TUI)`,
+    };
+  }
+  return {
+    status: "ok",
+    name,
+    detail: `plugin v${live.currentVersion} in ${live.profiles.map((p) => p.name).join(", ")}; ${live.running} opencode process(es) running it`,
+  };
+}
+
 function checkAgent(d: DoctorDeps, driver: AgentDriver): DoctorCheck {
   const name = `agent ${driver.label}`;
   const bin = d.findOnPath(driver.bin);
@@ -171,6 +201,8 @@ export async function collectDoctor(d: DoctorDeps): Promise<DoctorReport> {
   checks.push(checkAlwaysHandoff(d));
   const peers = checkPeerInboxes(d);
   if (peers) checks.push(peers);
+  const ocLive = checkOpencodeLive(d);
+  if (ocLive) checks.push(ocLive);
   const agentChecks = d.drivers.map((drv) => checkAgent(d, drv));
   const installedCount = d.drivers.filter((drv) => d.findOnPath(drv.bin) !== null).length;
   checks.push(

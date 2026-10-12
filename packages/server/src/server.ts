@@ -7,7 +7,11 @@ import { AuthService } from "./auth.js";
 import { readLiveSessions, type LiveSessionEntry } from "./claude-live.js";
 import { codexThreadHolders } from "./codex-live.js";
 import { deleteCodexQueued, queueCodexMessage } from "./codex-peer.js";
-import { opencodeInstancePids } from "./opencode-live.js";
+import { opencodeXdg } from "./agents/opencode.js";
+import {
+  listOpencodePeers, listOpencodePids, opencodePeerAbort, opencodePeerPrompt, opencodePeerReply, opencodePeersDir, ownOpencodePids,
+  peerSessionBusy, peerSessionIdleAt, peersOnStorage, pickOpencodePeer, pruneOpencodePeers, readOpencodePeer, type OpencodePeer,
+} from "./opencode-peer.js";
 import { readCliMode, readPeerStatus, readPeerToken, readProcessMode, resolvePeerTarget, sendPeerMessage } from "./claude-peer.js";
 import { findTranscript } from "./claude-transcript.js";
 import { FileOutbox } from "./outbox.js";
@@ -16,7 +20,7 @@ import { PermissionBroker } from "./permission-broker.js";
 import { profileDir, readProfileLive } from "./profiles.js";
 import { PushClient } from "./push-client.js";
 import { SessionManager } from "./session-manager.js";
-import type { CodexPeerBridge, PeerBridge } from "./session-manager.js";
+import type { CodexPeerBridge, OpencodePeerBridge, OpencodeTarget, PeerBridge } from "./session-manager.js";
 import { loadSettings } from "./settings.js";
 import { makeMcpLaunch } from "./mcp-launch.js";
 import { createStores } from "./stores.js";
@@ -73,6 +77,31 @@ export async function startServer(env: Record<string, string | undefined> = proc
   // would race the CLI, the API to report cliLive, so BOTH must get the same function
   // Process-level evidence per agent, cached like the registry (the list asks per row every poll)
   const EXTERNAL_TTL_MS = 2000;
+
+  // opencode: the processes tiny's plugin registered (what each is doing, per session) and whether
+  // any opencode runs without it (then nobody can say what that one is doing). One look serves every
+  // row of a list poll
+  const peersDir = opencodePeersDir(paths.home);
+  let ocScan: { at: number; peers: OpencodePeer[]; strangers: boolean | null } | null = null;
+  const opencodeScan = () => {
+    if (ocScan && Date.now() - ocScan.at < EXTERNAL_TTL_MS) return ocScan;
+    const peers = listOpencodePeers(peersDir);
+    const all = listOpencodePids();
+    const own = ownOpencodePids(); // tiny's own `opencode acp`, which is tiny's turn, not the person's
+    const known = new Set([...peers.map((p) => p.pid), ...(own ?? [])]);
+    const strangers = all === null || own === null ? null : all.some((pid) => !known.has(pid));
+    ocScan = { at: Date.now(), peers, strangers };
+    return ocScan;
+  };
+  /** The registered processes working on this session's storage */
+  const opencodePeersOf = (s: SessionRecord): OpencodePeer[] => {
+    try {
+      return peersOnStorage(opencodeScan().peers, opencodeXdg(profileDir(paths.profilesDir, s.profile)).data);
+    } catch {
+      return []; // a vanished profile
+    }
+  };
+
   const externalCache = new Map<string, { at: number; busy: boolean | null }>();
   const externalBusy = (s: SessionRecord): boolean | null => {
     if (!s.agentSessionId) return null;
@@ -85,8 +114,15 @@ export async function startServer(env: Record<string, string | undefined> = proc
         // Measured: codex holds the thread's writer lock open for the whole turn
         busy = codexThreadHolders(dir, s.agentSessionId).length > 0;
       } else if (s.agent === "opencode") {
-        // The lock is per storage, not per session: a live instance means "cannot tell", none means "nobody"
-        busy = opencodeInstancePids(dir).length > 0 ? null : false;
+        // A registered process says so outright. Otherwise: nobody, unless an opencode runs that
+        // tiny's plugin is not loaded in (started before `tiny live on`, another config) — that one
+        // could be running this very session, and nothing says it is not
+        // A process that has worked on the session and reports it idle is the authority on it
+        const id = s.agentSessionId;
+        const mine = opencodePeersOf(s);
+        if (mine.some((p) => peerSessionBusy(p, id))) busy = true;
+        else if (mine.some((p) => p.sessions[id] !== undefined)) busy = false;
+        else busy = opencodeScan().strangers === false ? false : null;
       }
     } catch {
       busy = null;
@@ -98,6 +134,11 @@ export async function startServer(env: Record<string, string | undefined> = proc
   const isCliLive = (s: SessionRecord): boolean | null => {
     // codex: whoever holds the thread's writer lock has the session open in a CLI
     if (s.agent === "codex" && s.agentSessionId) return externalBusy(s) === true;
+    // opencode: a registered process has worked on it. Short of that, nobody can say
+    if (s.agent === "opencode" && s.agentSessionId) {
+      const id = s.agentSessionId;
+      return opencodePeersOf(s).some((p) => p.sessions[id] !== undefined) ? true : null;
+    }
     const entries = liveEntriesOf(s);
     if (entries === undefined || entries === null) return null;
     return entries.has(s.agentSessionId!);
@@ -151,6 +192,34 @@ export async function startServer(env: Record<string, string | undefined> = proc
     },
   };
 
+  // Live join for opencode: a message for a session the person's opencode can run goes to that
+  // process through tiny's plugin; opencode-peer.ts is the only module that speaks to it
+  const withPeer = <T>(t: OpencodeTarget, fn: (peer: OpencodePeer) => Promise<T>): Promise<T> => {
+    const peer = readOpencodePeer(peersDir, t.pid);
+    return peer ? fn(peer) : Promise.reject(new Error("the opencode CLI is gone"));
+  };
+  const opencodePeer: OpencodePeerBridge = {
+    resolve: (s) => {
+      if (!s.agentSessionId) return null;
+      const peer = pickOpencodePeer(opencodePeersOf(s), s.cwd, s.agentSessionId);
+      return peer ? { pid: peer.pid } : null;
+    },
+    state: (s, t) => {
+      const peer = readOpencodePeer(peersDir, t.pid);
+      if (!peer || !s.agentSessionId) return null;
+      const id = s.agentSessionId;
+      return {
+        busy: peerSessionBusy(peer, id),
+        idleAt: peerSessionIdleAt(peer, id),
+        permissions: peer.permissions.filter((r) => r.root === id),
+        questions: peer.questions.filter((q) => q.root === id),
+      };
+    },
+    prompt: (s, t, msg) => withPeer(t, (peer) => opencodePeerPrompt(peer, { directory: s.cwd, sessionID: s.agentSessionId!, ...msg })),
+    abort: (s, t) => withPeer(t, (peer) => opencodePeerAbort(peer, { directory: s.cwd, sessionID: s.agentSessionId! })),
+    reply: (s, t, r) => withPeer(t, (peer) => opencodePeerReply(peer, { directory: s.cwd, ...r })),
+  };
+
   let port = paths.port;
   const manager = new SessionManager({
     stores,
@@ -165,6 +234,7 @@ export async function startServer(env: Record<string, string | undefined> = proc
     cliState,
     peer,
     codexPeer,
+    opencodePeer,
     externalBusy,
     liveScanEnabled: (name) => readProfileLive(paths.profilesDir, name),
   });
@@ -213,6 +283,8 @@ export async function startServer(env: Record<string, string | undefined> = proc
     } catch (err) {
       console.error("[tinyd] external session scan failed:", err);
     }
+    // A killed opencode leaves its plugin registration behind (a clean exit removes it)
+    pruneOpencodePeers(peersDir);
   }, 5000);
   scanTimer.unref?.();
 

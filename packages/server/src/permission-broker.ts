@@ -7,6 +7,9 @@ export type PermissionDecision =
   | { behavior: "allow"; updatedInput?: Record<string, unknown> }
   | { behavior: "deny"; message: string };
 
+/** The deny message a withdrawn request resolves with (see withdraw) */
+export const WITHDRAWN = "withdrawn";
+
 export interface PendingPermission {
   id: string;
   sessionId: string;
@@ -58,6 +61,15 @@ export class PermissionBroker {
     this.pendings.delete(id);
     e.resolve(decision);
     return true;
+  }
+
+  /**
+   * Take a request off the phone because it was settled somewhere else (answered in the terminal, or
+   * gone with an abort). Its waiter gets a deny so nothing is left hanging; the caller knows to ignore
+   * it. false = already decided or unknown
+   */
+  withdraw(id: string): boolean {
+    return this.resolve(id, { behavior: "deny", message: WITHDRAWN });
   }
 
   listPending(sessionId: string): PendingPermission[] {

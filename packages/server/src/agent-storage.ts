@@ -41,4 +41,9 @@ export interface ExternalRead {
    * storage keeps no such id (legacy codex rollouts, opencode)
    */
   peerMsgIds?: string[];
+  /**
+   * How the newest reply imported in this read ended: an error in the agent's own words, or null
+   * when it ended fine. Absent when this read imported no reply (opencode only)
+   */
+  replyError?: string | null;
 }

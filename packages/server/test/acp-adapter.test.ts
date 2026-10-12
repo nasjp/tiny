@@ -5,7 +5,7 @@ import path from "node:path";
 import { AcpAdapter, fetchAcpChoices } from "../src/acp-adapter.js";
 import { readAcpChoices } from "../src/acp-choices.js";
 import type { RunTurnParams, TurnEventInput } from "../src/adapter.js";
-import type { AgentDriver } from "../src/agents/index.js";
+import type { AgentDriver, SidePermission } from "../src/agents/index.js";
 import { assertTurnEventInvariants } from "./adapter-contract.js";
 import { fakeAcpAgent, type FakeAgentCtx } from "./fake-acp-agent.js";
 
@@ -544,5 +544,103 @@ describe("AcpAdapter output-token progress", () => {
     const { p } = baseParams({ progress: (pr) => seen.push(pr.outputTokens) });
     await new AcpAdapter(driver, { spawn: fake.spawn }).runTurn(p);
     expect(seen).toEqual([]);
+  });
+});
+
+describe("AcpAdapter side channel (prompts the agent raises outside ACP)", () => {
+  /** A driver whose agent also lists prompts out of band, the way opencode's HTTP server lists a subagent's */
+  function sideDriver(pending: () => SidePermission[], replies: Array<[string, boolean]>): AgentDriver {
+    return {
+      ...driver,
+      turnEnv: { TINY_OPENCODE_PEER: "off" },
+      acpSideChannel: {
+        launchArgs: (port) => ["--port", String(port)],
+        pending: async (_port, cwd, acpSessionId) => {
+          expect(cwd).toBe("/tmp/repo");
+          expect(acpSessionId).toBe("ses_fake1");
+          return pending();
+        },
+        reply: async (_port, _cwd, id, allow) => {
+          replies.push([id, allow]);
+        },
+      },
+    };
+  }
+  const subagentBash: SidePermission = {
+    id: "per_1", toolName: "bash", input: { command: "curl x" }, hint: { kind: "execute", summary: "(subagent) curl x" },
+  };
+  /** The prompt returns once the side channel has been answered (the subagent then finishes) */
+  const waitForReply = (replies: Array<[string, boolean]>) => async () => {
+    while (replies.length === 0) await new Promise((r) => setTimeout(r, 5));
+    return { stopReason: "end_turn" };
+  };
+
+  it("pins the agent's HTTP port, asks the phone once per prompt, and answers it", async () => {
+    const replies: Array<[string, boolean]> = [];
+    let listed: SidePermission[] = [];
+    const fake = fakeAcpAgent({
+      onPrompt: async () => {
+        listed = [subagentBash]; // stays listed until answered: every poll sees it again
+        return waitForReply(replies)();
+      },
+    });
+    const asked: unknown[] = [];
+    const { p, events } = baseParams({
+      requestPermission: async (toolName, input, hint) => {
+        asked.push([toolName, input, hint]);
+        await new Promise((r) => setTimeout(r, 30)); // a few polls happen while the phone decides
+        return { behavior: "allow" };
+      },
+    });
+    await new AcpAdapter(sideDriver(() => listed, replies), { spawn: fake.spawn, freePort: async () => 4242, sidePollMs: 5 }).runTurn(p);
+    expect(fake.spawned[0]!.launch).toEqual({ command: "fake", args: ["acp", "--port", "4242"] });
+    expect(fake.spawned[0]!.env.TINY_OPENCODE_PEER).toBe("off");
+    expect(asked).toEqual([["bash", { command: "curl x" }, { kind: "execute", summary: "(subagent) curl x" }]]);
+    expect(replies).toEqual([["per_1", true]]);
+    expect(events.at(-1)!.type).toBe("turn_completed");
+    assertTurnEventInvariants(events);
+  });
+
+  it("allows without asking in auto mode, and passes a deny on as a reject", async () => {
+    const replies: Array<[string, boolean]> = [];
+    const fake = fakeAcpAgent({ onPrompt: waitForReply(replies) });
+    let called = false;
+    const auto = baseParams({ permissionMode: "auto", requestPermission: async () => { called = true; return { behavior: "allow" }; } });
+    await new AcpAdapter(sideDriver(() => [subagentBash], replies), { spawn: fake.spawn, freePort: async () => 1, sidePollMs: 5 }).runTurn(auto.p);
+    expect(called).toBe(false);
+    expect(replies).toEqual([["per_1", true]]);
+
+    const denied: Array<[string, boolean]> = [];
+    const fake2 = fakeAcpAgent({ onPrompt: waitForReply(denied) });
+    const ask = baseParams({ requestPermission: async () => ({ behavior: "deny", message: "no" }) });
+    await new AcpAdapter(sideDriver(() => [subagentBash], denied), { spawn: fake2.spawn, freePort: async () => 1, sidePollMs: 5 }).runTurn(ask.p);
+    expect(denied).toEqual([["per_1", false]]);
+  });
+
+  it("answers nothing once the turn is interrupted (the cancel takes the subagent down) and stops polling", async () => {
+    const replies: Array<[string, boolean]> = [];
+    let polls = 0;
+    const fake = fakeAcpAgent({ onPrompt: () => new Promise(() => {}) });
+    const abort = new AbortController();
+    const { p, events } = baseParams({ signal: abort.signal, requestPermission: () => new Promise(() => {}) });
+    const run = new AcpAdapter(sideDriver(() => { polls++; return [subagentBash]; }, replies), {
+      spawn: fake.spawn, freePort: async () => 1, sidePollMs: 5,
+    }).runTurn(p);
+    while (polls === 0) await new Promise((r) => setTimeout(r, 5));
+    abort.abort();
+    await run;
+    const after = polls;
+    await new Promise((r) => setTimeout(r, 30));
+    expect(polls).toBe(after);
+    expect(replies).toEqual([]);
+    expect(events.at(-1)!.payload).toEqual({ error: "interrupted" });
+  });
+
+  it("leaves agents without a side channel exactly as they were", async () => {
+    const fake = fakeAcpAgent({ onPrompt: bashTurn });
+    let portAsked = false;
+    await new AcpAdapter(driver, { spawn: fake.spawn, freePort: async () => { portAsked = true; return 1; } }).runTurn(baseParams().p);
+    expect(portAsked).toBe(false);
+    expect(fake.spawned[0]!.launch).toEqual({ command: "fake", args: ["acp"] });
   });
 });

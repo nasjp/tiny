@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { opencodeXdg } from "../src/agents/opencode.js";
 import {
-  listOpencodeSessions, opencodeDbStat, opencodeInstancePids, opencodeSessionCursor, readOpencodeSession,
+  listOpencodeSessions, opencodeDbStat, opencodeLastChoice, opencodeSessionCursor, readOpencodeSession,
 } from "../src/opencode-live.js";
 
 const SID = "ses_fixture1";
@@ -107,6 +107,48 @@ describe("opencode-live", () => {
     expect(readOpencodeSession(profileDir, SID, r3.cursor)!.events).toEqual([]);
   });
 
+  it("reads past a reply its process abandoned: a newer reply means that one will never complete", () => {
+    // Measured 2026-10-12: a turn hung in tiny's own `opencode acp` (a subagent's permission went
+    // nowhere) left its reply without time.completed, and the terminal carried on in the same
+    // session. Holding at that reply hid everything the terminal did afterwards
+    const { profileDir, db } = makeStorage();
+    addMessage(db, "msg_u1", 1000, { role: "user", time: { created: 1000 } }, [{ type: "text", text: "find reviews" }]);
+    addMessage(db, "msg_a1", 1100, { role: "assistant", time: { created: 1100 } }, [
+      { type: "reasoning", text: "Search first." },
+      { type: "tool", tool: "bash", callID: "call_done", state: { status: "completed", input: { command: "curl a" }, title: "curl a", output: "2 hits" } },
+      { type: "tool", tool: "task", callID: "call_hung", state: { status: "running", input: { description: "dig" }, title: "dig" } },
+    ]);
+    addMessage(db, "msg_u2", 2000, { role: "user", time: { created: 2000 } }, [{ type: "text", text: "find reviews (again)" }]);
+    addMessage(db, "msg_a2", 2100, { role: "assistant", time: { created: 2100, completed: 2500 }, tokens: { output: 5 } }, [{ type: "text", text: "Here they are." }]);
+    const r = readOpencodeSession(profileDir, SID, null)!;
+    expect(r.events.map((e) => [e.type, e.payload.toolUseId ?? e.payload.text])).toEqual([
+      ["user_message", "find reviews"],
+      ["assistant_thinking", "Search first."],
+      ["tool_started", "call_done"],
+      ["tool_finished", "call_done"],
+      ["tool_started", "call_hung"],
+      ["tool_finished", "call_hung"],
+      ["user_message", "find reviews (again)"],
+      ["assistant_text", "Here they are."],
+    ]);
+    // A tool its process never finished did not succeed
+    expect(r.events[5]!.payload).toMatchObject({ toolUseId: "call_hung", isError: true });
+    expect(r.turn).toMatchObject({ open: false, outputTokens: 5 });
+    expect(r.cursor).toBe("t:2100:msg_a2");
+  });
+
+  it("still holds at the newest reply while it grows, even behind a newer user message (queued)", () => {
+    // Typing while a turn runs stores the user message at once; the reply in progress is still live
+    const { profileDir, db } = makeStorage();
+    addMessage(db, "msg_u1", 1000, { role: "user", time: { created: 1000 } }, [{ type: "text", text: "a" }]);
+    addMessage(db, "msg_a1", 1100, { role: "assistant", time: { created: 1100 } }, [{ type: "text", text: "wor" }]);
+    addMessage(db, "msg_u2", 1200, { role: "user", time: { created: 1200 } }, [{ type: "text", text: "b" }]);
+    const r = readOpencodeSession(profileDir, SID, null)!;
+    expect(r.events.map((e) => e.type)).toEqual(["user_message"]);
+    expect(r.turn).toMatchObject({ open: true });
+    expect(r.cursor).toBe("t:1000:msg_u1");
+  });
+
   it("cursor seeding refuses to skip an unfinished assistant message", () => {
     const { profileDir, db } = makeStorage();
     expect(opencodeSessionCursor(profileDir, SID)).toBe("");
@@ -114,17 +156,26 @@ describe("opencode-live", () => {
     expect(opencodeSessionCursor(profileDir, SID)).toBe("t:1000:msg_u1");
     addMessage(db, "msg_a1", 1500, { role: "assistant", time: { created: 1500 } });
     expect(opencodeSessionCursor(profileDir, SID)).toBeNull();
+    // Once the process that wrote it is known to be gone (tiny's own turn ended), its tail is final
+    expect(opencodeSessionCursor(profileDir, SID, { includeUnfinished: true })).toBe("t:1500:msg_a1");
   });
 
-  it("db stat and instance pids degrade to nothing on a missing or stale storage", () => {
+  it("reads the agent and model the session last ran with, from the newest user message", () => {
+    const { profileDir, db } = makeStorage();
+    expect(opencodeLastChoice(profileDir, SID)).toEqual({ agent: null, model: null });
+    addMessage(db, "msg_u1", 1000, { role: "user", agent: "plan", model: { providerID: "opencode", modelID: "gpt-5.5" } }, [{ type: "text", text: "x" }]);
+    addMessage(db, "msg_a1", 1100, { role: "assistant", agent: "plan", time: { created: 1100, completed: 1200 } });
+    addMessage(db, "msg_u2", 2000, { role: "user", agent: "build", model: { providerID: "opencode-go", modelID: "space-bunny", variant: "xhigh" } }, [{ type: "text", text: "y" }]);
+    expect(opencodeLastChoice(profileDir, SID)).toEqual({
+      agent: "build",
+      model: { providerID: "opencode-go", modelID: "space-bunny", variant: "xhigh" },
+    });
+    expect(opencodeLastChoice("/no/such/profile", SID)).toEqual({ agent: null, model: null });
+  });
+
+  it("db stat degrades to nothing on a missing storage", () => {
     const { profileDir } = makeStorage();
     expect(opencodeDbStat(profileDir)).not.toBeNull();
     expect(opencodeDbStat("/no/such/profile")).toBeNull();
-    expect(opencodeInstancePids(profileDir)).toEqual([]);
-    const locks = path.join(opencodeXdg(profileDir).state, "opencode", "locks", "abc.lock");
-    fs.mkdirSync(locks, { recursive: true });
-    fs.writeFileSync(path.join(locks, "meta.json"), JSON.stringify({ pid: 4242, token: "t" }));
-    expect(opencodeInstancePids(profileDir, () => true)).toEqual([4242]);
-    expect(opencodeInstancePids(profileDir, () => false)).toEqual([]);
   });
 });
