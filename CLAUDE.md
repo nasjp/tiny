@@ -22,7 +22,9 @@ file only holds operating rules and tooling usage.
 - Commit messages are conventional commits in English (`feat:` `fix:` `docs:` ...)
 - The remote is `git@github.com:nasjp/tiny.git` (private). If the agent shell has no
   ssh-agent and push fails:
-  `git -c credential.helper='!gh auth git-credential' push https://github.com/nasjp/tiny.git main:main`
+  `git -c url."https://github.com/".insteadOf="git@github.com:" -c credential.helper='!gh auth git-credential' push origin main`
+  (push to `origin`, not to a bare URL — a bare-URL push leaves `origin/main` stale and
+  `git status` then reports a phantom "ahead N")
 
 ## Command quick reference
 
