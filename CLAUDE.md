@@ -20,11 +20,11 @@ file only holds operating rules and tooling usage.
 - Direct commits to main are allowed only for small changes such as docs or HANDOFF
   updates
 - Commit messages are conventional commits in English (`feat:` `fix:` `docs:` ...)
-- The remote is `git@github.com:nasjp/tiny.git` (private). If the agent shell has no
-  ssh-agent and push fails:
-  `git -c url."https://github.com/".insteadOf="git@github.com:" -c credential.helper='!gh auth git-credential' push origin main`
-  (push to `origin`, not to a bare URL — a bare-URL push leaves `origin/main` stale and
-  `git status` then reports a phantom "ahead N")
+- The remote is `git@github.com:nasjp/tiny.git` (private). This Mac has no SSH key on
+  GitHub; the global gitconfig rewrites `git@github.com:` to HTTPS and authenticates
+  with gh's token, so a plain `git push` works. Always push to `origin`, never to a bare
+  URL — a bare-URL push leaves `origin/main` stale and `git status` then reports a
+  phantom "ahead N"
 
 ## Command quick reference
 
