@@ -108,15 +108,8 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
 
 ## Traps in this environment
 
-- **`npx tsx` can be mangled by the rtk hook and break** → for the CLI use
-  `pnpm tiny <subcommand>` (= `pnpm -C packages/server exec tsx src/cli.ts`). If you
-  must call it directly, use `./node_modules/.bin/tsx`
-- **Never read API JSON through a curl pipe** → write it to a file first, then read it
-  (rtk transforms the output; scripts/smoke.sh shows the pattern)
-- **Do not trust `git log --oneline -1` output as evidence of git state** (rtk sometimes
-  drops merge commits from the display; this caused two misreadings in practice). Check
-  state with commands that print **unambiguous output**, e.g. `git rev-parse HEAD` /
-  `git merge-base --is-ancestor`
+- **Run the CLI as `pnpm tiny <subcommand>`** (= `pnpm -C packages/server exec tsx src/cli.ts`).
+  If you must call it directly, use `./node_modules/.bin/tsx`
 - **Any code that spawns child processes must strip `ANTHROPIC_API_KEY` from the env**
   (leaving it set bills the API pay-as-you-go instead of the subscription; every
   existing spawn path already strips it)
@@ -184,10 +177,6 @@ node scripts/codex-probe.mjs             # probe the Codex app-server
   `priority: "now"` — the CLI abandons its own prompt (recording the tool call as rejected, an echo
   tinyd drops) and takes the answers as a message. Everything the transcript reader can see —
   answers chosen at the Mac, a dismissed question — still comes from the jsonl
-- **The rtk hook rewrites `git diff` / `grep` / `awk` pipelines too**, not just `npx` —
-  a review diff generated through it showed modified lines as unchanged context. Run
-  scripts that produce diffs for another reader with `rtk proxy bash <script>`, and
-  read API JSON with a Node `fetch` script rather than `curl`
 - The src/dist launch split lives only in `src/entry.ts` (shared by the plist in
   `daemon.ts` and the `tiny mcp-server` spawn in `mcp-launch.ts`). **Do not add more
   code that locates files relative to `import.meta.url`** (tsup splits chunks)
